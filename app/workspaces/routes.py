@@ -75,6 +75,7 @@ from app.services.github import (
     get_github_client,
     validate_full_name,
 )
+from app.services.health import coverage_estimate, detect_ci_files
 from app.services.importing import ProjectImportError, extract_archive, import_github_repo
 from app.services.invitations import cancel_pending_for_user
 from app.services.llm import LLMProviderError, get_provider
@@ -661,6 +662,9 @@ def api_project_stats(project_id: int):
     test_files = [f for f in files if _is_test_path(f.path)]
     doc_files = [f for f in files if f.path.rsplit(".", 1)[-1].lower() in ("md", "rst", "txt")]
     inventory = project_analysis.dependency_inventory(project)
+    paths = [f.path for f in files]
+    ci_files = detect_ci_files(paths)
+    coverage = coverage_estimate(paths)
 
     duration = None
     if project.indexed_at and project.created_at:
@@ -678,6 +682,8 @@ def api_project_stats(project_id: int):
             "dependency_count": len(inventory),
             "manifest_files": sorted({item["file"] for item in inventory}),
             "index_duration_seconds": duration,
+            "ci_files": ci_files,
+            "coverage_estimate": coverage,
         }
     )
 

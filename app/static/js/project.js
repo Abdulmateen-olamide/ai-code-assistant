@@ -471,6 +471,27 @@
           });
           html += "</ul>";
         }
+        var coverage = data.coverage_estimate;
+        if (coverage) {
+          html += '<h3 class="metric-title">Coverage (estimated)</h3>';
+          html += '<p class="field-hint">' + escapeHtml(coverage.note) + "</p>";
+          html += '<div class="metric-grid">';
+          html += metric("Estimate", (coverage.ratio * 100).toFixed(1) + "%");
+          html += metric("Test files", coverage.test_file_count);
+          html += metric("Source files", coverage.source_file_count);
+          html += metric("Signal", coverage.label);
+          html += "</div>";
+        }
+        if (data.ci_files && data.ci_files.length) {
+          html += '<h3 class="metric-title">CI configuration</h3><ul class="metric-list">';
+          data.ci_files.forEach(function (path) {
+            html += "<li><code>" + escapeHtml(path) + "</code></li>";
+          });
+          html += "</ul>";
+        } else {
+          html += '<h3 class="metric-title">CI configuration</h3>';
+          html += '<p class="sidebar-empty">No CI configuration detected.</p>';
+        }
         output.innerHTML = html;
       })
       .catch(function (error) {
