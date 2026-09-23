@@ -80,6 +80,7 @@ from app.services.invitations import cancel_pending_for_user
 from app.services.llm import LLMProviderError, get_provider
 from app.services.notifications import notify
 from app.services.permissions import resolve_workspace
+from app.services.ratelimit import per_user_limit
 from app.services.search import search_project
 from app.services.stellar_detection import project_stellar_metadata
 from app.workspaces import bp
@@ -378,6 +379,11 @@ def api_list_projects(workspace_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/projects", methods=["POST"])
 @login_required
+@per_user_limit(
+    "import",
+    max_config="RATE_LIMIT_IMPORT_MAX",
+    window_config="RATE_LIMIT_IMPORT_WINDOW",
+)
 def api_import_project(workspace_id: int):
     """Import a project from an archive, GitHub, or a generated Soroban scaffold."""
     workspace = _get_workspace(workspace_id)
@@ -603,6 +609,11 @@ def api_project_file(project_id: int):
 
 @bp.route("/api/projects/<int:project_id>/search", methods=["GET"])
 @login_required
+@per_user_limit(
+    "search",
+    max_config="RATE_LIMIT_SEARCH_MAX",
+    window_config="RATE_LIMIT_SEARCH_WINDOW",
+)
 def api_project_search(project_id: int):
     project = _get_project(project_id)
     if project.status != STATUS_READY:
@@ -715,6 +726,11 @@ def api_project_messages(project_id: int):
 
 @bp.route("/api/projects/<int:project_id>/chat", methods=["POST"])
 @login_required
+@per_user_limit(
+    "chat",
+    max_config="RATE_LIMIT_CHAT_MAX",
+    window_config="RATE_LIMIT_CHAT_WINDOW",
+)
 def api_project_chat(project_id: int):
     """Answer a question about the project (non-streaming)."""
     project = _get_project(project_id)
@@ -743,6 +759,11 @@ def api_project_chat(project_id: int):
 
 @bp.route("/api/projects/<int:project_id>/chat/stream", methods=["POST"])
 @login_required
+@per_user_limit(
+    "stream",
+    max_config="RATE_LIMIT_STREAM_MAX",
+    window_config="RATE_LIMIT_STREAM_WINDOW",
+)
 def api_project_chat_stream(project_id: int):
     """Stream an assistant reply about the project using Server-Sent Events."""
     project = _get_project(project_id)
@@ -788,6 +809,11 @@ def api_project_chat_stream(project_id: int):
 
 @bp.route("/api/projects/<int:project_id>/analyze", methods=["POST"])
 @login_required
+@per_user_limit(
+    "analyze",
+    max_config="RATE_LIMIT_ANALYZE_MAX",
+    window_config="RATE_LIMIT_ANALYZE_WINDOW",
+)
 def api_project_analyze(project_id: int):
     """Run a bounded analysis of the project (architecture/bugs/refactor/...)."""
     project = _get_project(project_id)
