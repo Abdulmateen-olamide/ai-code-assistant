@@ -35,7 +35,7 @@ from app.models.review import (
     STATUS_FAILED,
     STATUS_RUNNING,
 )
-from app.models.review_finding import SEVERITIES
+from app.models.review_finding import CATEGORIES_BY_KIND, SEVERITIES
 from app.reviews import bp
 from app.services import metrics as metrics_service
 from app.services import reviews as reviews_service
@@ -44,6 +44,7 @@ from app.services.github import (
     GitHubError,
     GitHubInvalidError,
     get_github_client,
+    github_error_payload,
     pull_request_payload,
     validate_full_name,
 )
@@ -229,7 +230,7 @@ def _run_pr_review(data: dict):
     try:
         full_name = validate_full_name(data.get("repo") or "")
     except GitHubInvalidError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(github_error_payload(exc)), 400
     try:
         number = int(data.get("pr_number"))
     except (TypeError, ValueError):
@@ -241,13 +242,13 @@ def _run_pr_review(data: dict):
     try:
         client = get_github_client()
     except GitHubError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(github_error_payload(exc)), 400
 
     try:
         pr_raw = client.get_pull_request(full_name, number)
         files = client.list_pull_request_files(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     pr = pull_request_payload(pr_raw)
     config = _effective_config(project) if project else _config_payload(None)
@@ -340,7 +341,12 @@ def _save_result(review: Review, result: dict, config: dict) -> None:
 @bp.route("/api/reviews/<int:review_id>", methods=["GET"])
 @login_required
 def api_review_detail(review_id: int):
-    return jsonify(_get_review(review_id).to_dict())
+    review = _get_review(review_id)
+    payload = review.to_dict()
+    # Expose the category vocabulary for this review kind so the detail page can
+    # offer a category filter (#118).
+    payload["categories"] = list(CATEGORIES_BY_KIND.get(review.kind, ("other",)))
+    return jsonify(payload)
 
 
 @bp.route("/api/reviews/<int:review_id>", methods=["DELETE"])

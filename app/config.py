@@ -159,6 +159,12 @@ class Config:
     RATE_LIMIT_STREAM_WINDOW = int(os.getenv("RATE_LIMIT_STREAM_WINDOW", "60"))
     RATE_LIMIT_ANALYZE_MAX = int(os.getenv("RATE_LIMIT_ANALYZE_MAX", "20"))
     RATE_LIMIT_ANALYZE_WINDOW = int(os.getenv("RATE_LIMIT_ANALYZE_WINDOW", "300"))
+    # OAuth callback throttling (#81): repeated *failures* for the same user/IP
+    # are limited to blunt brute-force state probing. Only failed attempts are
+    # counted and a successful connection clears the bucket, so legitimate
+    # connects are never affected.
+    RATE_LIMIT_OAUTH_CALLBACK_MAX = int(os.getenv("RATE_LIMIT_OAUTH_CALLBACK_MAX", "10"))
+    RATE_LIMIT_OAUTH_CALLBACK_WINDOW = int(os.getenv("RATE_LIMIT_OAUTH_CALLBACK_WINDOW", "300"))
     # Optional SMTP for invitation email delivery. When unset, invitations are
     # delivered as in-app notifications only and the app never crashes on mail.
     SMTP_HOST = os.getenv("SMTP_HOST", "")

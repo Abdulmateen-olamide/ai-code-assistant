@@ -216,6 +216,29 @@
     );
   }
 
+  function trendSection(trend) {
+    if (!trend || !trend.length) return "";
+    var max = 0;
+    trend.forEach(function (point) { max = Math.max(max, point.total || 0); });
+    max = max || 1;
+    var html = "<h3 class='metric-title'>Findings addressed over time</h3><ul class='trend-list'>";
+    trend.forEach(function (point) {
+      var openPct = Math.round(((point.open || 0) / max) * 100);
+      var donePct = Math.round(((point.addressed || 0) / max) * 100);
+      html +=
+        "<li class='trend-row'>" +
+        "<span class='trend-date'>" + formatActivityTime(point.created_at) + "</span>" +
+        "<span class='trend-bar'>" +
+        "<span class='trend-open' style='width:" + openPct + "%'></span>" +
+        "<span class='trend-done' style='width:" + donePct + "%'></span>" +
+        "</span>" +
+        "<span class='trend-counts'>" + (point.open || 0) + " open &middot; " +
+        (point.addressed || 0) + " addressed</span>" +
+        "</li>";
+    });
+    return html + "</ul>";
+  }
+
   function loadWorkspaceMetrics() {
     var el = document.getElementById("workspace-metrics");
     if (!el) return;
@@ -230,7 +253,8 @@
           metricCard(findings.unaddressed_high_risk || 0, "open high risk") +
           metricCard(findings.addressed || 0, "addressed") +
           metricCard(metrics.reviews_last_7_days || 0, "reviews / 7d") +
-          "</div>";
+          "</div>" +
+          trendSection(metrics.findings_trend);
       })
       .catch(function () {
         el.innerHTML = '<p class="empty-note">Quality metrics unavailable.</p>';
