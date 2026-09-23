@@ -25,7 +25,7 @@ from flask import jsonify, render_template, request
 from flask_login import current_user, login_required
 
 from app.extensions import db
-from app.models import Project, Review, ReviewConfig, ReviewFinding
+from app.models import Project, Review, ReviewConfig, ReviewFinding, Workspace
 from app.models.project import STATUS_READY
 from app.models.review import (
     PROJECT_REVIEW_KINDS,
@@ -430,6 +430,13 @@ def api_update_config(project_id: int):
 @bp.route("/api/metrics", methods=["GET"])
 @login_required
 def api_metrics():
+    """Aggregate quality metrics per workspace, project, or the current user."""
+    workspace_id = request.args.get("workspace_id", type=int)
+    if workspace_id:
+        workspace = Workspace.query.filter_by(
+            id=workspace_id, user_id=current_user.id
+        ).first_or_404()
+        return jsonify(metrics_service.workspace_metrics(workspace))
     project_id = request.args.get("project_id", type=int)
     if project_id:
         project = _get_project(project_id)

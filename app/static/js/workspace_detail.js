@@ -167,6 +167,34 @@
     return new Date(iso).toLocaleString();
   }
 
+  function metricCard(value, label) {
+    return (
+      '<div class="metric-card"><span class="metric-value">' + value +
+      '</span><span class="metric-label">' + label + "</span></div>"
+    );
+  }
+
+  function loadWorkspaceMetrics() {
+    var el = document.getElementById("workspace-metrics");
+    if (!el) return;
+    api("/reviews/api/metrics?workspace_id=" + WORKSPACE_ID)
+      .then(function (metrics) {
+        var findings = metrics.findings || {};
+        el.innerHTML =
+          '<h2>Quality</h2><div class="metric-grid">' +
+          metricCard(metrics.total_reviews || 0, "reviews") +
+          metricCard(findings.total || 0, "findings") +
+          metricCard(findings.high_risk || 0, "high risk") +
+          metricCard(findings.unaddressed_high_risk || 0, "open high risk") +
+          metricCard(findings.addressed || 0, "addressed") +
+          metricCard(metrics.reviews_last_7_days || 0, "reviews / 7d") +
+          "</div>";
+      })
+      .catch(function () {
+        el.innerHTML = '<p class="empty-note">Quality metrics unavailable.</p>';
+      });
+  }
+
   function loadActivity() {
     var list = document.getElementById("activity-list");
     if (!list) return;
@@ -206,6 +234,7 @@
     document.getElementById("import-github-btn").addEventListener("click", importGithub);
     loadConnectedRepos();
     loadActivity();
+    loadWorkspaceMetrics();
 
     document.getElementById("rename-workspace").addEventListener("click", function () {
       var name = prompt("Rename workspace:", wsName.textContent.trim());

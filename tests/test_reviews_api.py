@@ -483,3 +483,38 @@ class TestMetrics:
         response = client.get(f"/reviews/api/metrics?project_id={project.id}")
         assert response.status_code == 200
         assert response.get_json()["total_reviews"] == 1
+
+    def test_workspace_metrics_aggregate(self, client, make_user, login):
+        user = make_user()
+        login()
+        project = _make_project(user)
+        review = Review(user_id=user.id, project_id=project.id, source="project", kind="quality")
+        db.session.add(review)
+        db.session.commit()
+        db.session.add(
+            ReviewFinding(
+                review_id=review.id,
+                severity="high",
+                category="duplication",
+                explanation="e",
+                confidence="confirmed",
+            )
+        )
+        db.session.commit()
+
+        response = client.get(f"/reviews/api/metrics?workspace_id={project.workspace_id}")
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["total_reviews"] == 1
+        assert payload["findings"]["total"] == 1
+        assert payload["findings"]["by_severity"]["high"] == 1
+        assert payload["findings"]["by_category"]["duplication"] == 1
+        assert "reviews_last_7_days" in payload
+
+    def test_workspace_metrics_owner_scoped(self, client, make_user, login):
+        other = make_user(username="other", email="other@example.com")
+        project = _make_project(other)
+        make_user()
+        login()
+        response = client.get(f"/reviews/api/metrics?workspace_id={project.workspace_id}")
+        assert response.status_code == 404
