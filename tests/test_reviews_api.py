@@ -339,6 +339,52 @@ class TestListDetailDelete:
         assert len(response.get_json()) == 1
         assert response.get_json()[0]["file"] == "b.py"
 
+    def test_detail_exposes_categories_and_filters_by_category(self, client, make_user, login):
+        user = make_user()
+        login()
+        project = _make_project(user)
+        review = Review(
+            user_id=user.id,
+            project_id=project.id,
+            source="project",
+            kind="quality",
+            status="completed",
+        )
+        db.session.add(review)
+        db.session.commit()
+        db.session.add_all(
+            [
+                ReviewFinding(
+                    review_id=review.id,
+                    severity="medium",
+                    category="readability",
+                    explanation="e",
+                    confidence="suggestion",
+                ),
+                ReviewFinding(
+                    review_id=review.id,
+                    severity="medium",
+                    category="dead-code",
+                    explanation="e",
+                    confidence="confirmed",
+                ),
+            ]
+        )
+        db.session.commit()
+
+        detail = client.get(f"/reviews/api/reviews/{review.id}").get_json()
+        assert "readability" in detail["categories"]
+        assert "dead-code" in detail["categories"]
+
+        all_findings = client.get(f"/reviews/api/reviews/{review.id}/findings").get_json()
+        assert len(all_findings) == 2
+
+        filtered = client.get(
+            f"/reviews/api/reviews/{review.id}/findings?category=readability"
+        ).get_json()
+        assert len(filtered) == 1
+        assert filtered[0]["category"] == "readability"
+
     def test_detail_forbidden_for_other_user(self, client, make_user, login):
         other = make_user(username="other", email="other@example.com")
         make_user()

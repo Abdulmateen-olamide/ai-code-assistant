@@ -35,7 +35,7 @@ from app.models.review import (
     STATUS_FAILED,
     STATUS_RUNNING,
 )
-from app.models.review_finding import SEVERITIES
+from app.models.review_finding import CATEGORIES_BY_KIND, SEVERITIES
 from app.reviews import bp
 from app.services import metrics as metrics_service
 from app.services import reviews as reviews_service
@@ -341,7 +341,12 @@ def _save_result(review: Review, result: dict, config: dict) -> None:
 @bp.route("/api/reviews/<int:review_id>", methods=["GET"])
 @login_required
 def api_review_detail(review_id: int):
-    return jsonify(_get_review(review_id).to_dict())
+    review = _get_review(review_id)
+    payload = review.to_dict()
+    # Expose the category vocabulary for this review kind so the detail page can
+    # offer a category filter (#118).
+    payload["categories"] = list(CATEGORIES_BY_KIND.get(review.kind, ("other",)))
+    return jsonify(payload)
 
 
 @bp.route("/api/reviews/<int:review_id>", methods=["DELETE"])
