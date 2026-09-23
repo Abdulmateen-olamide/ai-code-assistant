@@ -39,6 +39,7 @@ from app.models.review_finding import SEVERITIES
 from app.reviews import bp
 from app.services import metrics as metrics_service
 from app.services import reviews as reviews_service
+from app.services.events import emit_event
 from app.services.github import (
     GitHubError,
     GitHubInvalidError,
@@ -271,6 +272,12 @@ def _run_pr_review(data: dict):
     except Exception as exc:
         result = {"summary": {}, "findings": [], "raw": "", "error": str(exc)}
     _save_result(review, result, config)
+    emit_event(
+        "review.completed",
+        data={"review_id": review.id, "kind": review.kind, "status": review.status},
+        workspace_id=project.workspace_id if project else None,
+        user_id=current_user.id,
+    )
     return jsonify(review.to_dict()), 201
 
 
@@ -302,6 +309,12 @@ def _run_project_review(data: dict):
     except Exception as exc:
         result = {"summary": {}, "findings": [], "raw": "", "error": str(exc)}
     _save_result(review, result, config)
+    emit_event(
+        "review.completed",
+        data={"review_id": review.id, "kind": review.kind, "status": review.status},
+        workspace_id=project.workspace_id,
+        user_id=current_user.id,
+    )
     return jsonify(review.to_dict()), 201
 
 
@@ -333,9 +346,13 @@ def api_review_detail(review_id: int):
 @bp.route("/api/reviews/<int:review_id>", methods=["DELETE"])
 @login_required
 def api_delete_review(review_id: int):
+    """Delete a review and its findings (owner only; findings cascade)."""
     review = _get_review(review_id)
+    workspace_id = review.project.workspace_id if review.project_id else None
+    data = {"review_id": review.id, "kind": review.kind, "source": review.source}
     db.session.delete(review)
     db.session.commit()
+    emit_event("review.deleted", data=data, workspace_id=workspace_id, user_id=current_user.id)
     return jsonify({"ok": True})
 
 
