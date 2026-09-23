@@ -474,6 +474,55 @@ def analyze_code_quality(project, config: dict) -> dict:
     return _run_json(prompt, kind="quality", threshold=config.get("severity_threshold"))
 
 
+_TEST_CATEGORY_HINT = (
+    "use categories: coverage-gap, missing-tests, missing-assertion, flaky-test, "
+    "edge-case, weak-coverage, outdated-test, test-structure, other"
+)
+
+
+def analyze_tests(project, config: dict) -> dict:
+    """Run a structured, test-focused review over an imported project.
+
+    Surfaces coverage gaps, missing or weak assertions, and flaky-test patterns
+    (plus missing tests, missing edge cases, outdated tests, and test-structure
+    problems) as structured findings for the ``tests`` review kind. Uses the
+    same bounded, injection-resistant context as every other project review, so
+    findings are persisted as ``ReviewFinding`` rows by the route layer.
+    """
+    context = _project_context(project, config, "tests")
+    structure = _project_structure_summary(project)
+    intro = (
+        "Analyze the test coverage and test quality of this project. Surface "
+        "coverage gaps, tests that assert little or nothing (missing assertions), "
+        "and flaky-test patterns such as timing/sleep dependence, order "
+        "dependence, shared mutable state, unseeded randomness, or real "
+        "network/filesystem dependence. Also identify important code without "
+        "tests, missing edge cases, weak coverage, outdated tests, and "
+        "test-structure problems. Use only the real files shown; never fabricate "
+        "coverage percentages."
+    )
+    prompt = (
+        f"Project: {project.name}\n\n"
+        f"Structure (sample):\n{structure}\n\n"
+        f"Source files under review:\n{context['blocks'] or '(no file contents retrieved)'}\n\n"
+        "Test files found:\n"
+        + "\n".join(context["test_files"] or ["(none)"])
+        + "\n\n"
+        + (
+            "Test file contents (sample):\n" + context["test_blocks"]
+            if context["test_blocks"]
+            else ""
+        )
+    )
+    prompt += (
+        f"\n\n{intro}\n\n"
+        f"For findings, {_TEST_CATEGORY_HINT}.\n"
+        "Set confidence 'confirmed' only when the shown files prove the issue; "
+        "otherwise use 'potential' or 'suggestion'.\n" + _JSON_SCHEMA
+    )
+    return _run_json(prompt, kind="tests", threshold=config.get("severity_threshold"))
+
+
 def review_project(project, kind: str, config: dict) -> dict:
     """Review an imported project (quality/security/tests) and return findings."""
     kind = (kind or "").strip().lower()
@@ -481,55 +530,30 @@ def review_project(project, kind: str, config: dict) -> dict:
         kind = "quality"
     if kind == "quality":
         return analyze_code_quality(project, config)
+    if kind == "tests":
+        return analyze_tests(project, config)
 
-    context = _project_context(project, config, kind)
+    context = _project_context(project, config, "security")
     structure = _project_structure_summary(project)
-
-    if kind == "security":
-        intro = (
-            "Perform a security analysis of this project. Look for legitimate "
-            "risks involving authentication, authorization, input validation, "
-            "file access, secrets, injection risks, unsafe dependencies, "
-            "sensitive information exposure, and insecure configuration. Do NOT "
-            "invent vulnerabilities; if a category shows no evidence, do not "
-            "report it. For dependency concerns that require a registry or "
-            "advisory source, mark them 'suggestion' and recommend verification."
-        )
-        category = "use categories: authentication, authorization, input-validation, "
-        "file-access, secrets, injection, unsafe-dependencies, "
-        "information-exposure, insecure-config, other"
-    else:  # tests
-        intro = (
-            "Analyze the test coverage and test quality of this project. "
-            "Identify changed or important code without corresponding tests, "
-            "missing edge cases, weak test coverage, existing tests that may "
-            "need updating, and test-structure problems. Use the real files "
-            "shown; never fabricate coverage percentages."
-        )
-        category = "use categories: missing-tests, edge-case, weak-coverage, "
-        "outdated-test, test-structure, other"
-
+    intro = (
+        "Perform a security analysis of this project. Look for legitimate "
+        "risks involving authentication, authorization, input validation, "
+        "file access, secrets, injection risks, unsafe dependencies, "
+        "sensitive information exposure, and insecure configuration. Do NOT "
+        "invent vulnerabilities; if a category shows no evidence, do not "
+        "report it. For dependency concerns that require a registry or "
+        "advisory source, mark them 'suggestion' and recommend verification."
+    )
+    category = "use categories: authentication, authorization, input-validation, "
+    "file-access, secrets, injection, unsafe-dependencies, "
+    "information-exposure, insecure-config, other"
     prompt = (
         f"Project: {project.name}\n\n"
         f"Structure (sample):\n{structure}\n\n"
-        f"Source files under review:\n{context['blocks'] or '(no file contents retrieved)'}\n"
-    )
-    if kind == "tests":
-        test_note = (
-            "\n\nTest files found:\n"
-            + "\n".join(context["test_files"] or ["(none)"])
-            + "\n\n"
-            + (
-                "Test file contents (sample):\n" + context["test_blocks"]
-                if context["test_blocks"]
-                else ""
-            )
-        )
-        prompt += test_note
-    prompt += (
-        f"\n\n{intro}\n\n"
+        f"Source files under review:\n{context['blocks'] or '(no file contents retrieved)'}\n\n"
+        f"{intro}\n\n"
         f"For findings, {category}.\n"
         "Set confidence 'confirmed' only when the shown files prove the issue; "
         "otherwise use 'potential' or 'suggestion'.\n" + _JSON_SCHEMA
     )
-    return _run_json(prompt, kind=kind, threshold=config.get("severity_threshold"))
+    return _run_json(prompt, kind="security", threshold=config.get("severity_threshold"))

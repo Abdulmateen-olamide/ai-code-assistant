@@ -115,6 +115,40 @@ QUALITY_JSON_REPLY = json.dumps(
     }
 )
 
+TESTS_JSON_REPLY = json.dumps(
+    {
+        "summary": {"overall_assessment": "Tests need work."},
+        "findings": [
+            {
+                "file": "tests/test_app.py",
+                "line": 5,
+                "severity": "high",
+                "category": "coverage-gap",
+                "explanation": "The error path is never exercised.",
+                "recommendation": "Add a test for the failure branch.",
+                "confidence": "confirmed",
+            },
+            {
+                "file": "tests/test_app.py",
+                "line": 12,
+                "severity": "medium",
+                "category": "missing-assertion",
+                "explanation": "The test calls the function but asserts nothing.",
+                "recommendation": "Assert the returned value.",
+                "confidence": "confirmed",
+            },
+            {
+                "file": "tests/test_worker.py",
+                "severity": "medium",
+                "category": "flaky-test",
+                "explanation": "The test depends on a real timer sleep.",
+                "recommendation": "Inject a clock.",
+                "confidence": "potential",
+            },
+        ],
+    }
+)
+
 
 class TestParseReviewResponse:
     def test_parses_json_findings(self, app):
@@ -181,6 +215,23 @@ class TestParseReviewResponse:
         result = reviews.parse_review_response(json.dumps(payload), kind="quality")
         categories = [f["category"] for f in result["findings"]]
         assert categories == ["readability", "dead-code", "other"]
+
+    def test_tests_categories_include_new_test_concerns(self, app):
+        payload = {
+            "findings": [
+                {"explanation": "x", "category": "coverage-gap"},
+                {"explanation": "y", "category": "missing-assertion"},
+                {"explanation": "z", "category": "flaky-test"},
+                {"explanation": "w", "category": "readability"},
+            ]
+        }
+        result = reviews.parse_review_response(json.dumps(payload), kind="tests")
+        assert [f["category"] for f in result["findings"]] == [
+            "coverage-gap",
+            "missing-assertion",
+            "flaky-test",
+            "other",
+        ]
 
 
 def _pr_file(name, patch="x", status="modified", additions=1, deletions=0):
@@ -254,6 +305,35 @@ class TestAnalyzeCodeQuality:
             "severity_threshold": "low",
         }
         assert reviews.review_project(project, "quality", config) == reviews.analyze_code_quality(
+            project, config
+        )
+
+
+class TestAnalyzeTests:
+    def test_structured_findings_cover_test_concerns(self, app, monkeypatch):
+        project = _ready_project([("tests/test_app.py", "def test_x():\n    pass\n")])
+        monkeypatch.setattr(reviews, "get_provider", lambda: FakeProvider(TESTS_JSON_REPLY))
+        config = {
+            "languages": None,
+            "max_files": 40,
+            "max_context_chars": 40000,
+            "severity_threshold": "low",
+        }
+        result = reviews.analyze_tests(project, config)
+        assert result["error"] is None
+        categories = {f["category"] for f in result["findings"]}
+        assert {"coverage-gap", "missing-assertion", "flaky-test"} <= categories
+
+    def test_review_project_tests_delegates_to_analyze_tests(self, app, monkeypatch):
+        project = _ready_project([("app/main.py", "x")])
+        monkeypatch.setattr(reviews, "get_provider", lambda: FakeProvider(TESTS_JSON_REPLY))
+        config = {
+            "languages": None,
+            "max_files": 40,
+            "max_context_chars": 40000,
+            "severity_threshold": "low",
+        }
+        assert reviews.review_project(project, "tests", config) == reviews.analyze_tests(
             project, config
         )
 

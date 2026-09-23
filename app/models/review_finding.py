@@ -48,7 +48,10 @@ SECURITY_CATEGORIES = (
     "other",
 )
 TEST_CATEGORIES = (
+    "coverage-gap",
     "missing-tests",
+    "missing-assertion",
+    "flaky-test",
     "edge-case",
     "weak-coverage",
     "outdated-test",
