@@ -199,8 +199,9 @@ developer tooling. This project is built incrementally across phases:
   `[SUGGESTION]` (inference), and project reviews drop findings below the
   configured `REVIEW_SEVERITY_THRESHOLD`.
 - **Project reviews** — run quality (`analyze_code_quality`: readability,
-  maintainability, duplication, dead code), security, and test-analysis reviews
-  over an imported project; repository content is explicitly framed as untrusted
+  maintainability, duplication, dead code), security, and test-analysis
+  (`analyze_tests`: coverage gaps, missing assertions, flaky tests) reviews over
+  an imported project; repository content is explicitly framed as untrusted
   data in the prompt to resist prompt injection.
 - **Review history & configuration** — per-project review history with a
   config snapshot on each run, and per-project review configuration (kinds,
