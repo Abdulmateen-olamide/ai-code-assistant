@@ -81,6 +81,40 @@ JSON_REPLY = json.dumps(
     }
 )
 
+QUALITY_JSON_REPLY = json.dumps(
+    {
+        "summary": {"overall_assessment": "Mixed quality."},
+        "findings": [
+            {
+                "file": "app/main.py",
+                "line": 3,
+                "severity": "high",
+                "category": "readability",
+                "explanation": "Deeply nested conditionals hurt readability.",
+                "recommendation": "Extract a helper.",
+                "confidence": "confirmed",
+            },
+            {
+                "file": "app/legacy.py",
+                "line": 1,
+                "severity": "medium",
+                "category": "dead-code",
+                "explanation": "An unreachable branch is never executed.",
+                "recommendation": "Delete the dead branch.",
+                "confidence": "potential",
+            },
+            {
+                "file": "app/dup.py",
+                "severity": "medium",
+                "category": "duplication",
+                "explanation": "Duplicated parsing logic.",
+                "recommendation": "Reuse a single function.",
+                "confidence": "confirmed",
+            },
+        ],
+    }
+)
+
 
 class TestParseReviewResponse:
     def test_parses_json_findings(self, app):
@@ -136,6 +170,18 @@ class TestParseReviewResponse:
         assert pr_result["findings"][0]["category"] == "other"
         assert tests_result["findings"][0]["category"] == "missing-tests"
 
+    def test_quality_categories_include_readability_and_dead_code(self, app):
+        payload = {
+            "findings": [
+                {"explanation": "x", "category": "readability"},
+                {"explanation": "y", "category": "dead-code"},
+                {"explanation": "z", "category": "bug"},
+            ]
+        }
+        result = reviews.parse_review_response(json.dumps(payload), kind="quality")
+        categories = [f["category"] for f in result["findings"]]
+        assert categories == ["readability", "dead-code", "other"]
+
 
 def _pr_file(name, patch="x", status="modified", additions=1, deletions=0):
     return {
@@ -181,6 +227,35 @@ class TestBuildPrContext:
         files = [_pr_file("tests/test_app.py", status="added"), _pr_file("app.py")]
         context = reviews.build_pr_context({"number": 1}, files, config)
         assert context["test_files"] == ["tests/test_app.py"]
+
+
+class TestAnalyzeCodeQuality:
+    def test_structured_findings_cover_named_concerns(self, app, monkeypatch):
+        project = _ready_project([("app/main.py", "def f():\n    pass\n")])
+        monkeypatch.setattr(reviews, "get_provider", lambda: FakeProvider(QUALITY_JSON_REPLY))
+        config = {
+            "languages": None,
+            "max_files": 40,
+            "max_context_chars": 40000,
+            "severity_threshold": "low",
+        }
+        result = reviews.analyze_code_quality(project, config)
+        assert result["error"] is None
+        categories = {f["category"] for f in result["findings"]}
+        assert {"readability", "dead-code", "duplication"} <= categories
+
+    def test_review_project_quality_delegates_to_analyze_code_quality(self, app, monkeypatch):
+        project = _ready_project([("app/main.py", "x")])
+        monkeypatch.setattr(reviews, "get_provider", lambda: FakeProvider(QUALITY_JSON_REPLY))
+        config = {
+            "languages": None,
+            "max_files": 40,
+            "max_context_chars": 40000,
+            "severity_threshold": "low",
+        }
+        assert reviews.review_project(project, "quality", config) == reviews.analyze_code_quality(
+            project, config
+        )
 
 
 class TestReviewRun:
