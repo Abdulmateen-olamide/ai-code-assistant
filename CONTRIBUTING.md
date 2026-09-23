@@ -360,10 +360,122 @@ see [docs/stellar.md](docs/stellar.md).
 ### Developing against a Stellar network
 
 - Defaults are **testnet** — safe for development.
-- To point at a local node: set `STELLAR_NETWORK=custom` and
-  `STELLAR_HORIZON_URL`/`STELLAR_RPC_URL` to loopback endpoints.
-- The test suite uses deterministic fixtures and mocked transport; no real
-  network access is required. Add fixtures rather than hitting live nodes.
+- The network configuration and endpoint safety rules are described in
+  [`docs/stellar.md`](docs/stellar.md#network-configuration) and
+  [`docs/soroban.md`](docs/soroban.md#security-model). The short local-node
+  walkthrough below uses the repository's documented mock, so it does not
+  require a locally installed `stellar-core` or `stellar-rpc`.
+
+#### Local development node walkthrough
+
+1. In the activated virtual environment, start the deterministic read-only
+  mock in one terminal and leave it running:
+
+  ```bash
+  python -m app.services.stellar_mock
+  ```
+
+  The process prints an ephemeral loopback port, for example:
+
+  ```text
+  Horizon: http://127.0.0.1:54321
+  RPC:     http://127.0.0.1:54321/rpc
+  ```
+
+  The mock implements the Horizon-style and read-only RPC methods used by the
+  app. It is the same implementation exercised by
+  [`tests/test_stellar_mock_network.py`](tests/test_stellar_mock_network.py),
+  and can be stopped with `Ctrl+C`.
+
+2. In a second terminal, use the port printed by the mock. Configure the
+  application explicitly as a custom loopback network. PowerShell:
+
+  ```powershell
+  $env:STELLAR_NETWORK = "custom"
+  $env:STELLAR_HORIZON_URL = "http://127.0.0.1:54321"
+  $env:STELLAR_RPC_URL = "http://127.0.0.1:54321/rpc"
+  ```
+
+  Bash or zsh:
+
+  ```bash
+  export STELLAR_NETWORK=custom
+  export STELLAR_HORIZON_URL=http://127.0.0.1:54321
+  export STELLAR_RPC_URL=http://127.0.0.1:54321/rpc
+  ```
+
+  Replace `54321` with the port printed in the first terminal. Keep the
+  `/rpc` suffix on `STELLAR_RPC_URL`; the Horizon URL is the base URL.
+
+3. Verify the live RPC path through the same command contributors use for
+  troubleshooting:
+
+  ```bash
+  flask --app wsgi stellar health
+  ```
+
+  A healthy mock prints `status: healthy`, a latest ledger, a retention
+  window, and a protocol version. Use `--json` for a scriptable check. A
+  service error or unreachable node exits with code `2`; invalid input exits
+  with code `3` as documented in [`docs/stellar.md`](docs/stellar.md#cli).
+
+For a real local `stellar-core`/`stellar-rpc`, use the same three settings and
+point both URLs at that node's loopback listeners. The app accepts custom
+endpoints only on loopback hosts; public-network endpoints require HTTPS and
+the clients refuse redirects, enforce timeouts, and cap response sizes. Never
+put a user- or project-supplied URL into this configuration. See
+[`docs/soroban.md`](docs/soroban.md#network-configuration) for the full
+configuration model and [`app/services/stellar_mock.py`](app/services/stellar_mock.py)
+for the mock's supported fixture surface.
+
+#### Extending a Stellar feature end to end
+
+Use a small read-only inspection method as the model. For example, adding a
+new inspection of a bounded RPC value should follow this sequence:
+
+1. **Service method:** add the developer-facing function in
+  `app/services/stellar_inspection.py`, and use the existing
+  `SorobanRpcClient`/`StellarService` instead of making a new HTTP call. Keep
+  address or key validation, result bounds, and explicit “not found” or
+  “undecodable” results consistent with the neighboring inspection methods.
+  The transport rules are centralized in `app/services/soroban_rpc.py` and
+  `app/services/stellar.py`; do not accept a URL, sign, simulate, or submit a
+  transaction.
+2. **Test the service first:** add deterministic assertions beside the related
+  tests in `tests/test_stellar_inspection.py` or
+  `tests/test_stellar_mock_network.py`. Extend the mock fixture only with
+  bounded, read-only data when the method needs a new response shape. Add
+  invalid-input, unavailable-node, and malformed/unsupported-data coverage
+  where applicable. Do not call a public Stellar network from tests.
+3. **Expose it through the CLI:** add a command in
+  `app/services/stellar_cli.py` using the existing exit-code and `--json`
+  conventions. Add success and error cases to `tests/test_stellar_cli.py`.
+  Reuse the service method so CLI and web results cannot drift.
+4. **Expose it through the API/UI when it is user-facing:** add the
+  authenticated read-only route in `app/stellar/routes.py`, wire the control
+  into `app/static/js/stellar.js` and its template if needed, and add route
+  coverage in `tests/test_stellar_routes.py`. For project-specific behavior,
+  use the owner-scoped workspace route and existing analysis gates rather than
+  creating a parallel authorization path.
+5. **Update the docs:** record the method and its honest limits in
+  [`docs/stellar.md`](docs/stellar.md), add RPC/security detail to
+  [`docs/soroban.md`](docs/soroban.md) only when the RPC contract changed, and
+  update the command/API list here. Link to the implementation and tests so
+  the next contributor can follow the same path.
+
+For a **new detection signal**, the analogous path is
+`detect_stellar_project()` in `app/services/stellar_detection.py` -> focused
+cases in `tests/test_stellar_detection.py` (and the `_extra` or import tests
+when relevant) -> `project_stellar_metadata()` and the existing import,
+workspace API, project panel, and analysis consumers -> the detection section
+of [`docs/stellar.md`](docs/stellar.md#project-detection). Detection must be
+evidence-based with `none`/`possible`/`likely` confidence; plain Rust and
+keyword-only prose must remain non-Stellar.
+
+Before opening a PR, run the focused Stellar command list below and then the
+full suite. Keep the SSRF, read-only, bounded-response, owner-authorization,
+and no-fabrication rules intact; these are security invariants, not optional
+implementation details.
 
 ### Testing Stellar work
 
