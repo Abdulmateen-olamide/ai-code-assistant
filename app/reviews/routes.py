@@ -44,6 +44,7 @@ from app.services.github import (
     GitHubError,
     GitHubInvalidError,
     get_github_client,
+    github_error_payload,
     pull_request_payload,
     validate_full_name,
 )
@@ -229,7 +230,7 @@ def _run_pr_review(data: dict):
     try:
         full_name = validate_full_name(data.get("repo") or "")
     except GitHubInvalidError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(github_error_payload(exc)), 400
     try:
         number = int(data.get("pr_number"))
     except (TypeError, ValueError):
@@ -241,13 +242,13 @@ def _run_pr_review(data: dict):
     try:
         client = get_github_client()
     except GitHubError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(github_error_payload(exc)), 400
 
     try:
         pr_raw = client.get_pull_request(full_name, number)
         files = client.list_pull_request_files(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     pr = pull_request_payload(pr_raw)
     config = _effective_config(project) if project else _config_payload(None)
