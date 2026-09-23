@@ -2151,6 +2151,14 @@ a:hover {
   overflow-x: auto;
 }
 
+.stellar-account-network {
+  margin: 0 0 10px;
+}
+
+.stellar-account-network .tag {
+  text-transform: uppercase;
+}
+
 .stellar-table {
   border-collapse: collapse;
   min-width: 620px;
