@@ -95,6 +95,43 @@ class TestGetAssets:
                 service.get_assets(limit="many")
 
 
+class TestGetOperation:
+    def test_success_is_bounded(self, app):
+        payload = {
+            "id": "42",
+            "type": "payment",
+            "source_account": VALID_ADDRESS,
+            "created_at": "2024-01-01T00:00:00Z",
+            "transaction_hash": "a" * 64,
+            "transaction_ledger": 100,
+            "transaction_successful": True,
+            "ledger": 100,
+            "amount": "secret-unrequested-field",
+        }
+        session = _FakeSession(_FakeResponse(200, payload))
+        with app.app_context():
+            service = StellarService(session=session)
+            operation = service.get_operation("42")
+        assert operation["type"] == "payment"
+        assert operation["transaction_ledger"] == 100
+        assert "amount" not in operation
+        assert session.requested_url.endswith("/operations/42")
+
+    def test_invalid_id(self, app):
+        with app.app_context():
+            service = StellarService()
+            for value in ("", "abc", "0", -1):
+                with pytest.raises(StellarError):
+                    service.get_operation(value)
+
+    def test_not_found_uses_existing_error_taxonomy(self, app):
+        session = _FakeSession(_FakeResponse(404))
+        with app.app_context():
+            service = StellarService(session=session)
+            with pytest.raises(AccountError):
+                service.get_operation(42)
+
+
 class TestGetAccountTransactions:
     def test_success(self, app):
         payload = {

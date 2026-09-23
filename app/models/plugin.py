@@ -24,6 +24,8 @@ class Plugin(db.Model):
     dependencies = db.Column(db.JSON, default=[])
     compatibility = db.Column(db.String(256), nullable=True)
     configuration = db.Column(db.JSON, default={})
+    trust_state = db.Column(db.String(16), nullable=False, default="Unverified")
+    trust_publisher = db.Column(db.String(256), nullable=True)
 
     enabled = db.Column(db.Boolean, default=True)
     installed_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), nullable=False)
@@ -56,6 +58,8 @@ class Plugin(db.Model):
             "dependencies": self.dependencies or [],
             "compatibility": self.compatibility,
             "configuration": self.configuration or {},
+            "trust_state": self.trust_state,
+            "trust_publisher": self.trust_publisher,
             "enabled": self.enabled,
             "installed_at": self.installed_at.isoformat() if self.installed_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

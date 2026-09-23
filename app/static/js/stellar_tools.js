@@ -139,13 +139,26 @@
   function renderAccount(data) {
     var html = "";
     if (!data || !data.account) return empty("No account data returned.");
+    var account = data.account;
+    var balances = account.balances || [];
+    var nativeBalances = balances.filter(function (balance) {
+      return balance.asset_type === "native";
+    });
+    var trustlines = balances.filter(function (balance) {
+      return balance.asset_type !== "native";
+    });
+    var flags = account.flags || {};
+    var signers = account.signers || [];
+    var dataEntries = account.data || {};
+    var transactions = (data.transactions && data.transactions.records) || [];
+
     html += kvList([
       ["Address", data.address || ""],
       ["Network", (data.network && data.network.network) || ""],
-      ["Sequence", String(data.account.sequence != null ? data.account.sequence : "")],
+      ["Sequence", String(account.sequence != null ? account.sequence : "")],
       [
         "Subentry count",
-        String(data.account.subentry_count != null ? data.account.subentry_count : ""),
+        String(account.subentry_count != null ? account.subentry_count : ""),
       ],
       [
         "Ledger freshness",
@@ -154,9 +167,11 @@
           : "unavailable",
       ],
     ]);
-    if (data.account.balances && data.account.balances.length) {
-      html += '<h4 class="metric-title">Balances</h4><ul class="metric-list">';
-      data.account.balances.forEach(function (balance) {
+
+    html += '<h4 class="metric-title">Balances</h4>';
+    if (nativeBalances.length) {
+      html += '<ul class="metric-list">';
+      nativeBalances.forEach(function (balance) {
         var asset = balance.asset_code
           ? balance.asset_code + ":" + (balance.asset_issuer || "")
           : balance.asset_type;
@@ -164,7 +179,81 @@
           "<li><code>" + esc(asset) + "</code> — " + esc(balance.balance) + "</li>";
       });
       html += "</ul>";
+    } else {
+      html += empty("No native balance returned.");
     }
+
+    html += '<h4 class="metric-title">Trustlines</h4>';
+    if (trustlines.length) {
+      html += '<div class="stellar-table-wrap"><table class="stellar-table"><thead><tr>';
+      html += "<th>Asset</th><th>Balance</th><th>Limit</th><th>Authorization</th>";
+      html += "</tr></thead><tbody>";
+      trustlines.forEach(function (balance) {
+        var asset = balance.asset_code || balance.asset_type || "Unknown asset";
+        var authorization = balance.is_authorized === undefined
+          ? "not reported"
+          : balance.is_authorized ? "authorized" : "unauthorized";
+        html +=
+          "<tr><td><code>" + esc(asset) + "</code><br><small>" +
+          esc(balance.asset_issuer || "") + "</small></td><td>" +
+          esc(balance.balance || "") + "</td><td>" + esc(balance.limit || "") +
+          "</td><td>" + esc(authorization) + "</td></tr>";
+      });
+      html += "</tbody></table></div>";
+    } else {
+      html += empty("No trustlines found.");
+    }
+
+    html += '<h4 class="metric-title">Account flags</h4>';
+    if (Object.keys(flags).length) {
+      html += kvList(Object.keys(flags).map(function (key) {
+        return [key, flags[key] ? "enabled" : "disabled"];
+      }));
+    } else {
+      html += empty("No account flags returned.");
+    }
+
+    html += '<h4 class="metric-title">Signers</h4>';
+    if (signers.length) {
+      html += '<ul class="metric-list">';
+      signers.forEach(function (signer) {
+        html += "<li><code>" + esc(signer.key || "") + "</code> — " +
+          esc(signer.type || "signer") + ", weight " + esc(signer.weight) + "</li>";
+      });
+      html += "</ul>";
+    } else {
+      html += empty("No additional signers returned.");
+    }
+
+    html += '<h4 class="metric-title">Manage-data entries</h4>';
+    if (Object.keys(dataEntries).length) {
+      html += '<ul class="metric-list">';
+      Object.keys(dataEntries).forEach(function (key) {
+        html += "<li><code>" + esc(key) + "</code> — " + esc(dataEntries[key]) + "</li>";
+      });
+      html += "</ul>";
+    } else {
+      html += empty("No manage-data entries returned.");
+    }
+
+    html += '<h4 class="metric-title">Recent transactions</h4>';
+    if (transactions.length) {
+      html += '<div class="stellar-table-wrap"><table class="stellar-table"><thead><tr>';
+      html += "<th>Ledger</th><th>Created</th><th>Status</th><th>Hash</th><th>Memo</th>";
+      html += "</tr></thead><tbody>";
+      transactions.forEach(function (transaction) {
+        html += "<tr><td>" + esc(transaction.ledger) + "</td><td>" +
+          esc(transaction.created_at || "") + "</td><td>" +
+          esc(transaction.successful === false ? "failed" : "successful") +
+          "</td><td><code>" + esc(transaction.hash || "") + "</code></td><td>" +
+          esc(transaction.memo || "") + "</td></tr>";
+      });
+      html += "</tbody></table></div>";
+    } else {
+      html += empty("No recent transactions found.");
+    }
+
+    html += '<p class="field-hint">Account and transaction details are read-only Horizon data on the selected network.</p>';
     return html;
   }
 

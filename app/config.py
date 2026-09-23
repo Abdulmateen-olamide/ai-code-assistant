@@ -7,6 +7,7 @@ repository; supply them through environment variables or a local ``.env``
 file (see ``.env.example``).
 """
 
+import json
 import os
 from pathlib import Path
 from typing import ClassVar
@@ -42,6 +43,19 @@ def _db_uri() -> str:
     return uri
 
 
+def _trusted_plugin_keys() -> dict[str, str]:
+    value = os.getenv("PLUGIN_TRUSTED_KEYS", "")
+    if not value:
+        return {}
+    try:
+        keys = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("PLUGIN_TRUSTED_KEYS must be a JSON object") from exc
+    if not isinstance(keys, dict) or not all(isinstance(key, str) for key in keys):
+        raise RuntimeError("PLUGIN_TRUSTED_KEYS must be a JSON object of publisher keys")
+    return keys
+
+
 class Config:
     """Base configuration shared by all environments."""
 
@@ -66,6 +80,11 @@ class Config:
     # as a version; when a prompt is deleted its history is retained for this
     # many days before being purged.
     PROMPT_VERSION_RETENTION_DAYS = int(os.getenv("PROMPT_VERSION_RETENTION_DAYS", "30"))
+
+    # Plugin manifest authenticity. ``if-present`` preserves the default local
+    # plugin behavior; ``required`` rejects unsigned and invalid manifests.
+    PLUGIN_TRUST_POLICY = os.getenv("PLUGIN_TRUST_POLICY", "if-present")
+    PLUGIN_TRUSTED_KEYS = _trusted_plugin_keys()
 
     # GitHub OAuth integration.
     GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")

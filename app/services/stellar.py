@@ -568,7 +568,8 @@ class StellarService:
             address: Stellar account id (G...)
 
         Returns:
-            Bounded account data (id, sequence, balances, subentry count).
+            Bounded account data including balances, trustline metadata,
+            account flags, signers, and manage-data entries.
 
         Raises:
             AccountError: If the address is invalid or the account does not exist.
@@ -579,16 +580,41 @@ class StellarService:
 
         path = f"{self._config.horizon_url}/accounts/{address}"
         data = self._get_json(path)
+        flags = data.get("flags") or {}
         return {
             "account_id": data.get("account_id", address),
             "sequence": data.get("sequence"),
             "subentry_count": data.get("subentry_count"),
+            "flags": {
+                key: flags.get(key)
+                for key in (
+                    "auth_required",
+                    "auth_revocable",
+                    "auth_immutable",
+                    "auth_clawback_enabled",
+                )
+                if key in flags
+            },
+            "signers": [
+                {
+                    "key": signer.get("key"),
+                    "weight": signer.get("weight"),
+                    "type": signer.get("type"),
+                }
+                for signer in (data.get("signers") or [])[:20]
+            ],
+            "data": dict(list((data.get("data") or {}).items())[:50]),
             "balances": [
                 {
                     "asset_type": b.get("asset_type"),
                     "asset_code": b.get("asset_code"),
                     "asset_issuer": b.get("asset_issuer"),
                     "balance": b.get("balance"),
+                    "limit": b.get("limit"),
+                    "is_authorized": b.get("is_authorized"),
+                    "is_authorized_to_maintain_liabilities": b.get(
+                        "is_authorized_to_maintain_liabilities"
+                    ),
                 }
                 for b in (data.get("balances") or [])
             ][:50],
@@ -704,6 +730,26 @@ class StellarService:
             "records": bounded,
             "next": (data.get("_links") or {}).get("next", {}).get("href"),
             "prev": (data.get("_links") or {}).get("prev", {}).get("href"),
+        }
+
+    def get_operation(self, operation_id: int | str) -> dict:
+        """Fetch bounded operation metadata from Horizon (read-only)."""
+        if isinstance(operation_id, bool):
+            raise StellarError(f"Invalid operation id: {operation_id}")
+        text = str(operation_id).strip()
+        if not text.isdigit() or int(text) <= 0 or len(text) > 20:
+            raise StellarError(f"Invalid operation id: {operation_id}")
+
+        data = self._get_json(f"{self._config.horizon_url}/operations/{int(text)}")
+        return {
+            "id": data.get("id"),
+            "type": data.get("type"),
+            "source_account": data.get("source_account"),
+            "created_at": data.get("created_at"),
+            "transaction_hash": data.get("transaction_hash"),
+            "transaction_ledger": data.get("transaction_ledger"),
+            "transaction_successful": data.get("transaction_successful"),
+            "ledger": data.get("ledger"),
         }
 
     def get_account_transactions(self, address: str, limit: int = 20) -> dict:

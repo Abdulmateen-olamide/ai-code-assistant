@@ -2125,3 +2125,34 @@ a:hover {
   overflow: auto;
   font-size: 0.8rem;
 }
+
+.stellar-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.stellar-table {
+  border-collapse: collapse;
+  min-width: 620px;
+  width: 100%;
+}
+
+.stellar-table th,
+.stellar-table td {
+  border-bottom: 1px solid var(--border, #ddd);
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.stellar-table th {
+  color: var(--text-muted, #666);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.stellar-table small {
+  color: var(--text-muted, #666);
+  word-break: break-all;
+}

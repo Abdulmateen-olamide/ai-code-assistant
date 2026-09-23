@@ -1,7 +1,7 @@
 """add prompt version history
 
 Revision ID: a1b2c3d4e5f6
-Revises: e2f3a4b5c6d7
+Revises: f7a6b5c4d3e2
 Create Date: 2026-09-23 15:00:00.000000
 
 """
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = 'a1b2c3d4e5f6'
-down_revision = 'e2f3a4b5c6d7'
+down_revision = 'f7a6b5c4d3e2'
 branch_labels = None
 depends_on = None
 

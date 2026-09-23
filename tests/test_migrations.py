@@ -32,6 +32,8 @@ EXPECTED_COLUMNS = {
         "dependencies",
         "compatibility",
         "configuration",
+        "trust_state",
+        "trust_publisher",
         "enabled",
         "installed_at",
         "updated_at",
@@ -244,7 +246,7 @@ class TestMigrationHead:
             db_url = f"sqlite:///{os.path.join(tmp, 'mig6.db')}"
             up = _run_flask(["db", "upgrade"], {"DATABASE_URL": db_url})
             assert up.returncode == 0, up.stderr
-            down = _run_flask(["db", "downgrade", "e2f3a4b5c6d7"], {"DATABASE_URL": db_url})
+            down = _run_flask(["db", "downgrade", "f7a6b5c4d3e2"], {"DATABASE_URL": db_url})
             assert down.returncode == 0, down.stderr
             with _inspect(db_url) as insp:
                 tables = set(insp.get_table_names())
