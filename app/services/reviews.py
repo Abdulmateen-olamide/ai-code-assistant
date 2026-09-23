@@ -523,6 +523,13 @@ def analyze_tests(project, config: dict) -> dict:
     return _run_json(prompt, kind="tests", threshold=config.get("severity_threshold"))
 
 
+_SECURITY_CATEGORY_HINT = (
+    "use categories: authentication, authorization, input-validation, "
+    "file-access, secrets, injection, unsafe-dependencies, "
+    "information-exposure, insecure-config, other"
+)
+
+
 def review_project(project, kind: str, config: dict) -> dict:
     """Review an imported project (quality/security/tests) and return findings."""
     kind = (kind or "").strip().lower()
@@ -544,15 +551,12 @@ def review_project(project, kind: str, config: dict) -> dict:
         "report it. For dependency concerns that require a registry or "
         "advisory source, mark them 'suggestion' and recommend verification."
     )
-    category = "use categories: authentication, authorization, input-validation, "
-    "file-access, secrets, injection, unsafe-dependencies, "
-    "information-exposure, insecure-config, other"
     prompt = (
         f"Project: {project.name}\n\n"
         f"Structure (sample):\n{structure}\n\n"
         f"Source files under review:\n{context['blocks'] or '(no file contents retrieved)'}\n\n"
         f"{intro}\n\n"
-        f"For findings, {category}.\n"
+        f"For findings, {_SECURITY_CATEGORY_HINT}.\n"
         "Set confidence 'confirmed' only when the shown files prove the issue; "
         "otherwise use 'potential' or 'suggestion'.\n" + _JSON_SCHEMA
     )
