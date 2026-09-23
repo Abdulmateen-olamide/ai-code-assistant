@@ -12,6 +12,8 @@
   var titleEl = document.getElementById("prompt-title");
   var categoryInputEl = document.getElementById("prompt-category");
   var contentEl = document.getElementById("prompt-content");
+  var historyEl = document.getElementById("prompt-history");
+  var versionsEl = document.getElementById("prompt-versions");
   var editingId = null;
 
   var CSRF_TOKEN = null;
@@ -120,6 +122,14 @@
     categoryInputEl.value = prompt ? prompt.category : "";
     contentEl.value = prompt ? prompt.content : "";
     document.getElementById("prompt-editor-title").textContent = prompt ? "Edit Prompt" : "New Prompt";
+    if (prompt) {
+      historyEl.hidden = false;
+      versionsEl.innerHTML = '<p class="sidebar-empty">Loading versions...</p>';
+      loadVersions(prompt.id);
+    } else {
+      historyEl.hidden = true;
+      versionsEl.innerHTML = "";
+    }
     editorEl.hidden = false;
     editorEl.scrollIntoView();
     titleEl.focus();
@@ -127,7 +137,73 @@
 
   function closeEditor() {
     editorEl.hidden = true;
+    historyEl.hidden = true;
     editingId = null;
+  }
+
+  function formatDate(value) {
+    if (!value) return "";
+    var parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+  }
+
+  function loadVersions(id) {
+    api("/prompts/api/prompts/" + id + "/versions")
+      .then(renderVersions)
+      .catch(function (error) {
+        historyEl.hidden = true;
+        flashError(error.message);
+      });
+  }
+
+  function renderVersions(versions) {
+    versionsEl.innerHTML = "";
+    if (!versions.length) {
+      versionsEl.innerHTML = '<p class="sidebar-empty">No versions yet.</p>';
+      return;
+    }
+    var latestId = versions[versions.length - 1].id;
+    versions.slice().reverse().forEach(function (version) {
+      var entry = document.createElement("div");
+      entry.className = "prompt-version";
+      var diff = version.diff
+        ? '<pre class="prompt-diff">' + escapeHtml(version.diff) + "</pre>"
+        : '<p class="prompt-version-meta">Initial version.</p>';
+      var action =
+        version.id === latestId
+          ? '<span class="prompt-version-current">current</span>'
+          : '<button class="btn btn-ghost btn-sm" data-action="revert" data-version="' +
+            version.id +
+            '">Revert</button>';
+      entry.innerHTML =
+        '<div class="prompt-version-header">' +
+        "<strong>v" + version.version + "</strong>" +
+        '<span class="prompt-version-meta">' + escapeHtml(formatDate(version.created_at)) + "</span>" +
+        action +
+        "</div>" +
+        '<p class="prompt-version-title">' + escapeHtml(version.title) + "</p>" +
+        diff;
+      versionsEl.appendChild(entry);
+    });
+  }
+
+  function revertVersion(versionId) {
+    if (!editingId) return;
+    api("/prompts/api/prompts/" + editingId, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revert_to_version: versionId }),
+    })
+      .then(function (prompt) {
+        titleEl.value = prompt.title;
+        categoryInputEl.value = prompt.category;
+        contentEl.value = prompt.content;
+        loadVersions(prompt.id);
+        refresh();
+      })
+      .catch(function (error) {
+        flashError(error.message);
+      });
   }
 
   function save() {
@@ -190,6 +266,11 @@
           flashError(error.message);
         });
       }
+    });
+
+    versionsEl.addEventListener("click", function (event) {
+      var button = event.target.closest("button[data-action='revert']");
+      if (button) revertVersion(button.dataset.version);
     });
   });
 })();

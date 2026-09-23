@@ -121,10 +121,10 @@ class TestMigrationUpgrade:
 
 
 class TestMigrationHead:
-    def test_head_is_latest_phase8(self):
+    def test_head_is_latest_revision(self):
         result = _run_flask(["db", "heads"], {"DATABASE_URL": "sqlite:///:memory:"})
         assert result.returncode == 0, result.stderr
-        assert "e2f3a4b5c6d7" in (result.stdout + result.stderr)
+        assert "a1b2c3d4e5f6" in (result.stdout + result.stderr)
 
     def test_users_stellar_network_column_upgraded(self):
         with _migration_db() as db_url, _inspect(db_url) as insp:
@@ -220,3 +220,32 @@ class TestMigrationHead:
             with _inspect(db_url) as insp:
                 tables = set(insp.get_table_names())
                 assert "plugin_error_reports" not in tables
+
+    def test_prompt_versions_table_upgraded(self):
+        expected = {
+            "id",
+            "prompt_id",
+            "version",
+            "title",
+            "content",
+            "category",
+            "changed_by",
+            "created_at",
+            "prompt_deleted_at",
+        }
+        with _migration_db() as db_url, _inspect(db_url) as insp:
+            tables = set(insp.get_table_names())
+            assert "prompt_versions" in tables
+            columns = {col["name"] for col in insp.get_columns("prompt_versions")}
+            assert columns == expected
+
+    def test_prompt_versions_downgrade_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_url = f"sqlite:///{os.path.join(tmp, 'mig6.db')}"
+            up = _run_flask(["db", "upgrade"], {"DATABASE_URL": db_url})
+            assert up.returncode == 0, up.stderr
+            down = _run_flask(["db", "downgrade", "e2f3a4b5c6d7"], {"DATABASE_URL": db_url})
+            assert down.returncode == 0, down.stderr
+            with _inspect(db_url) as insp:
+                tables = set(insp.get_table_names())
+                assert "prompt_versions" not in tables

@@ -62,6 +62,11 @@ class Config:
     # LLM provider backend: "mock" (default, offline) or "openai".
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
 
+    # Prompt library (Phase 3): version history. Every prompt save is recorded
+    # as a version; when a prompt is deleted its history is retained for this
+    # many days before being purged.
+    PROMPT_VERSION_RETENTION_DAYS = int(os.getenv("PROMPT_VERSION_RETENTION_DAYS", "30"))
+
     # GitHub OAuth integration.
     GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
     GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")

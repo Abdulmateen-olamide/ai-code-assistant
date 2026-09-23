@@ -107,7 +107,8 @@ developer tooling. This project is built incrementally across phases:
   server-sent-event (SSE) streaming, typing indicator, and client-side
   Markdown rendering with code blocks.
 - **Prompt management** — save, edit, delete, favorite, categorize, and search
-  reusable prompt templates.
+  reusable prompt templates, with version history (a version is recorded on
+  every save), a diff timeline, and revert-to-version.
 - **AI code generation** — generate code from natural language, plus code
   actions: explain, refactor, find bugs, optimize, add comments, write
   documentation, and draft commit messages.
@@ -493,6 +494,7 @@ All configuration is environment-driven (see `.env.example`):
 | `OPENAI_API_KEY`     | unset        | API key for the OpenAI provider          |
 | `OPENAI_BASE_URL`    | OpenAI       | Custom/compatible endpoint               |
 | `OPENAI_MODEL`       | `gpt-4o-mini`| Model used by the OpenAI provider        |
+| `PROMPT_VERSION_RETENTION_DAYS` | `30` | Days a deleted prompt's version history is kept before purging |
 | `MAX_CONTENT_LENGTH` | `16777216`   | Max uploaded file size in bytes          |
 | `GITHUB_CLIENT_ID`   | unset        | GitHub OAuth app client ID               |
 | `GITHUB_CLIENT_SECRET`| unset       | GitHub OAuth app client secret           |

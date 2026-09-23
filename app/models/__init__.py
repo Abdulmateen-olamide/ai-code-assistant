@@ -18,6 +18,7 @@ from app.models.project_comment import ProjectComment
 from app.models.project_file import ProjectFile
 from app.models.project_message import ProjectMessage
 from app.models.prompt import Prompt
+from app.models.prompt_version import PromptVersion
 from app.models.review import Review
 from app.models.review_config import ReviewConfig
 from app.models.review_finding import ReviewFinding
@@ -43,6 +44,7 @@ __all__ = [
     "ProjectFile",
     "ProjectMessage",
     "Prompt",
+    "PromptVersion",
     "Review",
     "ReviewConfig",
     "ReviewFinding",

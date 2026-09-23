@@ -7,6 +7,7 @@ from sqlalchemy import func
 from app.extensions import db
 from app.models import Prompt
 from app.prompts import bp
+from app.services import prompt_versions as prompt_versions_service
 
 
 def _get_prompt(prompt_id: int) -> Prompt:
@@ -75,6 +76,8 @@ def create_prompt():
         is_favorite=bool(data.get("is_favorite")),
     )
     db.session.add(prompt)
+    db.session.flush()
+    prompt_versions_service.record_version(prompt, changed_by=current_user.id)
     db.session.commit()
     return jsonify(prompt.to_dict()), 201
 
@@ -90,29 +93,92 @@ def get_prompt(prompt_id: int):
 @bp.route("/api/prompts/<int:prompt_id>", methods=["PATCH"])
 @login_required
 def update_prompt(prompt_id: int):
-    """Update a prompt's fields (title, content, category, favorite)."""
+    """Update a prompt's fields, or revert it to a previous version.
+
+    Passing ``revert_to_version`` (a version row id or version number) restores
+    that snapshot and records the restore as a new version. Otherwise any
+    change to title/content/category is recorded as a new version.
+    """
     prompt = _get_prompt(prompt_id)
     data = request.get_json(silent=True) or {}
+
+    if data.get("revert_to_version") is not None:
+        return _revert_prompt(prompt, data.get("revert_to_version"))
+
+    changed = False
     if "title" in data:
-        prompt.title = (data.get("title") or prompt.title).strip()[:200]
+        title = (data.get("title") or prompt.title).strip()[:200]
+        changed = changed or title != prompt.title
+        prompt.title = title
     if "content" in data:
-        prompt.content = (data.get("content") or "").strip()
-        if not prompt.content:
+        content = (data.get("content") or "").strip()
+        if not content:
             return jsonify({"error": "Content cannot be empty."}), 400
+        changed = changed or content != prompt.content
+        prompt.content = content
     if "category" in data:
-        prompt.category = (data.get("category") or "General").strip()[:80] or "General"
+        category = (data.get("category") or "General").strip()[:80] or "General"
+        changed = changed or category != prompt.category
+        prompt.category = category
     if "is_favorite" in data:
         prompt.is_favorite = bool(data["is_favorite"])
+
+    if changed:
+        prompt_versions_service.record_version(prompt, changed_by=current_user.id)
     db.session.commit()
     return jsonify(prompt.to_dict())
+
+
+def _revert_prompt(prompt: Prompt, selector):
+    """Restore ``prompt`` to the selected version, recording a new version."""
+    version = prompt_versions_service.resolve_version(prompt.id, selector)
+    if version is None:
+        return jsonify({"error": "Version not found."}), 404
+    prompt_versions_service.revert_to_version(prompt, version, changed_by=current_user.id)
+    db.session.commit()
+    return jsonify(prompt.to_dict())
+
+
+@bp.route("/api/prompts/<int:prompt_id>/revert", methods=["POST"])
+@login_required
+def revert_prompt(prompt_id: int):
+    """Revert a prompt to a version selected by ``version`` (id or number)."""
+    prompt = _get_prompt(prompt_id)
+    data = request.get_json(silent=True) or {}
+    selector = data.get("version", data.get("revert_to_version"))
+    if selector is None:
+        return jsonify({"error": "A version is required."}), 400
+    return _revert_prompt(prompt, selector)
+
+
+@bp.route("/api/prompts/<int:prompt_id>/versions", methods=["GET"])
+@login_required
+def list_prompt_versions(prompt_id: int):
+    """Return the prompt's version timeline (oldest first) with unified diffs."""
+    prompt = _get_prompt(prompt_id)
+    return jsonify(prompt_versions_service.version_timeline(prompt.id))
+
+
+@bp.route("/api/prompts/<int:prompt_id>/versions/<int:version_id>", methods=["GET"])
+@login_required
+def get_prompt_version(prompt_id: int, version_id: int):
+    """Return a single version, including its diff against the previous one."""
+    prompt = _get_prompt(prompt_id)
+    version = prompt_versions_service.get_version(prompt.id, version_id)
+    if version is None:
+        return jsonify({"error": "Version not found."}), 404
+    return jsonify(prompt_versions_service.version_payload(version))
 
 
 @bp.route("/api/prompts/<int:prompt_id>", methods=["DELETE"])
 @login_required
 def delete_prompt(prompt_id: int):
-    """Delete a prompt template."""
+    """Delete a prompt template, retaining its version history for a period."""
     prompt = _get_prompt(prompt_id)
+    prompt_versions_service.mark_prompt_deleted(prompt.id)
     db.session.delete(prompt)
+    db.session.commit()
+    prompt_versions_service.purge_expired_versions()
     db.session.commit()
     return jsonify({"ok": True})
 
