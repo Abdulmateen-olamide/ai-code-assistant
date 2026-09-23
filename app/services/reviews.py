@@ -436,26 +436,56 @@ def _project_structure_summary(project) -> str:
         return f"{project.file_count} files"
 
 
+_QUALITY_CATEGORY_HINT = (
+    "use categories: readability, complexity, long-function, duplication, "
+    "dead-code, error-handling, unused-code, maintainability, consistency, other"
+)
+
+
+def analyze_code_quality(project, config: dict) -> dict:
+    """Run a structured code-quality review over an imported project.
+
+    Surfaces readability, maintainability, duplication, and dead-code concerns
+    (plus complexity, long functions, error handling, and consistency) as
+    structured findings for the ``quality`` review kind. Uses the same bounded,
+    injection-resistant context and severity threshold as every other project
+    review, so findings are persisted as ``ReviewFinding`` rows by the route
+    layer.
+    """
+    context = _project_context(project, config, "quality")
+    structure = _project_structure_summary(project)
+    intro = (
+        "Analyze the code quality of this project. Surface readability, "
+        "maintainability, duplication, and dead-code concerns, together with "
+        "excessive complexity, long functions, poor error handling, and "
+        "inconsistent patterns. Do NOT flag code merely because it differs from "
+        "an arbitrary style preference; every finding must be tied to a concrete, "
+        "evidence-based maintainability concern."
+    )
+    prompt = (
+        f"Project: {project.name}\n\n"
+        f"Structure (sample):\n{structure}\n\n"
+        f"Source files under review:\n{context['blocks'] or '(no file contents retrieved)'}\n\n"
+        f"{intro}\n\n"
+        f"For findings, {_QUALITY_CATEGORY_HINT}.\n"
+        "Set confidence 'confirmed' only when the shown files prove the issue; "
+        "otherwise use 'potential' or 'suggestion'.\n" + _JSON_SCHEMA
+    )
+    return _run_json(prompt, kind="quality", threshold=config.get("severity_threshold"))
+
+
 def review_project(project, kind: str, config: dict) -> dict:
     """Review an imported project (quality/security/tests) and return findings."""
     kind = (kind or "").strip().lower()
     if kind not in ("quality", "security", "tests"):
         kind = "quality"
+    if kind == "quality":
+        return analyze_code_quality(project, config)
+
     context = _project_context(project, config, kind)
     structure = _project_structure_summary(project)
 
-    if kind == "quality":
-        intro = (
-            "Analyze the code quality of this project. Look for excessive "
-            "complexity, long functions, duplicate code, poor error handling, "
-            "unused code, maintainability problems, and inconsistent patterns. "
-            "Do NOT flag code merely because it differs from an arbitrary style "
-            "preference; every finding must be tied to a concrete, evidence-based "
-            "maintainability concern."
-        )
-        category = "use categories: complexity, long-function, duplication, "
-        "error-handling, unused-code, maintainability, consistency, other"
-    elif kind == "security":
+    if kind == "security":
         intro = (
             "Perform a security analysis of this project. Look for legitimate "
             "risks involving authentication, authorization, input validation, "
