@@ -21,6 +21,7 @@ from app.models.project_message import ProjectMessage
 from app.models.prompt import Prompt
 from app.models.prompt_version import PromptVersion
 from app.models.review import Review
+from app.models.review_comment import ReviewComment
 from app.models.review_config import ReviewConfig
 from app.models.review_finding import ReviewFinding
 from app.models.stellar_security_finding import StellarSecurityFinding
@@ -48,6 +49,7 @@ __all__ = [
     "Prompt",
     "PromptVersion",
     "Review",
+    "ReviewComment",
     "ReviewConfig",
     "ReviewFinding",
     "StellarSecurityFinding",
