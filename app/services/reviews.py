@@ -80,10 +80,20 @@ Use empty arrays for sections with no content. findings may be empty.
 """
 
 
+_TRUNCATION_MARKER = "\n…[context truncated]"
+
+
 def _clip(text: str, limit: int) -> str:
+    """Return ``text`` truncated so the result is never longer than ``limit``.
+
+    The truncation marker is included in the limit, so callers can rely on
+    ``len(_clip(text, limit)) <= max(limit, 0)``.
+    """
     if len(text) <= limit:
         return text
-    return text[:limit] + "\n…[context truncated]"
+    if limit <= len(_TRUNCATION_MARKER):
+        return text[: max(limit, 0)]
+    return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 
 def _budget() -> dict:
@@ -120,7 +130,12 @@ def is_test_path(path: str) -> bool:
 
 
 def _bounded_blocks(files: list, *, budget: int, per_file: int | None = None) -> str:
-    """Assemble bounded ```path\\ncontent``` blocks for a list of files."""
+    """Assemble bounded ```path\\ncontent``` blocks for a list of files.
+
+    The returned text — including the fenced-block wrappers — is clipped to
+    ``budget`` characters, so callers never send more than the configured
+    ``REVIEW_MAX_CONTEXT_CHARS`` of repository content to the model.
+    """
     blocks = []
     remaining = budget
     per_file = per_file or max(budget // 10, 2000)
@@ -134,7 +149,7 @@ def _bounded_blocks(files: list, *, budget: int, per_file: int | None = None) ->
         remaining -= len(chunk)
         if remaining <= 0:
             break
-    return "\n\n".join(blocks)
+    return _clip("\n\n".join(blocks), max(budget, 0))
 
 
 def _text_files(project) -> list:
@@ -353,8 +368,11 @@ def build_pr_context(pr: dict, files: list[dict], config: dict) -> dict:
             f"\n\nNote: only {len(selected)} of {len(files)} changed files are "
             "shown; the rest were excluded by the review limits."
         )
+    # Reserve room for the truncation note so the whole ``files_text`` context
+    # stays within ``max_context_chars`` (the note itself is never dropped).
+    body = _clip("\n\n".join(changed), max(budget - len(note), 0))
     return {
-        "files_text": _clip("\n\n".join(changed), budget) + note,
+        "files_text": body + note,
         "test_files": test_files,
         "selected_count": len(selected),
         "total_count": len(files),

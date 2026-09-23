@@ -280,6 +280,48 @@ class TestBuildPrContext:
         assert context["test_files"] == ["tests/test_app.py"]
 
 
+class TestContextBounding:
+    def test_clip_never_exceeds_limit(self, app):
+        assert len(reviews._clip("x" * 1000, 100)) <= 100
+        assert reviews._clip("short", 100) == "short"
+        assert len(reviews._clip("x" * 100, 0)) == 0
+
+    def test_pr_context_respects_char_budget_including_note(self, app):
+        config = {"languages": None, "max_files": 3, "max_context_chars": 3000}
+        files = [_pr_file(f"f{i}.py", patch="x" * 5000) for i in range(6)]
+        context = reviews.build_pr_context({"number": 1}, files, config)
+        assert len(context["files_text"]) <= 3000
+        assert "only 3 of 6 changed files" in context["files_text"]
+
+    def test_project_context_respects_char_budget(self, app):
+        project = _ready_project([("app/a.py", "x" * 5000), ("app/b.py", "y" * 5000)])
+        config = {
+            "languages": None,
+            "max_files": 40,
+            "max_context_chars": 2000,
+            "severity_threshold": "low",
+        }
+        context = reviews._project_context(project, config, "quality")
+        assert len(context["blocks"]) <= 2000
+
+    def test_project_context_language_filter(self, app):
+        project = _ready_project(
+            [("app/a.py", "python"), ("web/b.js", "js"), ("README.md", "markdown")]
+        )
+        config = {"languages": "py", "max_files": 40, "max_context_chars": 20000}
+        context = reviews._project_context(project, config, "quality")
+        assert "app/a.py" in context["blocks"]
+        assert "web/b.js" not in context["blocks"]
+        assert "README.md" not in context["blocks"]
+
+    def test_project_context_max_files(self, app):
+        project = _ready_project([(f"f{i}.py", "x") for i in range(5)])
+        config = {"languages": None, "max_files": 2, "max_context_chars": 20000}
+        context = reviews._project_context(project, config, "quality")
+        assert context["count"] == 2
+        assert context["blocks"].count("```") == 4
+
+
 class TestAnalyzeCodeQuality:
     def test_structured_findings_cover_named_concerns(self, app, monkeypatch):
         project = _ready_project([("app/main.py", "def f():\n    pass\n")])
