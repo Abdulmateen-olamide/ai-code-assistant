@@ -35,7 +35,7 @@ from flask_login import current_user, login_required
 from app.extensions import db
 from app.github import bp
 from app.models import GithubAccount
-from app.services import analysis
+from app.services import analysis, ratelimit
 from app.services.github import (
     GITHUB_AUTHORIZE_URL,
     GITHUB_TOKEN_URL,
@@ -82,18 +82,26 @@ def connect():
 @login_required
 def callback():
     """Exchange the authorization code for a token and store the connection."""
+    key = _callback_limit_key()
+    blocked, retry_after = _callback_blocked()
+    if blocked:
+        return _throttled_response(retry_after)
+
     error = request.args.get("error")
     if error:
+        ratelimit.record(key)
         flash(f"GitHub authorization failed: {error}", "error")
         return redirect(url_for("github.index"))
 
     state = request.args.get("state")
     if state != _get_state():
+        ratelimit.record(key)
         flash("GitHub authorization failed: state mismatch.", "error")
         return redirect(url_for("github.index"))
 
     code = request.args.get("code")
     if not code:
+        ratelimit.record(key)
         flash("GitHub authorization failed: missing code.", "error")
         return redirect(url_for("github.index"))
 
@@ -114,6 +122,7 @@ def callback():
     except ValueError:
         token_data = {}
     if response.status_code >= 400 or "access_token" not in token_data:
+        ratelimit.record(key)
         message = token_data.get("error_description") or token_data.get("error") or response.text
         flash(f"GitHub authorization failed: {message}", "error")
         return redirect(url_for("github.index"))
@@ -123,6 +132,7 @@ def callback():
     try:
         user = client.get_user()
     except GitHubError as exc:
+        ratelimit.record(key)
         flash(f"Could not verify your GitHub account: {exc}", "error")
         return redirect(url_for("github.index"))
 
@@ -144,6 +154,10 @@ def callback():
         data={"github_username": account.github_username},
         user_id=current_user.id,
     )
+
+    # A successful connection proves the user's own state, so clear any
+    # accumulated failure hits: legitimate connects are never throttled.
+    ratelimit.clear(key)
 
     flash(f"Connected to GitHub as @{account.github_username}.", "success")
     return redirect(url_for("github.index"))
@@ -192,6 +206,37 @@ def _get_state() -> str | None:
     from flask import session
 
     return session.pop(_STATE_SESSION_KEY, None)
+
+
+def _callback_limit_key() -> str:
+    """Build the OAuth callback limiter key for the current user and client IP."""
+    return ratelimit.client_key(f"github_oauth:{current_user.get_id()}")
+
+
+def _callback_blocked() -> tuple[bool, int]:
+    """Return ``(blocked, retry_after)`` for repeated callback failures.
+
+    Only failed callback attempts are recorded (see ``callback``), so a user who
+    connects successfully is never affected; the limit exists purely to blunt
+    brute-force ``state`` probing.
+    """
+    max_hits = current_app.config.get("RATE_LIMIT_OAUTH_CALLBACK_MAX", 10)
+    window = current_app.config.get("RATE_LIMIT_OAUTH_CALLBACK_WINDOW", 300)
+    key = _callback_limit_key()
+    if ratelimit.count(key, window=window) >= max_hits:
+        return True, ratelimit.retry_after(key, window=window)
+    return False, 0
+
+
+def _throttled_response(retry_after: int):
+    """Return a ``429`` response (with ``Retry-After``) for a throttled callback."""
+    response = current_app.response_class(
+        "Too many failed GitHub authorization attempts. Please try again later.",
+        status=429,
+        mimetype="text/plain",
+    )
+    response.headers["Retry-After"] = str(retry_after)
+    return response
 
 
 # --------------------------------------------------------------------------
