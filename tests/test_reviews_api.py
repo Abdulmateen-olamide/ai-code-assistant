@@ -337,6 +337,12 @@ class TestListDetailDelete:
 
         response = client.get(f"/reviews/api/reviews/{review.id}/findings?addressed=1")
         assert len(response.get_json()) == 1
+
+        # Findings carry a [CONFIRMED]/[SUGGESTION] label derived from confidence.
+        findings = client.get(f"/reviews/api/reviews/{review.id}/findings").get_json()
+        labels = {f["confidence"]: f["confidence_label"] for f in findings}
+        assert labels["confirmed"] == "[CONFIRMED]"
+        assert labels["suggestion"] == "[SUGGESTION]"
         assert response.get_json()[0]["file"] == "b.py"
 
     def test_detail_exposes_categories_and_filters_by_category(self, client, make_user, login):
