@@ -119,6 +119,32 @@ class TestStellarLedgerEntryCLI:
         assert "found: True" in result.output
 
 
+class TestStellarHorizonCLI:
+    def test_ledger_json(self, app, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.stellar.StellarService",
+            lambda *a, **k: type(
+                "Service", (), {"get_ledger": lambda self, sequence: {"sequence": sequence}}
+            )(),
+        )
+        result = _runner(app).invoke(args=["stellar", "ledger", "42", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output)["sequence"] == 42
+
+    def test_operation_json(self, app, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.stellar.StellarService",
+            lambda *a, **k: type(
+                "Service",
+                (),
+                {"get_operation": lambda self, operation_id: {"id": operation_id}},
+            )(),
+        )
+        result = _runner(app).invoke(args=["stellar", "operation", "42", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output)["id"] == "42"
+
+
 class TestJsonOutput:
     def test_network_json(self, app):
         result = _runner(app).invoke(args=["stellar", "network", "--json"])

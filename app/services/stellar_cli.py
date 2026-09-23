@@ -8,6 +8,9 @@ Usage (inside an app context provided by Flask):
     flask stellar health [--json]
     flask stellar contract <contract_id> [--wasm-hash <hex>] [--json]
     flask stellar ledger-entry <base64-ledger-key> [--json]
+    flask stellar ledger <sequence> [--json]
+    flask stellar assets [--cursor <cursor>] [--limit <limit>] [--json]
+    flask stellar operation <operation-id> [--json]
 
 Everything is read-only and bounded by the same service/RPC client used by the
 web application — commands never sign, simulate, or submit transactions.
@@ -230,3 +233,70 @@ def register_stellar_cli(app: Flask) -> None:
         if result.get("entry"):
             click.echo(f"last_modified_ledger: {result['entry'].get('lastModifiedLedgerSeq')}")
             click.echo("xdr: (retrieved, not decoded)")
+
+    @stellar_group.command("ledger")
+    @click.argument("sequence", type=int)
+    @click.option("--network", default=None, callback=_configure_client)
+    @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+    def stellar_ledger(sequence: int, network: str | None, as_json: bool) -> None:
+        """Fetch a bounded ledger by sequence number (read-only)."""
+        from app.services.stellar import StellarError, StellarService
+
+        try:
+            result = StellarService(network=network).get_ledger(sequence)
+        except StellarError as exc:
+            _fail(str(exc), EXIT_SERVICE, as_json=as_json)
+        if as_json:
+            _emit_json(result)
+            return
+        click.echo(f"sequence: {result['sequence']}")
+        click.echo(f"hash: {result['hash']}")
+        click.echo(f"closed_at: {result['closed_at']}")
+        click.echo(f"operation_count: {result['operation_count']}")
+
+    @stellar_group.command("assets")
+    @click.option("--cursor", default=None)
+    @click.option("--limit", default=None, type=int)
+    @click.option("--network", default=None, callback=_configure_client)
+    @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+    def stellar_assets(
+        cursor: str | None, limit: int | None, network: str | None, as_json: bool
+    ) -> None:
+        """Fetch a bounded page of issued assets (read-only)."""
+        from app.services.stellar import StellarError, StellarService
+
+        try:
+            result = StellarService(network=network).get_assets(cursor=cursor, limit=limit)
+        except StellarError as exc:
+            _fail(str(exc), EXIT_SERVICE, as_json=as_json)
+        if as_json:
+            _emit_json(result)
+            return
+        for asset in result["records"]:
+            code = asset.get("asset_code") or asset.get("asset_type")
+            click.echo(
+                f"asset: {code} issuer={asset.get('asset_issuer')} amount={asset.get('amount')}"
+            )
+        if result.get("next"):
+            click.echo(f"next: {result['next']}")
+
+    @stellar_group.command("operation")
+    @click.argument("operation_id")
+    @click.option("--network", default=None, callback=_configure_client)
+    @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+    def stellar_operation(operation_id: str, network: str | None, as_json: bool) -> None:
+        """Fetch bounded operation metadata (read-only)."""
+        from app.services.stellar import StellarError, StellarService
+
+        try:
+            result = StellarService(network=network).get_operation(operation_id)
+        except StellarError as exc:
+            _fail(str(exc), EXIT_SERVICE, as_json=as_json)
+        if as_json:
+            _emit_json(result)
+            return
+        click.echo(f"id: {result['id']}")
+        click.echo(f"type: {result['type']}")
+        click.echo(f"source_account: {result['source_account']}")
+        click.echo(f"transaction_hash: {result['transaction_hash']}")
+        click.echo(f"ledger: {result['ledger']}")

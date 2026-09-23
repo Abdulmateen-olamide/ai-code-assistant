@@ -8,6 +8,9 @@ Endpoints (all ``@login_required``, all read-only):
 - ``GET /stellar/api/account``           — read-only account inspection
 - ``GET /stellar/api/contract``          — read-only contract inspection
 - ``GET /stellar/api/ledger-entry``      — ledger entry lookup by base64 key
+- ``GET /stellar/api/ledger``            — read-only ledger lookup by sequence
+- ``GET /stellar/api/assets``             — bounded issued-asset page
+- ``GET /stellar/api/operation``         — read-only operation lookup by id
 
 Authorization: login required. Network endpoints come exclusively from the
 validated configuration; callers can never supply a URL (no SSRF). The network
@@ -27,6 +30,7 @@ from app.services.stellar import (
     AccountError,
     NetworkError,
     StellarError,
+    StellarService,
     selectable_stellar_networks,
     set_stellar_network,
     stored_stellar_network,
@@ -157,3 +161,54 @@ def api_ledger_entry():
         return jsonify({"error": str(exc)}), 502
     except (NetworkError, StellarError) as exc:
         return jsonify({"error": str(exc)}), 502
+
+
+@bp.route("/api/ledger")
+@login_required
+def api_ledger():
+    """Fetch a bounded Horizon ledger by sequence (read-only)."""
+    if _rate_limited():
+        return jsonify({"error": "Rate limit exceeded. Try again shortly."}), 429
+    value = (request.args.get("sequence") or "").strip()
+    try:
+        return jsonify(StellarService().get_ledger(value))
+    except NetworkError as exc:
+        return jsonify({"error": str(exc)}), 502
+    except StellarError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@bp.route("/api/assets")
+@login_required
+def api_assets():
+    """Fetch a bounded page of Horizon assets (read-only)."""
+    if _rate_limited():
+        return jsonify({"error": "Rate limit exceeded. Try again shortly."}), 429
+    try:
+        return jsonify(
+            StellarService().get_assets(
+                cursor=request.args.get("cursor"),
+                limit=request.args.get("limit"),
+            )
+        )
+    except NetworkError as exc:
+        return jsonify({"error": str(exc)}), 502
+    except StellarError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@bp.route("/api/operation")
+@login_required
+def api_operation():
+    """Fetch bounded Horizon operation metadata by id (read-only)."""
+    if _rate_limited():
+        return jsonify({"error": "Rate limit exceeded. Try again shortly."}), 429
+    operation_id = (request.args.get("id") or "").strip()
+    if not operation_id:
+        return jsonify({"error": "An operation id is required."}), 400
+    try:
+        return jsonify(StellarService().get_operation(operation_id))
+    except NetworkError as exc:
+        return jsonify({"error": str(exc)}), 502
+    except StellarError as exc:
+        return jsonify({"error": str(exc)}), 400
