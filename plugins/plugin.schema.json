@@ -101,6 +101,17 @@
       "type": "object",
       "default": {},
       "description": "Plugin configuration schema and defaults"
+    },
+    "signature": {
+      "type": "object",
+      "required": ["publisher", "algorithm", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "publisher": {"type": "string", "minLength": 1, "maxLength": 256},
+        "algorithm": {"const": "ed25519"},
+        "value": {"type": "string", "minLength": 1}
+      },
+      "description": "Optional Ed25519 signature over the canonical manifest body"
     }
   }
 }

@@ -92,13 +92,22 @@ class TestAccountEndpoint:
             lambda address: {
                 "address": address,
                 "network": {"network": "testnet"},
-                "account": {"sequence": "1"},
+                "account": {
+                    "sequence": "1",
+                    "balances": [],
+                    "flags": {},
+                    "signers": [],
+                    "data": {},
+                },
                 "ledger_freshness": {"available": False},
+                "transactions": {"records": [], "next": None},
             },
         )
         response = client.get(f"/stellar/api/account?address={VALID_ADDRESS}")
         assert response.status_code == 200
-        assert response.get_json()["account"]["sequence"] == "1"
+        payload = response.get_json()
+        assert payload["account"]["sequence"] == "1"
+        assert payload["transactions"]["records"] == []
 
 
 class TestContractEndpoint:
@@ -206,3 +215,53 @@ class TestLedgerEntryEndpoint:
         assert payload["found"] is True
         assert payload["entry"]["decoded"]["detail"]["durability"] == "persistent"
         assert payload["entry"]["xdr"] == "AAAAAA=="
+
+
+class TestHorizonReadEndpoints:
+    def test_ledger_validation(self, client, make_user, login, monkeypatch):
+        make_user()
+        login()
+        from app.services.stellar import StellarError
+
+        service = type(
+            "Service",
+            (),
+            {
+                "get_ledger": lambda self, sequence: (_ for _ in ()).throw(
+                    StellarError("invalid ledger")
+                )
+            },
+        )
+        monkeypatch.setattr("app.stellar.routes.StellarService", service)
+        response = client.get("/stellar/api/ledger?sequence=bad")
+        assert response.status_code == 400
+
+    def test_assets_success(self, client, make_user, login, monkeypatch):
+        make_user()
+        login()
+        monkeypatch.setattr(
+            "app.stellar.routes.StellarService",
+            lambda: type("Service", (), {"get_assets": lambda self, **kwargs: {"records": []}})(),
+        )
+        response = client.get("/stellar/api/assets?limit=10")
+        assert response.status_code == 200
+        assert response.get_json() == {"records": []}
+
+    def test_operation_missing_id(self, client, make_user, login):
+        make_user()
+        login()
+        response = client.get("/stellar/api/operation")
+        assert response.status_code == 400
+
+    def test_operation_success(self, client, make_user, login, monkeypatch):
+        make_user()
+        login()
+        monkeypatch.setattr(
+            "app.stellar.routes.StellarService",
+            lambda: type(
+                "Service", (), {"get_operation": lambda self, operation_id: {"id": operation_id}}
+            )(),
+        )
+        response = client.get("/stellar/api/operation?id=42")
+        assert response.status_code == 200
+        assert response.get_json()["id"] == "42"

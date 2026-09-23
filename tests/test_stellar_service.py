@@ -150,7 +150,20 @@ class TestStellarServiceClient:
             "account_id": VALID_ADDRESS,
             "sequence": "12345",
             "subentry_count": 1,
-            "balances": [{"asset_type": "native", "balance": "100.0000000"}],
+            "flags": {"auth_required": True, "auth_revocable": False},
+            "signers": [{"key": VALID_ADDRESS, "weight": 1, "type": "ed25519"}],
+            "data": {"hello": "aGVsbG8="},
+            "balances": [
+                {"asset_type": "native", "balance": "100.0000000"},
+                {
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USD",
+                    "asset_issuer": VALID_ADDRESS_2,
+                    "balance": "2.0000000",
+                    "limit": "100.0000000",
+                    "is_authorized": True,
+                },
+            ],
         }
         session = _FakeSession(_FakeResponse(200, payload))
         with app.app_context():
@@ -159,7 +172,37 @@ class TestStellarServiceClient:
             assert account["account_id"] == VALID_ADDRESS
             assert account["sequence"] == "12345"
             assert account["balances"][0]["balance"] == "100.0000000"
+            assert account["balances"][1]["limit"] == "100.0000000"
+            assert account["balances"][1]["is_authorized"] is True
+            assert account["flags"]["auth_required"] is True
+            assert account["signers"][0]["weight"] == 1
+            assert account["data"]["hello"] == "aGVsbG8="
             assert service.config.horizon_url in session.requested_url
+
+    def test_get_account_transactions_success(self, app):
+        payload = {
+            "_embedded": {
+                "records": [
+                    {
+                        "hash": "a" * 64,
+                        "ledger": 100,
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "successful": True,
+                        "source_account": VALID_ADDRESS,
+                        "memo": "hello",
+                        "fee_charged": "100",
+                        "max_fee": "1000",
+                        "operation_count": 1,
+                    }
+                ]
+            }
+        }
+        session = _FakeSession(_FakeResponse(200, payload))
+        with app.app_context():
+            service = StellarService(session=session)
+            result = service.get_account_transactions(VALID_ADDRESS)
+            assert result["records"][0]["memo"] == "hello"
+            assert result["records"][0]["operation_count"] == 1
 
     def test_get_account_invalid_address(self, app):
         with app.app_context():

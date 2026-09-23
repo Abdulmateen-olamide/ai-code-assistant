@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from flask import current_app
+
 from app.extensions import db
 from app.models import Plugin
 from app.services.plugins import (
@@ -86,7 +88,11 @@ def install_from_local_dir(path: str) -> Plugin:
     manifest_file = _resolve_manifest_file(path)
     if not manifest_file.is_file():
         raise PluginError(f"Manifest file not found: {manifest_file}")
-    manifest = PluginManifest.from_file(manifest_file)
+    manifest = PluginManifest.from_file(
+        manifest_file,
+        trusted_publishers=current_app.config["PLUGIN_TRUSTED_KEYS"],
+        trust_policy=current_app.config["PLUGIN_TRUST_POLICY"],
+    )
 
     existing = db.session.get(Plugin, manifest.id)
     if existing is not None:
@@ -108,6 +114,8 @@ def install_from_local_dir(path: str) -> Plugin:
         dependencies=manifest.dependencies or [],
         compatibility=manifest.compatibility,
         configuration=manifest.configuration or {},
+        trust_state=manifest.trust_state,
+        trust_publisher=manifest.trust_publisher,
     )
     db.session.add(plugin)
     db.session.commit()

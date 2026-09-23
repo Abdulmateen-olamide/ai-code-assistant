@@ -7,6 +7,8 @@ This module provides:
 - Custom exceptions for plugin system
 """
 
+import base64
+import binascii
 import importlib
 import json
 import logging
@@ -18,9 +20,18 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from app.services.plugin_compat import is_valid_compatibility
 
 logger = logging.getLogger(__name__)
+
+TRUSTED = "Trusted"
+UNVERIFIED = "Unverified"
+INVALID = "Invalid"
+VERIFY_IF_PRESENT = "if-present"
+VERIFY_REQUIRED = "required"
 
 
 class PluginError(Exception):
@@ -72,6 +83,9 @@ class PluginManifest:
     permissions: list[str] | None = None
     dependencies: list[str] | None = None
     configuration: dict[str, Any] | None = None
+    signature: dict[str, str] | None = None
+    trust_state: str = UNVERIFIED
+    trust_publisher: str | None = None
 
     def __post_init__(self) -> None:
         """Normalize defaults."""
@@ -83,7 +97,13 @@ class PluginManifest:
             self.configuration = {}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "PluginManifest":
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        trusted_publishers: dict[str, str | bytes] | None = None,
+        trust_policy: str = VERIFY_IF_PRESENT,
+    ) -> "PluginManifest":
         """Parse manifest from dictionary.
 
         Args:
@@ -157,6 +177,25 @@ class PluginManifest:
         if errors:
             raise ManifestValidationError("; ".join(errors))
 
+        signature = data.get("signature")
+        signature_error = _validate_signature_metadata(signature)
+        if signature_error:
+            errors.append(signature_error)
+
+        if trust_policy not in (VERIFY_IF_PRESENT, VERIFY_REQUIRED):
+            raise ManifestValidationError(f"Invalid plugin trust policy: {trust_policy}")
+        trust_state, trust_publisher = _verify_signature(
+            data,
+            signature,
+            trusted_publishers or {},
+        )
+        if trust_policy == VERIFY_REQUIRED and trust_state != TRUSTED:
+            raise ManifestValidationError(
+                f"Plugin manifest trust verification failed: {trust_state}"
+            )
+        if errors:
+            raise ManifestValidationError("; ".join(errors))
+
         return cls(
             id=data["id"],
             name=data["name"],
@@ -169,10 +208,19 @@ class PluginManifest:
             permissions=data.get("permissions", []),
             dependencies=data.get("dependencies", []),
             configuration=data.get("configuration", {}),
+            signature=signature,
+            trust_state=trust_state,
+            trust_publisher=trust_publisher,
         )
 
     @classmethod
-    def from_file(cls, manifest_path: str | Path) -> "PluginManifest":
+    def from_file(
+        cls,
+        manifest_path: str | Path,
+        *,
+        trusted_publishers: dict[str, str | bytes] | None = None,
+        trust_policy: str = VERIFY_IF_PRESENT,
+    ) -> "PluginManifest":
         """Load manifest from JSON file.
 
         Args:
@@ -195,7 +243,11 @@ class PluginManifest:
         except OSError as e:
             raise PluginError(f"Cannot read manifest file: {e}") from e
 
-        return cls.from_dict(data)
+        return cls.from_dict(
+            data,
+            trusted_publishers=trusted_publishers,
+            trust_policy=trust_policy,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary representation."""
@@ -211,7 +263,68 @@ class PluginManifest:
             "permissions": self.permissions or [],
             "dependencies": self.dependencies or [],
             "configuration": self.configuration or {},
+            "signature": self.signature,
+            "trust_state": self.trust_state,
+            "trust_publisher": self.trust_publisher,
         }
+
+
+def _validate_signature_metadata(signature: Any) -> str | None:
+    """Validate the shape of optional signature metadata."""
+    if signature is None:
+        return None
+    if not isinstance(signature, dict):
+        return "Invalid signature: must be an object"
+    if set(signature) != {"publisher", "algorithm", "value"}:
+        return "Invalid signature: expected publisher, algorithm, and value"
+    if not all(isinstance(signature.get(key), str) and signature[key] for key in signature):
+        return "Invalid signature: publisher, algorithm, and value must be non-empty strings"
+    if signature["algorithm"] != "ed25519":
+        return "Invalid signature: algorithm must be ed25519"
+    return None
+
+
+def _canonical_manifest_body(data: dict[str, Any]) -> bytes:
+    """Return the stable JSON representation signed by plugin publishers."""
+    body = {key: value for key, value in data.items() if key != "signature"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _decode_public_key(value: str | bytes) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if value.startswith("-----BEGIN"):
+        from cryptography.hazmat.primitives import serialization
+
+        return serialization.load_pem_public_key(value.encode()).public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    return base64.b64decode(value, validate=True)
+
+
+def _verify_signature(
+    data: dict[str, Any],
+    signature: Any,
+    trusted_publishers: dict[str, str | bytes],
+) -> tuple[str, str | None]:
+    if signature is None:
+        return UNVERIFIED, None
+    if _validate_signature_metadata(signature):
+        return INVALID, signature.get("publisher") if isinstance(signature, dict) else None
+    publisher = signature["publisher"]
+    key_value = trusted_publishers.get(publisher)
+    if key_value is None:
+        return INVALID, publisher
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(_decode_public_key(key_value))
+        public_key.verify(
+            base64.b64decode(signature["value"], validate=True),
+            _canonical_manifest_body(data),
+        )
+    except (ValueError, TypeError, binascii.Error, InvalidSignature):
+        return INVALID, publisher
+    return TRUSTED, publisher
 
 
 class Plugin:
