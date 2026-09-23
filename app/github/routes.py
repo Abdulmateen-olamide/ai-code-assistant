@@ -272,10 +272,29 @@ def _stellar_repo_context(client: GitHubClient, full_name: str) -> list[dict]:
     return client.get_file_text_batch(full_name, relevant, ref=default_branch)
 
 
+def _repo_matches_query(repo: dict, query: str) -> bool:
+    """Return whether ``repo`` matches ``query`` in name, full name, or description.
+
+    ``query`` is expected to be lower-cased. GitHub's repo payload does not
+    include a searchable description on every repository, so missing/None
+    fields are treated as empty and simply never match.
+    """
+    for field in ("name", "full_name", "description"):
+        value = repo.get(field)
+        if value and query in str(value).lower():
+            return True
+    return False
+
+
 @bp.route("/api/repos")
 @login_required
 def api_repos():
-    """List repositories visible to the connected user, optionally filtered."""
+    """List repositories visible to the connected user, optionally filtered.
+
+    Filtering is server-side across repository name, full name, and
+    description. An empty ``q`` returns all of the user's repositories. The
+    client debounces typing so a burst of keystrokes issues a single request.
+    """
     try:
         client = _client()
     except GitHubError as exc:
@@ -288,11 +307,7 @@ def api_repos():
         return jsonify({"error": str(exc), "kind": exc.kind}), 502
 
     if query:
-        repos = [
-            r
-            for r in repos
-            if query in r.get("name", "").lower() or query in r.get("full_name", "").lower()
-        ]
+        repos = [r for r in repos if _repo_matches_query(r, query)]
     repos.sort(key=lambda r: r.get("pushed_at") or "", reverse=True)
     return jsonify([repo_payload(r) for r in repos])
 
