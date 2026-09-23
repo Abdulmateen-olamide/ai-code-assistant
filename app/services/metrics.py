@@ -84,7 +84,7 @@ def project_metrics(project) -> dict:
 def workspace_metrics(workspace) -> dict:
     """Aggregated metrics across every project in a workspace."""
     reviews = (
-        Review.query.join("project")
+        Review.query.join(Review.project)
         .filter_by(workspace_id=workspace.id)
         .order_by(Review.created_at)
         .all()

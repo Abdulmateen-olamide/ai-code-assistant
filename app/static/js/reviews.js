@@ -53,32 +53,43 @@
 
   // ----- Quality dashboard strip ----------------------------------------
 
+  function metricCard(value, label) {
+    return (
+      "<div class='metric-card'>" +
+      "<span class='metric-value'>" + value + "</span>" +
+      "<span class='metric-label'>" + label + "</span>" +
+      "</div>"
+    );
+  }
+
+  function breakdown(title, counts, limit) {
+    var keys = Object.keys(counts || {});
+    if (!keys.length) return "";
+    var html = "<h3 class='metric-title'>" + GH.escapeHtml(title) + "</h3><ul class='metric-list'>";
+    keys.slice(0, limit || keys.length).forEach(function (key) {
+      html += "<li><code>" + GH.escapeHtml(key) + "</code> — " + counts[key] + "</li>";
+    });
+    return html + "</ul>";
+  }
+
   function renderMetrics(metrics, container) {
     if (!container) return;
     var findings = metrics.findings || {};
-    var parts = [
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + metrics.total_reviews + "</span>",
-      "<span class='metric-label'>reviews</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.total || 0) + "</span>",
-      "<span class='metric-label'>findings</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.high_risk || 0) + "</span>",
-      "<span class='metric-label'>high risk</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.unaddressed_high_risk || 0) + "</span>",
-      "<span class='metric-label'>open high risk</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.confirmed || 0) + "</span>",
-      "<span class='metric-label'>confirmed</span>",
-      "</div>",
-    ];
-    container.innerHTML = "<div class='metric-grid'>" + parts.join("") + "</div>";
+    var html = "<div class='metric-grid'>" +
+      metricCard(metrics.total_reviews || 0, "reviews") +
+      metricCard(findings.total || 0, "findings") +
+      metricCard(findings.high_risk || 0, "high risk") +
+      metricCard(findings.unaddressed_high_risk || 0, "open high risk") +
+      metricCard(findings.addressed || 0, "addressed") +
+      metricCard(metrics.reviews_last_7_days || 0, "reviews / 7d") +
+      "</div>";
+    html += breakdown("Findings by severity", findings.by_severity);
+    html += breakdown("Findings by category", findings.by_category, 10);
+    if (metrics.last_review_at) {
+      html += "<p class='repo-meta'>Last review " + GH.relativeDate(metrics.last_review_at) +
+        " &middot; " + (metrics.reviews_last_30_days || 0) + " in the last 30 days</p>";
+    }
+    container.innerHTML = html;
   }
 
   function loadMetrics(container) {
