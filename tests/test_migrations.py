@@ -32,6 +32,8 @@ EXPECTED_COLUMNS = {
         "dependencies",
         "compatibility",
         "configuration",
+        "trust_state",
+        "trust_publisher",
         "enabled",
         "installed_at",
         "updated_at",
@@ -124,7 +126,7 @@ class TestMigrationHead:
     def test_head_is_latest_phase8(self):
         result = _run_flask(["db", "heads"], {"DATABASE_URL": "sqlite:///:memory:"})
         assert result.returncode == 0, result.stderr
-        assert "e2f3a4b5c6d7" in (result.stdout + result.stderr)
+        assert "f7a6b5c4d3e2" in (result.stdout + result.stderr)
 
     def test_users_stellar_network_column_upgraded(self):
         with _migration_db() as db_url, _inspect(db_url) as insp:

@@ -67,6 +67,8 @@ def register_plugins_cli(app: Flask) -> None:
                         "name": p.name,
                         "version": p.version,
                         "enabled": p.enabled,
+                        "trust_state": p.trust_state,
+                        "trust_publisher": p.trust_publisher,
                         "entry_point": p.entry_point,
                         "declared_capabilities": p.capabilities or [],
                     }
@@ -102,6 +104,8 @@ def register_plugins_cli(app: Flask) -> None:
         click.echo(f"author: {plugin.author or ''}")
         click.echo(f"entry_point: {plugin.entry_point}")
         click.echo(f"compatibility: {plugin.compatibility or 'any'}")
+        click.echo(f"trust_state: {plugin.trust_state}")
+        click.echo(f"trust_publisher: {plugin.trust_publisher or ''}")
         click.echo(f"enabled: {plugin.enabled}")
         click.echo(f"declared_capabilities: {', '.join(plugin.capabilities or [])}")
         click.echo(f"permissions: {', '.join(plugin.permissions or [])}")

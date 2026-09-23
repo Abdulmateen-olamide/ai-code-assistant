@@ -69,6 +69,7 @@ class TestPluginListing:
         assert plugins["test-plugin"]["installed"] is True
         assert plugins["test-plugin"]["enabled"] is True
         assert plugins["test-plugin"]["declared_capabilities"] == ["PROJECT_READ"]
+        assert plugins["test-plugin"]["trust_state"] == "Unverified"
 
     def test_list_requires_membership(self, app, client, make_user, login):
         owner = make_user(username="owner", email="owner@example.com")
@@ -119,6 +120,18 @@ class TestPluginInspection:
 
 
 class TestInstallation:
+    def test_strict_policy_rejects_unsigned_manifest(self, app, client, make_user, login):
+        owner = make_user()
+        login()
+        ws = _workspace(db, owner)
+        app.config["PLUGIN_TRUST_POLICY"] = "required"
+
+        resp = _install(client, ws.id, VALID_MANIFEST)
+
+        assert resp.status_code == 400
+        assert "Unverified" in resp.get_json()["error"]
+        assert db.session.get(Plugin, "test-plugin") is None
+
     def test_valid_manifest_installed(self, app, client, make_user, login):
         owner = make_user()
         login()

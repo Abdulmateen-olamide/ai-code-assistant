@@ -13,7 +13,7 @@ only the workspace owner may install, enable, disable, or grant capabilities.
 The backend is authoritative and never trusts the UI.
 """
 
-from flask import jsonify, render_template, request
+from flask import current_app, jsonify, render_template, request
 from flask_login import current_user, login_required
 
 from app.extensions import db
@@ -73,6 +73,8 @@ def _serialize(plugin: Plugin, workspace_id: int) -> dict:
         "permissions": plugin.permissions or [],
         "dependencies": plugin.dependencies or [],
         "compatibility": plugin.compatibility or "any",
+        "trust_state": plugin.trust_state,
+        "trust_publisher": plugin.trust_publisher,
         "compatible_with_app": bool(status["compatible"]),
         "app_version": status["app_version"],
         "installed": installation is not None,
@@ -172,7 +174,11 @@ def api_install_plugin(workspace_id: int):
         return jsonify({"error": "A manifest object is required."}), 400
 
     try:
-        manifest = PluginManifest.from_dict(manifest_data)
+        manifest = PluginManifest.from_dict(
+            manifest_data,
+            trusted_publishers=current_app.config["PLUGIN_TRUSTED_KEYS"],
+            trust_policy=current_app.config["PLUGIN_TRUST_POLICY"],
+        )
     except ManifestValidationError as exc:
         return jsonify({"error": f"Invalid plugin manifest: {exc}"}), 400
     except PluginError as exc:
@@ -210,6 +216,8 @@ def api_install_plugin(workspace_id: int):
             dependencies=manifest.dependencies or [],
             compatibility=manifest.compatibility,
             configuration=manifest.configuration or {},
+            trust_state=manifest.trust_state,
+            trust_publisher=manifest.trust_publisher,
         )
         db.session.add(plugin)
     elif plugin.entry_point != manifest.entry_point:

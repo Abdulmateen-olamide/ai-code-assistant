@@ -1,10 +1,13 @@
 """Tests for plugin manifest and registry."""
 
+import base64
 import json
 import tempfile
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.services.plugins import (
     ManifestValidationError,
@@ -59,6 +62,80 @@ class TestPluginManifest:
         assert len(manifest.capabilities) == 3
         assert manifest.dependencies == ["stellar-sdk>=11.0.0"]
         assert manifest.configuration["enabled_networks"] == ["testnet"]
+
+    def test_manifest_valid_signature_is_trusted(self):
+        data = {
+            "id": "signed-plugin",
+            "name": "Signed Plugin",
+            "version": "0.1.0",
+            "description": "A signed test plugin",
+            "author": "Tester",
+            "entry_point": "plugins.test:TestPlugin",
+            "capabilities": ["PROJECT_READ"],
+        }
+        private_key = Ed25519PrivateKey.generate()
+        body = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+        data["signature"] = {
+            "publisher": "test-publisher",
+            "algorithm": "ed25519",
+            "value": base64.b64encode(private_key.sign(body)).decode(),
+        }
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+
+        manifest = PluginManifest.from_dict(
+            data,
+            trusted_publishers={"test-publisher": base64.b64encode(public_key).decode()},
+        )
+
+        assert manifest.trust_state == "Trusted"
+        assert manifest.trust_publisher == "test-publisher"
+
+    def test_manifest_tampered_signature_is_invalid_in_lenient_mode(self):
+        data = {
+            "id": "signed-plugin",
+            "name": "Signed Plugin",
+            "version": "0.1.0",
+            "description": "A signed test plugin",
+            "author": "Tester",
+            "entry_point": "plugins.test:TestPlugin",
+            "capabilities": ["PROJECT_READ"],
+        }
+        private_key = Ed25519PrivateKey.generate()
+        body = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+        data["signature"] = {
+            "publisher": "test-publisher",
+            "algorithm": "ed25519",
+            "value": base64.b64encode(private_key.sign(body)).decode(),
+        }
+        data["name"] = "Tampered Plugin"
+
+        manifest = PluginManifest.from_dict(
+            data,
+            trusted_publishers={
+                "test-publisher": private_key.public_key().public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw,
+                )
+            },
+        )
+
+        assert manifest.trust_state == "Invalid"
+
+    def test_manifest_strict_policy_rejects_missing_signature(self):
+        data = {
+            "id": "unsigned-plugin",
+            "name": "Unsigned Plugin",
+            "version": "0.1.0",
+            "description": "An unsigned test plugin",
+            "author": "Tester",
+            "entry_point": "plugins.test:TestPlugin",
+            "capabilities": ["PROJECT_READ"],
+        }
+        with pytest.raises(ManifestValidationError, match="Unverified"):
+            PluginManifest.from_dict(data, trust_policy="required")
 
     def test_manifest_missing_required_field(self):
         """Test manifest with missing required field."""
