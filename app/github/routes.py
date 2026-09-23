@@ -42,6 +42,7 @@ from app.services.github import (
     GitHubClient,
     GitHubError,
     get_github_client,
+    github_error_payload,
     issue_payload,
     pull_request_payload,
     repo_payload,
@@ -343,13 +344,13 @@ def api_repos():
     try:
         client = _client()
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 403
+        return jsonify(github_error_payload(exc)), 403
 
     query = request.args.get("q", "").strip().lower()
     try:
         repos = client.list_repositories()
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     if query:
         repos = [r for r in repos if _repo_matches_query(r, query)]
@@ -365,7 +366,7 @@ def api_repo_detail(owner: str, repo: str):
         client = _client()
         data = client.get_repository(validate_full_name(f"{owner}/{repo}"))
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
     payload = repo_payload(data)
     payload["readme"] = client.get_readme(data.get("full_name", f"{owner}/{repo}"))
     return jsonify(payload)
@@ -380,7 +381,7 @@ def api_branches(owner: str, repo: str):
         client = _client()
         data = client.list_branches(full_name)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
     return jsonify(
         [
             {
@@ -403,7 +404,7 @@ def api_tree(owner: str, repo: str):
         client = _client()
         tree = client.get_tree(full_name, ref, recursive=True)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     entries = []
     for entry in tree.get("tree", []):
@@ -435,7 +436,7 @@ def api_contents(owner: str, repo: str):
         client = _client()
         data = client.get_contents(full_name, path, ref=ref)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     if isinstance(data, dict):
         # A single file: return decoded text.
@@ -443,7 +444,7 @@ def api_contents(owner: str, repo: str):
         try:
             text = client.get_file_text(full_name, file_path, ref=ref)
         except GitHubError as exc:
-            return jsonify({"error": str(exc), "kind": exc.kind}), 422
+            return jsonify(github_error_payload(exc)), 422
         return jsonify(
             {
                 "type": "file",
@@ -484,7 +485,7 @@ def api_commits(owner: str, repo: str):
         client = _client()
         data = client.list_commits(full_name, ref=ref, path=path)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     items = []
     for commit in data:
@@ -512,7 +513,7 @@ def api_commit_detail(owner: str, repo: str, sha: str):
         client = _client()
         commit = client.get_commit(full_name, sha)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
 
     commit_data = commit.get("commit") or {}
     author = commit_data.get("author") or {}
@@ -555,7 +556,7 @@ def api_issues(owner: str, repo: str):
         client = _client()
         data = client.list_issues(full_name, state=state)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
     return jsonify([issue_payload(i) for i in data])
 
 
@@ -569,7 +570,7 @@ def api_issue_detail(owner: str, repo: str, number: int):
         client = _client()
         data = client.get_issue(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
 
     payload = issue_payload(data)
     if analyze:
@@ -596,7 +597,7 @@ def api_pulls(owner: str, repo: str):
         client = _client()
         data = client.list_pull_requests(full_name, state=state)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
     return jsonify([pull_request_payload(pr) for pr in data])
 
 
@@ -611,7 +612,7 @@ def api_pull_detail(owner: str, repo: str, number: int):
         pr = client.get_pull_request(full_name, number)
         files = client.list_pull_request_files(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
 
     payload = pull_request_payload(pr)
     payload["files"] = [
@@ -648,7 +649,7 @@ def api_analyze_repo(owner: str, repo: str):
         readme = client.get_readme(full_name, ref=default_branch)
         tree = client.get_tree(full_name, default_branch, recursive=True)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     file_list = [
         entry.get("path", "") for entry in tree.get("tree", []) if entry.get("type") == "blob"
@@ -672,7 +673,7 @@ def api_analyze_file(owner: str, repo: str):
         client = _client()
         text = client.get_file_text(full_name, path, ref=ref)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     language = (path.rsplit(".", 1)[-1] if "." in path else "") or "text"
     return jsonify(analysis.analyze_file(path, language, text, question=question))

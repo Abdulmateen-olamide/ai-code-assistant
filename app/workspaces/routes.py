@@ -73,6 +73,7 @@ from app.services.github import (
     GitHubError,
     GitHubInvalidError,
     get_github_client,
+    github_error_payload,
     validate_full_name,
 )
 from app.services.health import coverage_estimate, detect_ci_files
@@ -519,7 +520,11 @@ def _import_github(workspace: Workspace):
     try:
         client = get_github_client()
         import_github_repo(project, full_name, client)
-    except (GitHubError, ProjectImportError) as exc:
+    except GitHubError as exc:
+        db.session.delete(project)
+        db.session.commit()
+        return jsonify(github_error_payload(exc)), 502
+    except ProjectImportError as exc:
         db.session.delete(project)
         db.session.commit()
         return jsonify({"error": str(exc)}), 502
