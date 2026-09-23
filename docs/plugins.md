@@ -312,6 +312,12 @@ outside the workspace they belong to (non-members receive 404).
 
 ## Writing a plugin
 
+> **New to plugins?** Start with the step-by-step
+> [Plugin developer guide](plugin-developer-guide.md). It walks through the
+> layout, manifest, plugin class, install/enable, explicit capability grants,
+> the local verify loop, and common pitfalls, using the runnable
+> [`examples/plugins/hello_world`](../examples/plugins/hello_world) example.
+
 ```python
 # plugins/stellar_tools/plugin.py
 class StellarPlugin:
@@ -347,9 +353,11 @@ tracked under the **Phase 8 - Plugins & Extensions** milestone (label
 `phase-8`), for example:
 
 - Dependency resolution and version compatibility checks.
-- A plugin development guide and an example plugin.
 - CLI commands for plugin management.
 - A capability audit trail (implemented).
+- A plugin development guide and an example plugin (implemented — see
+  [plugin-developer-guide.md](plugin-developer-guide.md) and
+  [`examples/plugins/hello_world`](../examples/plugins/hello_world)).
 
 ## Testing
 
