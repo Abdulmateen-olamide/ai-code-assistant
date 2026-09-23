@@ -72,6 +72,32 @@
     return html + "</ul>";
   }
 
+  function trendSection(trend) {
+    if (!trend || !trend.length) return "";
+    var max = 0;
+    trend.forEach(function (point) { max = Math.max(max, point.total || 0); });
+    max = max || 1;
+    var html = "<h3 class='metric-title'>Findings addressed over time</h3>" +
+      "<p class='repo-meta'>Open vs addressed findings for each of the last " +
+      trend.length + " review" + (trend.length === 1 ? "" : "s") + ".</p>" +
+      "<ul class='trend-list'>";
+    trend.forEach(function (point) {
+      var openPct = Math.round(((point.open || 0) / max) * 100);
+      var donePct = Math.round(((point.addressed || 0) / max) * 100);
+      html += "<li class='trend-row'>" +
+        "<span class='trend-date'>" + GH.escapeHtml(GH.relativeDate(point.created_at)) + "</span>" +
+        "<span class='trend-bar' title='" + (point.open || 0) + " open / " +
+        (point.addressed || 0) + " addressed'>" +
+        "<span class='trend-open' style='width:" + openPct + "%'></span>" +
+        "<span class='trend-done' style='width:" + donePct + "%'></span>" +
+        "</span>" +
+        "<span class='trend-counts'>" + (point.open || 0) + " open &middot; " +
+        (point.addressed || 0) + " addressed</span>" +
+        "</li>";
+    });
+    return html + "</ul>";
+  }
+
   function renderMetrics(metrics, container) {
     if (!container) return;
     var findings = metrics.findings || {};
@@ -83,6 +109,7 @@
       metricCard(findings.addressed || 0, "addressed") +
       metricCard(metrics.reviews_last_7_days || 0, "reviews / 7d") +
       "</div>";
+    html += trendSection(metrics.findings_trend);
     html += breakdown("Findings by severity", findings.by_severity);
     html += breakdown("Findings by category", findings.by_category, 10);
     if (metrics.last_review_at) {

@@ -1716,6 +1716,47 @@ a:hover {
   font-size: 0.85rem;
 }
 
+.trend-list {
+  list-style: none;
+  padding: 0;
+  margin-bottom: 12px;
+}
+
+.trend-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 150px;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.8rem;
+  margin-bottom: 4px;
+}
+
+.trend-date {
+  color: var(--text-muted);
+}
+
+.trend-bar {
+  display: flex;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+
+.trend-open {
+  background: #f85149;
+}
+
+.trend-done {
+  background: #3fb950;
+}
+
+.trend-counts {
+  color: var(--text-muted);
+  text-align: right;
+}
+
 @media (max-width: 860px) {
   .project-layout {
     grid-template-columns: 1fr;

@@ -518,3 +518,57 @@ class TestMetrics:
         login()
         response = client.get(f"/reviews/api/metrics?workspace_id={project.workspace_id}")
         assert response.status_code == 404
+
+    def test_findings_trend_tracks_open_and_addressed(self, client, make_user, login):
+        user = make_user()
+        login()
+        first = Review(user_id=user.id, source="project", kind="quality", status="completed")
+        db.session.add(first)
+        db.session.commit()
+        second = Review(user_id=user.id, source="project", kind="security", status="completed")
+        db.session.add(second)
+        db.session.commit()
+        db.session.add_all(
+            [
+                ReviewFinding(
+                    review_id=first.id,
+                    severity="high",
+                    category="duplication",
+                    explanation="e",
+                    confidence="confirmed",
+                    addressed=True,
+                ),
+                ReviewFinding(
+                    review_id=first.id,
+                    severity="medium",
+                    category="readability",
+                    explanation="e",
+                    confidence="potential",
+                    addressed=False,
+                ),
+                ReviewFinding(
+                    review_id=second.id,
+                    severity="critical",
+                    category="injection",
+                    explanation="e",
+                    confidence="confirmed",
+                    addressed=False,
+                ),
+            ]
+        )
+        db.session.commit()
+
+        trend = client.get("/reviews/api/metrics").get_json()["findings_trend"]
+        assert [point["review_id"] for point in trend] == [first.id, second.id]
+        assert trend[0]["kind"] == "quality"
+        assert trend[0]["open"] == 1
+        assert trend[0]["addressed"] == 1
+        assert trend[0]["total"] == 2
+        assert trend[1]["open"] == 1
+        assert trend[1]["addressed"] == 0
+        assert trend[1]["total"] == 1
+
+    def test_findings_trend_empty_without_reviews(self, client, make_user, login):
+        make_user()
+        login()
+        assert client.get("/reviews/api/metrics").get_json()["findings_trend"] == []
