@@ -100,6 +100,10 @@ developer tooling. This project is built incrementally across phases:
 - **Safe redirects** — post-login redirects are validated against an
   open-redirect attack (only same-host URLs are allowed).
 - **CSRF protection** — all state-changing forms are protected via Flask-WTF.
+- **Encrypted provider keys** — bring your own LLM provider API keys
+  (`/keys/`); they are encrypted at rest with AES-256-GCM (random nonce per
+  record), only ever shown redacted, and decrypted in memory only for a
+  provider call.
 
 ### Phase 3 — AI core features
 

@@ -126,7 +126,7 @@ class TestMigrationHead:
     def test_head_is_latest_revision(self):
         result = _run_flask(["db", "heads"], {"DATABASE_URL": "sqlite:///:memory:"})
         assert result.returncode == 0, result.stderr
-        assert "b2c3d4e5f6a7" in (result.stdout + result.stderr)
+        assert "c3d4e5f6a7b8" in (result.stdout + result.stderr)
 
     def test_users_stellar_network_column_upgraded(self):
         with _migration_db() as db_url, _inspect(db_url) as insp:
@@ -267,3 +267,31 @@ class TestMigrationHead:
             with _inspect(db_url) as insp:
                 columns = {col["name"] for col in insp.get_columns("workspaces")}
                 assert "is_pinned" not in columns
+
+    def test_api_keys_table_upgraded(self):
+        expected = {
+            "id",
+            "user_id",
+            "provider",
+            "encrypted_value",
+            "label",
+            "last_verified_at",
+            "is_active",
+            "created_at",
+            "updated_at",
+        }
+        with _migration_db() as db_url, _inspect(db_url) as insp:
+            tables = set(insp.get_table_names())
+            assert "api_keys" in tables
+            columns = {col["name"] for col in insp.get_columns("api_keys")}
+            assert columns == expected
+
+    def test_api_keys_downgrade_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_url = f"sqlite:///{os.path.join(tmp, 'mig8.db')}"
+            up = _run_flask(["db", "upgrade"], {"DATABASE_URL": db_url})
+            assert up.returncode == 0, up.stderr
+            down = _run_flask(["db", "downgrade", "b2c3d4e5f6a7"], {"DATABASE_URL": db_url})
+            assert down.returncode == 0, down.stderr
+            with _inspect(db_url) as insp:
+                assert "api_keys" not in set(insp.get_table_names())
