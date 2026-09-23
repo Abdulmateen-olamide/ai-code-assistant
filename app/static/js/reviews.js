@@ -169,13 +169,27 @@
 
   function findingsUrl(base) {
     var severity = document.getElementById("finding-severity");
+    var category = document.getElementById("finding-category");
     var confidence = document.getElementById("finding-confidence");
     var addressed = document.getElementById("finding-addressed");
     var params = [];
     if (severity && severity.value) params.push("severity=" + encodeURIComponent(severity.value));
+    if (category && category.value) params.push("category=" + encodeURIComponent(category.value));
     if (confidence && confidence.value) params.push("confidence=" + encodeURIComponent(confidence.value));
     if (addressed && addressed.value !== "") params.push("addressed=" + encodeURIComponent(addressed.value));
     return base + (params.length ? "?" + params.join("&") : "");
+  }
+
+  function populateCategories(categories) {
+    var select = document.getElementById("finding-category");
+    if (!select) return;
+    select.innerHTML = '<option value="">All categories</option>';
+    (categories || []).forEach(function (category) {
+      var option = document.createElement("option");
+      option.value = category;
+      option.textContent = category;
+      select.appendChild(option);
+    });
   }
 
   function summarySection(title, items) {
@@ -271,6 +285,7 @@
         summarySection("Files affected", summary.files_affected) +
         (review.status === "failed" ? '<p class="sidebar-empty">This review did not complete.</p>' : "") +
         "</div>";
+      populateCategories(review.categories);
       loadFindings(id);
     }).catch(function (error) {
       container.innerHTML = '<p class="sidebar-empty">Could not load review.</p>';
@@ -284,6 +299,7 @@
     if (!document.getElementById("review-detail")) return;
     loadDetail();
     document.getElementById("finding-severity").addEventListener("change", function () { loadFindings(id); });
+    document.getElementById("finding-category").addEventListener("change", function () { loadFindings(id); });
     document.getElementById("finding-confidence").addEventListener("change", function () { loadFindings(id); });
     document.getElementById("finding-addressed").addEventListener("change", function () { loadFindings(id); });
     document.addEventListener("click", function (event) {
