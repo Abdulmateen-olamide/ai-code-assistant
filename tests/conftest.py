@@ -38,6 +38,21 @@ def _reset_event_dispatcher():
     get_dispatcher().clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Clear the shared in-memory rate limiter around each test.
+
+    The limiter is a module-level singleton, so without a reset hits recorded by
+    one test would count against the next and could trip the per-user Phase 5
+    limits (import/chat/analyze) in unrelated tests.
+    """
+    from app.services import ratelimit
+
+    ratelimit.reset()
+    yield
+    ratelimit.reset()
+
+
 @pytest.fixture()
 def app():
     """Create a fresh application instance for each test."""

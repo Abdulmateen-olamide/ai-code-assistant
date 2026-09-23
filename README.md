@@ -519,6 +519,11 @@ All configuration is environment-driven (see `.env.example`):
 | `INVITE_TTL_HOURS`     | `168`       | Invitation expiry window in hours (Phase 7) |
 | `RATE_LIMIT_MAX`       | `30`        | Max attempts per IP/window for invitation endpoints (Phase 7) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `300`  | Rate-limit window in seconds (Phase 7) |
+| `RATE_LIMIT_IMPORT_MAX` / `RATE_LIMIT_IMPORT_WINDOW` | `10` / `3600` | Per-user project-import requests per window (Phase 5, #106) |
+| `RATE_LIMIT_SEARCH_MAX` / `RATE_LIMIT_SEARCH_WINDOW` | `120` / `60` | Per-user project-search requests per window (Phase 5, #106) |
+| `RATE_LIMIT_CHAT_MAX` / `RATE_LIMIT_CHAT_WINDOW` | `30` / `60` | Per-user project-chat requests per window (Phase 5, #106) |
+| `RATE_LIMIT_STREAM_MAX` / `RATE_LIMIT_STREAM_WINDOW` | `30` / `60` | Per-user project-chat stream requests per window (Phase 5, #106) |
+| `RATE_LIMIT_ANALYZE_MAX` / `RATE_LIMIT_ANALYZE_WINDOW` | `20` / `300` | Per-user project-analysis requests per window (Phase 5, #106) |
 | `SMTP_HOST`           | unset       | SMTP host for invitation emails (Phase 7) |
 | `SMTP_PORT`           | `587`       | SMTP port (Phase 7) |
 | `SMTP_USER`           | unset       | SMTP username (Phase 7) |
