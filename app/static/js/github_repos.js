@@ -8,6 +8,10 @@
   var listEl = document.getElementById("repo-list");
   var searchEl = document.getElementById("repo-search");
 
+  // Debounce search requests so typing does not fire one API call per keystroke.
+  var SEARCH_DEBOUNCE_MS = 300;
+  var searchTimer = null;
+
   function render(repos) {
     listEl.innerHTML = "";
     if (!repos.length) {
@@ -48,9 +52,14 @@
     });
   }
 
+  function onSearchInput() {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(refresh, SEARCH_DEBOUNCE_MS);
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     if (!listEl || !searchEl) return;
     refresh();
-    searchEl.addEventListener("input", refresh);
+    searchEl.addEventListener("input", onSearchInput);
   });
 })();

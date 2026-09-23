@@ -181,6 +181,43 @@ class TestRepositoryApi:
         data = client.get("/github/api/repos?q=other").get_json()
         assert [r["full_name"] for r in data] == ["owner/other"]
 
+    def test_repos_filters_by_name_and_description(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+
+        def fake_repos(self_, *, per_page=100):
+            return [
+                {
+                    "full_name": "owner/api-repo",
+                    "name": "api-repo",
+                    "description": "A REST service for billing",
+                    "pushed_at": "2026-01-02T00:00:00Z",
+                },
+                {
+                    "full_name": "owner/other",
+                    "name": "other",
+                    "description": "Experimental widgets",
+                    "pushed_at": "2026-01-01T00:00:00Z",
+                },
+            ]
+
+        monkeypatch.setattr(GitHubClient, "list_repositories", fake_repos)
+
+        # Empty query returns every one of the user's repositories.
+        data = client.get("/github/api/repos").get_json()
+        assert [r["full_name"] for r in data] == ["owner/api-repo", "owner/other"]
+
+        # Name match.
+        data = client.get("/github/api/repos?q=widgets").get_json()
+        assert [r["full_name"] for r in data] == ["owner/other"]
+
+        # Description match (case-insensitive).
+        data = client.get("/github/api/repos?q=BILLING").get_json()
+        assert [r["full_name"] for r in data] == ["owner/api-repo"]
+
+        # No match.
+        assert client.get("/github/api/repos?q=nope").get_json() == []
+
     def test_repo_detail_not_found(self, client, app, monkeypatch):
         _logged_in_client(client)
         _create_account(app)
