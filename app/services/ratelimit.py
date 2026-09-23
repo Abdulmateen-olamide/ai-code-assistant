@@ -1,19 +1,22 @@
 """Small in-memory sliding-window rate limiter.
 
 Used for the public collaboration endpoints (invitation accept/decline/landing)
-and the presence heartbeat until the broader per-user AI/import rate limiting
-land (#28/#81/#106). Limits are per-key (typically per client IP) over a
-configurable window. The limiter is process-local, which is acceptable for the
-default single-worker deployments and CI; multi-worker deployments should
-back it with a shared store (out of scope here).
+and the presence heartbeat, and — via :func:`per_user_limit` — for the costly
+per-user Phase 5 endpoints (project import, search, chat/stream, analysis, #106).
+Limits are per-key (typically per client IP, or per user id for the endpoint
+limiter) over a configurable window. The limiter is process-local, which is
+acceptable for the default single-worker deployments and CI; multi-worker
+deployments should back it with a shared store (out of scope here).
 """
 
 from __future__ import annotations
 
+import functools
 import threading
 import time
 
-from flask import current_app
+from flask import current_app, jsonify
+from flask_login import current_user
 
 _ENTRIES: dict[str, list[float]] = {}
 _LOCK = threading.Lock()
@@ -49,6 +52,59 @@ def hit(key: str, *, max_hits: int | None = None, window: int | None = None) -> 
         allowed = len(timestamps) < max_hits
         timestamps.append(now)
         return allowed
+
+
+def consume(key: str, *, max_hits: int, window: int) -> tuple[bool, int]:
+    """Record a hit for ``key`` and return ``(allowed, retry_after_seconds)``.
+
+    Unlike :func:`hit`, this reports how long the caller must wait before the
+    limit resets (the time remaining on the oldest hit in the window). It is the
+    building block for the per-user endpoint limiter below.
+    """
+    now = time.monotonic()
+    with _LOCK:
+        _prune(key, window)
+        timestamps = _ENTRIES.setdefault(key, [])
+        if len(timestamps) >= max_hits:
+            oldest = timestamps[0]
+            retry_after = max(round(window - (now - oldest)), 1)
+            return False, retry_after
+        timestamps.append(now)
+        return True, 0
+
+
+def per_user_limit(bucket: str, *, max_config: str, window_config: str):
+    """Decorator enforcing a per-user sliding-window limit on a view.
+
+    The maximum number of requests and the window length (in seconds) are read
+    from ``max_config`` / ``window_config`` on the app config at request time,
+    so they remain environment-configurable. When the limit is exceeded the
+    wrapped view is not called and a ``429`` JSON response carrying a
+    ``Retry-After`` header is returned instead.
+    """
+
+    def decorator(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            max_hits = current_app.config.get(max_config) or 0
+            window = current_app.config.get(window_config) or 0
+            key = f"{bucket}:user:{current_user.get_id()}"
+            allowed, retry_after = consume(key, max_hits=max_hits, window=window)
+            if not allowed:
+                response = jsonify(
+                    {
+                        "error": "Rate limit exceeded. Please retry later.",
+                        "kind": "rate_limited",
+                    }
+                )
+                response.status_code = 429
+                response.headers["Retry-After"] = str(retry_after)
+                return response
+            return view(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def client_key(extra: str = "") -> str:

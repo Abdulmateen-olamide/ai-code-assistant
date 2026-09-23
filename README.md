@@ -198,8 +198,9 @@ developer tooling. This project is built incrementally across phases:
   content). Findings are labeled `[CONFIRMED]` (supported by the code) versus
   `[SUGGESTION]` (inference), and project reviews drop findings below the
   configured `REVIEW_SEVERITY_THRESHOLD`.
-- **Project reviews** — run quality, security, and test-analysis reviews over
-  an imported project; repository content is explicitly framed as untrusted
+- **Project reviews** — run quality (`analyze_code_quality`: readability,
+  maintainability, duplication, dead code), security, and test-analysis reviews
+  over an imported project; repository content is explicitly framed as untrusted
   data in the prompt to resist prompt injection.
 - **Review history & configuration** — per-project review history with a
   config snapshot on each run, and per-project review configuration (kinds,
@@ -520,6 +521,11 @@ All configuration is environment-driven (see `.env.example`):
 | `INVITE_TTL_HOURS`     | `168`       | Invitation expiry window in hours (Phase 7) |
 | `RATE_LIMIT_MAX`       | `30`        | Max attempts per IP/window for invitation endpoints (Phase 7) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `300`  | Rate-limit window in seconds (Phase 7) |
+| `RATE_LIMIT_IMPORT_MAX` / `RATE_LIMIT_IMPORT_WINDOW` | `10` / `3600` | Per-user project-import requests per window (Phase 5, #106) |
+| `RATE_LIMIT_SEARCH_MAX` / `RATE_LIMIT_SEARCH_WINDOW` | `120` / `60` | Per-user project-search requests per window (Phase 5, #106) |
+| `RATE_LIMIT_CHAT_MAX` / `RATE_LIMIT_CHAT_WINDOW` | `30` / `60` | Per-user project-chat requests per window (Phase 5, #106) |
+| `RATE_LIMIT_STREAM_MAX` / `RATE_LIMIT_STREAM_WINDOW` | `30` / `60` | Per-user project-chat stream requests per window (Phase 5, #106) |
+| `RATE_LIMIT_ANALYZE_MAX` / `RATE_LIMIT_ANALYZE_WINDOW` | `20` / `300` | Per-user project-analysis requests per window (Phase 5, #106) |
 | `SMTP_HOST`           | unset       | SMTP host for invitation emails (Phase 7) |
 | `SMTP_PORT`           | `587`       | SMTP port (Phase 7) |
 | `SMTP_USER`           | unset       | SMTP username (Phase 7) |

@@ -120,6 +120,21 @@ class Config:
     # scope of the umbrella issues (#28/#81/#106).
     RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))
     RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "300"))
+    # Per-user sliding-window limits for the costly Phase 5 endpoints (#106):
+    # project import, project search, project chat, chat streaming, and project
+    # analysis. Each pair is <max requests> per <window seconds>, keyed by user
+    # id, and every value is environment-configurable. Import and analyze hit
+    # the network/LLM and are therefore tighter than local search.
+    RATE_LIMIT_IMPORT_MAX = int(os.getenv("RATE_LIMIT_IMPORT_MAX", "10"))
+    RATE_LIMIT_IMPORT_WINDOW = int(os.getenv("RATE_LIMIT_IMPORT_WINDOW", "3600"))
+    RATE_LIMIT_SEARCH_MAX = int(os.getenv("RATE_LIMIT_SEARCH_MAX", "120"))
+    RATE_LIMIT_SEARCH_WINDOW = int(os.getenv("RATE_LIMIT_SEARCH_WINDOW", "60"))
+    RATE_LIMIT_CHAT_MAX = int(os.getenv("RATE_LIMIT_CHAT_MAX", "30"))
+    RATE_LIMIT_CHAT_WINDOW = int(os.getenv("RATE_LIMIT_CHAT_WINDOW", "60"))
+    RATE_LIMIT_STREAM_MAX = int(os.getenv("RATE_LIMIT_STREAM_MAX", "30"))
+    RATE_LIMIT_STREAM_WINDOW = int(os.getenv("RATE_LIMIT_STREAM_WINDOW", "60"))
+    RATE_LIMIT_ANALYZE_MAX = int(os.getenv("RATE_LIMIT_ANALYZE_MAX", "20"))
+    RATE_LIMIT_ANALYZE_WINDOW = int(os.getenv("RATE_LIMIT_ANALYZE_WINDOW", "300"))
     # Optional SMTP for invitation email delivery. When unset, invitations are
     # delivered as in-app notifications only and the app never crashes on mail.
     SMTP_HOST = os.getenv("SMTP_HOST", "")

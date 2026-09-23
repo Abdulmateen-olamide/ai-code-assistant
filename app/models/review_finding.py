@@ -24,9 +24,11 @@ PR_CATEGORIES = (
     "other",
 )
 QUALITY_CATEGORIES = (
+    "readability",
     "complexity",
     "long-function",
     "duplication",
+    "dead-code",
     "error-handling",
     "unused-code",
     "maintainability",
