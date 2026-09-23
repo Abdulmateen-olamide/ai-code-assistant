@@ -59,6 +59,16 @@ class _FakeSession:
         return self.response
 
 
+class _QueueSession(_FakeSession):
+    def __init__(self, responses):
+        super().__init__(responses[0])
+        self.responses = list(responses)
+
+    def get(self, url, timeout=None, stream=None, headers=None, allow_redirects=False):
+        self.requested_url = url
+        return self.responses.pop(0)
+
+
 def _rpc_result(payload):
     return {"jsonrpc": "2.0", "id": 1, "result": payload}
 
@@ -142,6 +152,59 @@ class TestInspectAccount:
         assert result["ledger_freshness"]["available"] is True
         assert result["ledger_freshness"]["sequence"] == 10
         assert result["network"]["network"] == "testnet"
+
+    def test_success_includes_account_dashboard_sections(self, app):
+        account_response = _FakeResponse(
+            200,
+            {
+                "account_id": VALID_ADDRESS,
+                "sequence": "123",
+                "subentry_count": 2,
+                "flags": {"auth_required": True},
+                "signers": [{"key": VALID_ADDRESS, "weight": 1, "type": "ed25519"}],
+                "data": {"project": "YWk="},
+                "balances": [
+                    {"asset_type": "native", "balance": "50.0000000"},
+                    {
+                        "asset_type": "credit_alphanum4",
+                        "asset_code": "USD",
+                        "asset_issuer": VALID_ADDRESS,
+                        "balance": "3.0000000",
+                        "limit": "10.0000000",
+                        "is_authorized": True,
+                    },
+                ],
+            },
+        )
+        transactions_response = _FakeResponse(
+            200,
+            {"_embedded": {"records": [{"hash": "a" * 64, "ledger": 20}]}},
+        )
+        with app.app_context():
+            result = inspect_account(
+                VALID_ADDRESS,
+                service=StellarService(
+                    session=_QueueSession([account_response, transactions_response])
+                ),
+                rpc=_StubRpc(),
+            )
+        assert result["account"]["flags"]["auth_required"] is True
+        assert result["account"]["balances"][1]["limit"] == "10.0000000"
+        assert result["account"]["data"]["project"] == "YWk="
+        assert result["transactions"]["records"][0]["ledger"] == 20
+
+    def test_success_includes_empty_transactions(self, app):
+        session = _QueueSession(
+            [
+                _FakeResponse(200, {"account_id": VALID_ADDRESS, "sequence": "1"}),
+                _FakeResponse(200, {"_embedded": {"records": []}}),
+            ]
+        )
+        with app.app_context():
+            result = inspect_account(
+                VALID_ADDRESS, service=StellarService(session=session), rpc=_StubRpc()
+            )
+        assert result["transactions"]["records"] == []
 
     def test_invalid_address_rejected(self, app):
         with app.app_context(), pytest.raises(AccountError):

@@ -111,6 +111,7 @@ def inspect_account(
 
     service = service or get_stellar_service()
     account = service.get_account(address)
+    transactions = service.get_account_transactions(address, limit=20)
 
     ledger: dict[str, Any] = {}
     ledger_available = False
@@ -125,6 +126,7 @@ def inspect_account(
         "address": address,
         "network": service.config.to_dict(),
         "account": account,
+        "transactions": transactions,
         "ledger_freshness": {
             "available": ledger_available,
             "sequence": ledger.get("sequence") if ledger_available else None,
