@@ -189,23 +189,29 @@
     );
   }
 
+  function confidenceTag(finding) {
+    var confirmed = finding.confidence === "confirmed";
+    var label = finding.confidence_label || (confirmed ? "[CONFIRMED]" : "[SUGGESTION]");
+    return (
+      '<span class="tag ' + (confirmed ? "tag-confirmed" : "tag-suggestion") + '">' +
+      GH.escapeHtml(label) + "</span>"
+    );
+  }
+
   function findingCard(finding) {
     var location = finding.file ? GH.escapeHtml(finding.file) : "(whole repo)";
     if (finding.line != null) location += ":" + finding.line;
-    var addressed = finding.addressed
-      ? '<span class="tag tag-confirmed">addressed</span>'
-      : '<span class="tag tag-suggestion">open</span>';
     return (
       '<div class="finding-card">' +
       '<div class="finding-header">' +
       badge(finding.severity) +
+      " " + confidenceTag(finding) +
       " " + GH.escapeHtml(finding.category) +
       " <span class='finding-location'>" + location + "</span>" +
       '<button class="btn btn-ghost btn-sm finding-toggle" data-id="' + finding.id +
       '" data-addressed="' + (finding.addressed ? "0" : "1") + '" type="button">' +
       (finding.addressed ? "Reopen" : "Mark addressed") + "</button>" +
       "</div>" +
-      "<p class='finding-confidence'>confidence: " + GH.escapeHtml(finding.confidence) + "</p>" +
       "<p>" + GH.renderMarkdownish(finding.explanation) + "</p>" +
       (finding.recommendation
         ? "<p class='finding-recommendation'><strong>Recommendation:</strong> " +

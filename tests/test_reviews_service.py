@@ -508,6 +508,30 @@ class TestStructuredFindingContract:
             assert finding["file"] == "a.py"
             assert finding["line"] == 3
 
+    def test_labels_instructed_consistently_for_pr_and_project(self, app, monkeypatch):
+        project = _ready_project([("app/main.py", "x")])
+        provider = CapturingProvider(JSON_REPLY)
+        monkeypatch.setattr(reviews, "get_provider", lambda: provider)
+        config = {
+            "languages": None,
+            "max_files": 40,
+            "max_context_chars": 40000,
+            "severity_threshold": "low",
+            "security_focus": True,
+            "performance_focus": True,
+        }
+
+        reviews.review_project(project, "security", config)
+        project_system = provider.messages[0]["content"]
+        assert "[CONFIRMED]" in project_system
+        assert "[SUGGESTION]" in project_system
+
+        provider.messages = None
+        reviews.review_pull_request({"number": 1, "title": "t"}, [_pr_file("app/x.py")], config)
+        pr_system = provider.messages[0]["content"]
+        assert "[CONFIRMED]" in pr_system
+        assert "[SUGGESTION]" in pr_system
+
     def test_finding_serialization_has_no_raw_content(self, app):
         finding = ReviewFinding(
             review_id=1,
