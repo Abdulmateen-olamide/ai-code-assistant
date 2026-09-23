@@ -138,7 +138,7 @@ def _validate_project_path(path: str) -> str:
 def index():
     """Workspace list page."""
     workspaces = Workspace.query.filter_by(user_id=current_user.id).order_by(
-        Workspace.updated_at.desc()
+        Workspace.is_pinned.desc(), Workspace.updated_at.desc()
     )
     return render_template("workspaces/index.html", workspaces=workspaces)
 
@@ -171,7 +171,7 @@ def project_explorer(workspace_id: int, project_id: int):
 @login_required
 def api_list_workspaces():
     workspaces = Workspace.query.filter_by(user_id=current_user.id).order_by(
-        Workspace.updated_at.desc()
+        Workspace.is_pinned.desc(), Workspace.updated_at.desc()
     )
     return jsonify([w.to_dict() for w in workspaces])
 
@@ -205,6 +205,8 @@ def api_update_workspace(workspace_id: int):
         workspace.name = name[:200]
     if "description" in data:
         workspace.description = (data.get("description") or "").strip()[:2000] or None
+    if "is_pinned" in data:
+        workspace.is_pinned = bool(data["is_pinned"])
     db.session.commit()
     return jsonify(workspace.to_dict())
 
