@@ -571,7 +571,9 @@ def _import_archive(workspace: Workspace):
         project.status = STATUS_FAILED
         project.error_message = "The archive contained no importable files."
         db.session.commit()
-        return jsonify({"error": project.error_message, "project": project.to_dict(), "retryable": False}), 400
+        return jsonify(
+            {"error": project.error_message, "project": project.to_dict(), "retryable": False}
+        ), 400
 
     store_project_files(project, rows)
     return _finish_project_import(workspace, project, SOURCE_ARCHIVE)

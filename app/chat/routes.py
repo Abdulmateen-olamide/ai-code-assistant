@@ -1,7 +1,7 @@
 """Chat routes: UI page, conversation CRUD, and SSE streaming."""
 
-import json
 import hashlib
+import json
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -145,7 +145,9 @@ def conversation_shares(conversation_id: int):
     """List or create secure, expiring links owned by the current user."""
     conversation = _get_conversation(conversation_id)
     if request.method == "GET":
-        return jsonify([_share_payload(share) for share in conversation.shares if not share.is_expired()])
+        return jsonify(
+            [_share_payload(share) for share in conversation.shares if not share.is_expired()]
+        )
 
     data = request.get_json(silent=True) or {}
     permission = data.get("permission", "read_only")
@@ -173,7 +175,9 @@ def conversation_shares(conversation_id: int):
 @login_required
 def revoke_conversation_share(conversation_id: int, share_id: int):
     conversation = _get_conversation(conversation_id)
-    share = ConversationShare.query.filter_by(id=share_id, conversation_id=conversation.id).first_or_404()
+    share = ConversationShare.query.filter_by(
+        id=share_id, conversation_id=conversation.id
+    ).first_or_404()
     db.session.delete(share)
     db.session.commit()
     return jsonify({"ok": True})
@@ -190,12 +194,14 @@ def shared_conversation_page(token: str):
 def shared_conversation(token: str):
     share = _share_from_token(token)
     conversation = db.session.get(Conversation, share.conversation_id)
-    return jsonify({
-        "conversation": conversation.to_dict(),
-        "messages": [message.to_dict() for message in conversation.messages],
-        "permission": share.permission,
-        "expires_at": share.expires_at.isoformat(),
-    })
+    return jsonify(
+        {
+            "conversation": conversation.to_dict(),
+            "messages": [message.to_dict() for message in conversation.messages],
+            "permission": share.permission,
+            "expires_at": share.expires_at.isoformat(),
+        }
+    )
 
 
 @bp.route("/api/shared/<token>/messages", methods=["POST"])
@@ -207,7 +213,9 @@ def add_shared_message(token: str):
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
     if not content or len(content) > 20_000:
-        return jsonify({"error": "Message content is required and must be under 20,000 characters."}), 400
+        return jsonify(
+            {"error": "Message content is required and must be under 20,000 characters."}
+        ), 400
     message = Message(role="user", content=content, conversation_id=share.conversation_id)
     db.session.add(message)
     db.session.commit()
