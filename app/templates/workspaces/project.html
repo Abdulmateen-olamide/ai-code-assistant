@@ -48,7 +48,14 @@
     <div id="tab-search" class="project-tab" hidden>
       <div class="repo-toolbar">
         <input id="search-query" class="sidebar-search" type="search" placeholder="Search file names and contents...">
+        <select id="search-scope" class="prompt-filter" aria-label="Search scope">
+          <option value="all">Names + contents</option>
+          <option value="path">Names only</option>
+          <option value="content">Contents only</option>
+        </select>
+        <input id="search-language" class="sidebar-search" type="text" placeholder="Language (e.g. python)">
         <label class="checkbox"><input type="checkbox" id="search-case"> Case sensitive</label>
+        <label class="checkbox"><input type="checkbox" id="search-regex"> Regex</label>
         <button id="search-run" class="btn btn-primary btn-sm" type="button">Search</button>
       </div>
       <div id="search-results" class="search-results"><p class="sidebar-empty">Enter a query to search the project.</p></div>

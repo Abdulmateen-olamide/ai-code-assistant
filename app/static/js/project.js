@@ -250,14 +250,24 @@
   function runSearch() {
     var query = document.getElementById("search-query").value.trim();
     var caseSensitive = document.getElementById("search-case").checked;
+    var regex = document.getElementById("search-regex").checked;
+    var scopeEl = document.getElementById("search-scope");
+    var languageEl = document.getElementById("search-language");
     var resultsEl = document.getElementById("search-results");
     if (!query) {
       resultsEl.innerHTML = '<p class="sidebar-empty">Enter a query to search the project.</p>';
       return;
     }
     resultsEl.innerHTML = '<p class="sidebar-empty">Searching...</p>';
-    var url = "/workspaces/api/projects/" + PROJECT_ID + "/search?q=" + encodeURIComponent(query);
-    if (caseSensitive) url += "&case=1";
+    var params = ["q=" + encodeURIComponent(query)];
+    if (caseSensitive) params.push("case=1");
+    if (regex) params.push("regex=1");
+    if (scopeEl && scopeEl.value && scopeEl.value !== "all") {
+      params.push("scope=" + encodeURIComponent(scopeEl.value));
+    }
+    var language = languageEl ? languageEl.value.trim() : "";
+    if (language) params.push("language=" + encodeURIComponent(language));
+    var url = "/workspaces/api/projects/" + PROJECT_ID + "/search?" + params.join("&");
     api(url)
       .then(function (data) {
         resultsEl.innerHTML = "";

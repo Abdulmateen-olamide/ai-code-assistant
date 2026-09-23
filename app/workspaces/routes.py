@@ -81,7 +81,7 @@ from app.services.llm import LLMProviderError, get_provider
 from app.services.notifications import notify
 from app.services.permissions import resolve_workspace
 from app.services.ratelimit import per_user_limit
-from app.services.search import search_project
+from app.services.search import SearchQueryError, search_project
 from app.services.stellar_detection import project_stellar_metadata
 from app.workspaces import bp
 
@@ -624,8 +624,24 @@ def api_project_search(project_id: int):
     if not query:
         return jsonify({"error": "A search query is required."}), 400
     case_sensitive = request.args.get("case", "0") == "1"
+    regex = request.args.get("regex", "0") == "1"
+    scope = request.args.get("scope", "all").strip().lower()
+    if scope not in ("all", "path", "content"):
+        return jsonify({"error": "Invalid scope."}), 400
+    language = request.args.get("language", "").strip() or None
     limit = request.args.get("limit", type=int)
-    result = search_project(project.id, query, case_sensitive=case_sensitive, limit=limit)
+    try:
+        result = search_project(
+            project.id,
+            query,
+            case_sensitive=case_sensitive,
+            limit=limit,
+            language=language,
+            scope=scope,
+            regex=regex,
+        )
+    except SearchQueryError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify(result)
 
 
