@@ -1,7 +1,7 @@
 """Merge the conversation-share and review-comment migration heads."""
 
 revision = "b4c6d7e8f9a0"
-down_revision = ("b4c3d2e1f0a9", "b4c5d6e7f8a9")
+down_revision = ("d4e5f6a7b8c9", "b4c5d6e7f8a9")
 branch_labels = None
 depends_on = None
 
