@@ -463,6 +463,43 @@ docker compose up --build
 The `web` service applies pending migrations before starting, and exposes a
 health check at `GET /health`.
 
+### Database migrations
+
+Schema changes are managed with Flask-Migrate (Alembic). The chat schema
+(`conversations`, `messages`, `api_keys`, and their follow-ups) and the
+`audit_logs` table are all committed migration scripts under
+`migrations/versions/`.
+
+```bash
+# Apply every pending migration
+flask --app wsgi db upgrade
+
+# Show the current revision and the full chain
+flask --app wsgi db current
+flask --app wsgi db heads
+flask --app wsgi db history
+
+# Downgrade one revision, or all the way back to the Phase 1 head
+flask --app wsgi db downgrade -1
+flask --app wsgi db downgrade 5f57a9ef1df8
+
+# Generate a new migration after changing a model
+flask --app wsgi db migrate -m "describe the change"
+```
+
+By default these run against the SQLite database from `DATABASE_URL`. To apply
+the same migrations to PostgreSQL (the production target), point `DATABASE_URL`
+at your Postgres instance first, e.g.:
+
+```bash
+DATABASE_URL=postgresql://aica:aica@localhost:5432/aica \
+  flask --app wsgi db upgrade
+```
+
+The downgrade path for the chat tables is `5f57a9ef1df8` (the Phase 1 head);
+`tests/test_migrations.py` exercises both directions against a temporary
+database. The Docker `web` service runs `db upgrade` automatically on start.
+
 ### Setting up GitHub OAuth (Phase 4)
 
 1. Create an OAuth App at <https://github.com/settings/applications/new>:

@@ -30,6 +30,12 @@ from app.models import (
 from app.models.message_attachment import ALLOWED_IMAGE_TYPES
 from app.models.project import STATUS_READY
 from app.services import audit
+from app.services.github import (
+    GitHubError,
+    GitHubNotConnectedError,
+    build_github_context,
+    github_error_message,
+)
 from app.services.llm import LLMProviderError, provider_status
 from app.services.llm_cache import cached_complete
 from app.services.notifications import notify
@@ -63,6 +69,55 @@ def _provider_not_configured_payload(status: dict) -> dict:
         "provider": status.get("provider"),
         "reason": status.get("reason"),
     }
+
+
+#: Machine-readable code returned when a message references GitHub context but
+#: the user has not connected a GitHub account (issue #74).
+GITHUB_NOT_CONNECTED_CODE = "github_not_connected"
+
+
+def _github_not_connected_payload() -> dict:
+    """Build the connection prompt for GitHub context without a linked account.
+
+    Mirrors the provider onboarding payload so the client can render a
+    "Connect GitHub" call to action instead of a generic error (issue #74).
+    """
+    return {
+        "error": (
+            "Connect your GitHub account to reference repositories, issues or pull "
+            "requests in chat."
+        ),
+        "code": GITHUB_NOT_CONNECTED_CODE,
+        "connect_url": url_for("github.connect"),
+    }
+
+
+def _github_context_messages(user, content: str) -> tuple[list[dict], dict | None, int]:
+    """Resolve the GitHub references in a message for a user (issue #74).
+
+    Returns ``(messages, error, status)``: the extra system messages carrying the
+    fetched context, or an error payload and the status to return it with. An
+    empty message list with no error means the message referenced nothing, so
+    chat keeps working for users who never connected GitHub.
+    """
+    try:
+        result = build_github_context(user, content)
+    except GitHubNotConnectedError:
+        return [], _github_not_connected_payload(), 409
+    except GitHubError as exc:
+        return [], {"error": github_error_message(exc), "code": "github_error"}, 502
+
+    messages: list[dict] = []
+    if result["context"]:
+        messages.append({"role": "system", "content": result["context"]})
+    if result["notices"]:
+        messages.append(
+            {
+                "role": "system",
+                "content": "GitHub context notes:\n- " + "\n- ".join(result["notices"]),
+            }
+        )
+    return messages, None, 200
 
 
 def _get_conversation(conversation_id: int) -> Conversation:
@@ -102,11 +157,12 @@ def _message_images(message) -> list[dict]:
     ]
 
 
-def _conversation_messages(conversation) -> list[dict]:
-    """Build the outgoing message list, honoring system prompt and images."""
+def _conversation_messages(conversation, context_messages=None) -> list[dict]:
+    """Build the outgoing message list, honoring system prompt, GitHub context and images."""
     messages: list[dict] = []
     if conversation.system_prompt:
         messages.append({"role": "system", "content": conversation.system_prompt})
+    messages.extend(context_messages or [])
     for message in conversation.messages:
         item: dict = {"role": message.role, "content": message.content}
         images = _message_images(message)
@@ -457,6 +513,12 @@ def send_message(conversation_id: int):
     if not status["configured"]:
         return jsonify(_provider_not_configured_payload(status)), 503
 
+    context_messages, context_error, context_status = _github_context_messages(
+        current_user, content
+    )
+    if context_error is not None:
+        return jsonify(context_error), context_status
+
     # ``no_cache`` lets a client force a fresh provider call (issue #18).
     no_cache = bool(data.get("no_cache"))
     user_message = Message(role="user", content=content)
@@ -466,7 +528,7 @@ def send_message(conversation_id: int):
         db.session.rollback()
         return jsonify({"error": error}), 400
 
-    messages = _conversation_messages(conversation)
+    messages = _conversation_messages(conversation, context_messages)
 
     try:
         provider = RetryingProvider(build_provider(current_user, conversation.provider))
@@ -512,6 +574,12 @@ def stream_message(conversation_id: int):
     if not status["configured"]:
         return jsonify(_provider_not_configured_payload(status)), 503
 
+    context_messages, context_error, context_status = _github_context_messages(
+        current_user, content
+    )
+    if context_error is not None:
+        return jsonify(context_error), context_status
+
     user_message = Message(role="user", content=content)
     conversation.messages.append(user_message)
     error = _link_attachments(conversation, user_message, attachment_ids)
@@ -519,7 +587,7 @@ def stream_message(conversation_id: int):
         db.session.rollback()
         return jsonify({"error": error}), 400
     db.session.commit()
-    messages = _conversation_messages(conversation)
+    messages = _conversation_messages(conversation, context_messages)
     generation = _generation_kwargs(conversation)
 
     def persist_assistant(reply: str):

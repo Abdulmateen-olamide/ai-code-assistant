@@ -184,6 +184,18 @@ def send_message(conversation_id: int):
             provider=status.get("provider"),
         )
 
+    context_messages, context_error, context_status = chat_routes._github_context_messages(
+        current_user, content
+    )
+    if context_error is not None:
+        extras = {key: value for key, value in context_error.items() if key != "error"}
+        return _problem(
+            context_status,
+            "GitHub context unavailable.",
+            context_error["error"],
+            **extras,
+        )
+
     user_message = Message(role="user", content=content)
     conversation.messages.append(user_message)
     error = chat_routes._link_attachments(conversation, user_message, attachment_ids)
@@ -191,7 +203,7 @@ def send_message(conversation_id: int):
         db.session.rollback()
         return _problem(400, "Invalid attachment.", error)
 
-    messages = chat_routes._conversation_messages(conversation)
+    messages = chat_routes._conversation_messages(conversation, context_messages)
     try:
         provider = RetryingProvider(build_provider(current_user, conversation.provider))
         reply = provider.chat(messages, **chat_routes._generation_kwargs(conversation)).content

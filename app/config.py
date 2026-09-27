@@ -100,6 +100,10 @@ class Config:
     # Pre-flight token/cost estimate (issue #104). The rate is only used to turn
     # an estimated token count into a rough USD figure shown before sending.
     LLM_ESTIMATE_USD_PER_1K_TOKENS = float(os.getenv("LLM_ESTIMATE_USD_PER_1K_TOKENS", "0.002"))
+    # Structured chat audit logging (issue #17). ``CHAT_AUDIT_LOG_LEVEL`` may be
+    # any logging level or OFF to disable.
+    CHAT_AUDIT_LOG_ENABLED = os.getenv("CHAT_AUDIT_LOG_ENABLED", "1") == "1"
+    CHAT_AUDIT_LOG_LEVEL = os.getenv("CHAT_AUDIT_LOG_LEVEL", "INFO")
 
     # Prompt library (Phase 3): version history. Every prompt save is recorded
     # as a version; when a prompt is deleted its history is retained for this

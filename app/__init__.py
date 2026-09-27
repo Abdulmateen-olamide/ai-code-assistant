@@ -38,6 +38,11 @@ def create_app(config_name: str | None = None) -> Flask:
     login_manager.init_app(app)
     csrf.init_app(app)
 
+    # Structured, security-relevant chat logging + request-id correlation (#17).
+    from app.services import chat_audit
+
+    chat_audit.init_app(app)
+
     # Per-user LLM response cache (issue #18).
     from app.services.llm_cache import configure_cache
 
