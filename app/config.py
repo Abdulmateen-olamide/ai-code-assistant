@@ -97,6 +97,10 @@ class Config:
     LLM_CACHE_ENABLED = os.getenv("LLM_CACHE_ENABLED", "1") == "1"
     LLM_CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "300"))
     LLM_CACHE_MAX_ENTRIES = int(os.getenv("LLM_CACHE_MAX_ENTRIES", "256"))
+    # Structured chat audit logging (issue #17). ``CHAT_AUDIT_LOG_LEVEL`` may be
+    # any logging level or OFF to disable.
+    CHAT_AUDIT_LOG_ENABLED = os.getenv("CHAT_AUDIT_LOG_ENABLED", "1") == "1"
+    CHAT_AUDIT_LOG_LEVEL = os.getenv("CHAT_AUDIT_LOG_LEVEL", "INFO")
 
     # Prompt library (Phase 3): version history. Every prompt save is recorded
     # as a version; when a prompt is deleted its history is retained for this

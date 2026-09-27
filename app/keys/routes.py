@@ -9,6 +9,7 @@ from flask_login import current_user, login_required
 
 from app.keys import bp
 from app.services import api_keys as api_keys_service
+from app.services import chat_audit
 from app.services.api_keys import ApiKeyError
 
 
@@ -38,6 +39,13 @@ def create_key():
         )
     except ApiKeyError as exc:
         return jsonify({"error": str(exc)}), 400
+    # Key lifecycle is logged by identifier only — never the secret material.
+    chat_audit.log_event(
+        "chat.key_created", user_id=current_user.id, provider=key.provider, key_id=key.id
+    )
+    chat_audit.log_event(
+        "chat.key_verified", user_id=current_user.id, provider=key.provider, key_id=key.id
+    )
     return jsonify(key.to_dict()), 201
 
 
@@ -50,6 +58,9 @@ def update_key(key_id: int):
     )
     if key is None:
         return jsonify({"error": "API key not found."}), 404
+    chat_audit.log_event(
+        "chat.key_updated", user_id=current_user.id, provider=key.provider, key_id=key.id
+    )
     return jsonify(key.to_dict())
 
 
@@ -58,4 +69,5 @@ def update_key(key_id: int):
 def delete_key(key_id: int):
     if not api_keys_service.delete_key(current_user, key_id):
         return jsonify({"error": "API key not found."}), 404
+    chat_audit.log_event("chat.key_deleted", user_id=current_user.id, key_id=key_id)
     return jsonify({"ok": True})

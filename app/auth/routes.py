@@ -13,7 +13,7 @@ from flask_login import current_user, login_required, login_user, logout_user
 from app.auth import bp
 from app.extensions import db
 from app.models import User
-from app.services import audit
+from app.services import audit, chat_audit
 
 
 def _is_safe_redirect_target(target: str) -> bool:
@@ -74,6 +74,7 @@ def register():
                 metadata={"username": user.username, "email": user.email},
             )
             db.session.commit()
+            chat_audit.log_event("chat.register", user_id=user.id, status="success")
             login_user(user)
             flash("Welcome! Your account was created successfully.", "success")
             if next_url and _is_safe_redirect_target(next_url):
@@ -101,6 +102,13 @@ def login():
             error = "Invalid email or password."
             audit.record(audit.LOGIN_FAILURE, metadata={"email": email})
             db.session.commit()
+            # Structured log: identifiers/status only, never the email or password.
+            chat_audit.log_event(
+                "chat.login",
+                user_id=(user.id if user is not None else None),
+                status="failure",
+                reason="invalid_credentials",
+            )
         elif not user.is_active:
             error = "This account has been disabled. Contact support."
             audit.record(
@@ -111,6 +119,7 @@ def login():
                 metadata={"email": email, "reason": "inactive"},
             )
             db.session.commit()
+            chat_audit.log_event("chat.login", user_id=user.id, status="failure", reason="inactive")
         else:
             user.touch_last_login()
             audit.record(
@@ -121,6 +130,7 @@ def login():
                 metadata={"email": user.email},
             )
             db.session.commit()
+            chat_audit.log_event("chat.login", user_id=user.id, status="success")
             login_user(user, remember=remember)
             flash(f"Welcome back, {user.username}!", "success")
 
