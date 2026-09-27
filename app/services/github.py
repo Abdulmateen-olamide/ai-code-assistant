@@ -909,3 +909,177 @@ def get_github_client(user=None) -> GitHubClient:
         db.session.commit()
         token = refreshed["access_token"]
     return GitHubClient(token)
+
+
+# -- Chat context references (issue #74) -------------------------------------
+
+
+#: Matches ``owner/repo#123`` and a bare ``owner/repo``. The lookbehind stops a
+#: leading word character, ``@`` or ``/`` from being read as part of the name.
+CONTEXT_REFERENCE_RE = re.compile(
+    r"(?<![\w@/.-])([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(?:#(\d+))?"
+)
+#: Matches a bare ``#123``, which needs a repository to resolve against.
+CONTEXT_NUMBER_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+#: Appended to the assembled context when it had to be trimmed to the cap.
+CONTEXT_TRUNCATED_MARKER = "\n\n[GitHub context truncated]"
+
+
+def parse_context_references(text: str) -> list[dict]:
+    """Return the GitHub references found in ``text`` (issue #74).
+
+    Three forms are recognized: ``owner/repo#123`` (an issue or pull request),
+    ``owner/repo`` (a repository), and a bare ``#123`` when the same message also
+    names a repository to resolve it against. Order is preserved and duplicates
+    collapse, so mentioning the same target twice fetches it once. A bare
+    ``#123`` with no repository named is ignored rather than guessed at.
+    """
+    references: list[dict] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    repositories: list[str] = []
+
+    for match in CONTEXT_REFERENCE_RE.finditer(text or ""):
+        try:
+            full_name = validate_full_name(match.group(1))
+        except GitHubInvalidError:
+            continue
+        number = match.group(2)
+        if number:
+            key = ("thread", full_name, int(number))
+            if key not in seen:
+                seen.add(key)
+                references.append({"kind": "thread", "full_name": full_name, "number": int(number)})
+        else:
+            key = ("repo", full_name, None)
+            if key not in seen:
+                seen.add(key)
+                references.append({"kind": "repo", "full_name": full_name, "number": None})
+            repositories.append(full_name)
+
+    for match in CONTEXT_NUMBER_RE.finditer(text or ""):
+        number = int(match.group(1))
+        for full_name in repositories:
+            key = ("thread", full_name, number)
+            if key in seen:
+                continue
+            seen.add(key)
+            references.append({"kind": "thread", "full_name": full_name, "number": number})
+
+    return references
+
+
+def _repo_context_section(client: GitHubClient, full_name: str) -> str:
+    """Return the model-facing context block for a whole repository."""
+    repo = client.get_repository(full_name)
+    lines = [
+        f"### Repository {repo.get('full_name') or full_name}",
+        f"- Description: {repo.get('description') or '(none)'}",
+        f"- Primary language: {repo.get('language') or 'unknown'}",
+        f"- Default branch: {repo.get('default_branch') or 'main'}",
+        f"- URL: {repo.get('html_url') or 'https://github.com/' + full_name}",
+    ]
+    try:
+        readme = client.get_readme(full_name, repo.get("default_branch"))
+    except GitHubError:
+        readme = None
+    if readme:
+        lines.extend(["", "README:", readme])
+    return "\n".join(lines)
+
+
+def _pull_request_context_section(client: GitHubClient, full_name: str, number: int) -> str:
+    """Return the model-facing context block for a pull request."""
+    pull = client.get_pull_request(full_name, number)
+    state = pull.get("state") or "unknown"
+    if pull.get("merged_at"):
+        state = f"{state} (merged)"
+    lines = [
+        f"### Pull request {full_name}#{number}",
+        f"- Title: {pull.get('title') or '(no title)'}",
+        f"- State: {state}",
+        f"- Author: {(pull.get('user') or {}).get('login') or 'unknown'}",
+        f"- Branch: {(pull.get('head') or {}).get('ref')} -> {(pull.get('base') or {}).get('ref')}",
+        (
+            f"- Changed files: {pull.get('changed_files', 0)} "
+            f"(+{pull.get('additions', 0)} -{pull.get('deletions', 0)})"
+        ),
+        f"- URL: {pull.get('html_url') or ''}",
+    ]
+    if pull.get("body"):
+        lines.extend(["", "Body:", pull["body"]])
+    return "\n".join(lines)
+
+
+def _issue_context_section(client: GitHubClient, full_name: str, number: int) -> str:
+    """Return the model-facing context block for an issue."""
+    issue = client.get_issue(full_name, number)
+    labels = ", ".join(
+        label.get("name", "") for label in issue.get("labels") or [] if isinstance(label, dict)
+    )
+    lines = [
+        f"### Issue {full_name}#{number}",
+        f"- Title: {issue.get('title') or '(no title)'}",
+        f"- State: {issue.get('state') or 'unknown'}",
+        f"- Author: {(issue.get('user') or {}).get('login') or 'unknown'}",
+        f"- Labels: {labels or '(none)'}",
+        f"- URL: {issue.get('html_url') or ''}",
+    ]
+    if issue.get("body"):
+        lines.extend(["", "Body:", issue["body"]])
+    return "\n".join(lines)
+
+
+def _thread_context_section(client: GitHubClient, full_name: str, number: int) -> str:
+    """Return the context block for ``#number``, preferring a pull request.
+
+    GitHub's issues API also returns pull requests, so probing the pull request
+    endpoint first (and falling back to the issue endpoint on 404) resolves both
+    kinds without a second round trip when the reference is a pull request.
+    """
+    try:
+        return _pull_request_context_section(client, full_name, number)
+    except GitHubNotFoundError:
+        return _issue_context_section(client, full_name, number)
+
+
+def build_github_context(user, text: str) -> dict:
+    """Assemble model-facing context for the GitHub references in ``text`` (issue #74).
+
+    Returns ``{"context", "references", "notices"}``. ``context`` is the block
+    handed to the model and never exceeds ``Config.GITHUB_MAX_CONTEXT_CHARS``
+    characters, so one chat message cannot push an unbounded amount of repository
+    data into the prompt. A reference that cannot be read (missing, private, or
+    rate limited) becomes an entry in ``notices`` instead of failing the whole
+    message.
+
+    Raises :class:`GitHubNotConnectedError` when ``user`` has no GitHub
+    connection, so the caller can prompt them to connect first.
+    """
+    references = parse_context_references(text)
+    if not references:
+        return {"context": "", "references": [], "notices": []}
+
+    client = get_github_client(user)
+    budget = int(Config.GITHUB_MAX_CONTEXT_CHARS)
+    sections: list[str] = []
+    notices: list[str] = []
+
+    for reference in references:
+        full_name = reference["full_name"]
+        number = reference["number"]
+        label = f"{full_name}#{number}" if number else full_name
+        try:
+            if reference["kind"] == "repo":
+                sections.append(_repo_context_section(client, full_name))
+            else:
+                sections.append(_thread_context_section(client, full_name, number))
+        except GitHubNotFoundError:
+            notices.append(f"{label} was not found or is not visible to your GitHub account.")
+        except GitHubError as exc:
+            notices.append(f"{label}: {github_error_message(exc)}")
+
+    context = "\n\n".join(section for section in sections if section)
+    if len(context) > budget:
+        context = context[:budget] + CONTEXT_TRUNCATED_MARKER
+
+    return {"context": context, "references": references, "notices": notices}

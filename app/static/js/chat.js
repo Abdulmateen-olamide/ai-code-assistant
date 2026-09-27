@@ -384,6 +384,10 @@
           showOnboarding(errData);
           return;
         }
+        if (errData && errData.code === "github_not_connected") {
+          showGitHubConnectPrompt(errData);
+          return;
+        }
         throw new Error(errData && errData.error ? errData.error : "Stream failed (" + response.status + ").");
       }
 
@@ -517,6 +521,26 @@
     var el = document.createElement("div");
     el.className = "flash flash-success";
     el.textContent = message;
+    messagesEl.prepend(el);
+  }
+
+  // Connection prompt shown when a message references GitHub content (#issue,
+  // #pr, or owner/repo) but no GitHub account is linked (issue #74).
+  function showGitHubConnectPrompt(payload) {
+    var url = (payload && payload.connect_url) || "/github/connect";
+    var el = document.createElement("div");
+    el.className = "flash flash-error";
+    el.appendChild(
+      document.createTextNode(
+        (payload && payload.error) ||
+          "Connect your GitHub account to reference issues, pull requests, or repositories in chat."
+      )
+    );
+    el.appendChild(document.createTextNode(" "));
+    var link = document.createElement("a");
+    link.href = url;
+    link.textContent = "Connect GitHub";
+    el.appendChild(link);
     messagesEl.prepend(el);
   }
 
