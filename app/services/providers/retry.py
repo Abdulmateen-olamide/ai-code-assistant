@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
+from app.services import chat_audit
 from app.services.providers.base import (
     LLMProvider,
     ProviderError,
@@ -119,11 +120,29 @@ class RetryingProvider(LLMProvider):
     ) -> ProviderResponse:
         messages = list(messages)
         attempt = 0
+        started = time.monotonic()
         while True:
             try:
-                return self.provider.chat(messages, model=model, params=params)
+                response = self.provider.chat(messages, model=model, params=params)
+                chat_audit.log_event(
+                    "chat.provider_call",
+                    provider=self.name,
+                    status="success",
+                    retries=attempt,
+                    latency_ms=round((time.monotonic() - started) * 1000, 1),
+                    token_count=response.total_tokens,
+                )
+                return response
             except ProviderError as exc:
                 if not is_transient_error(exc) or attempt >= self.max_retries:
+                    chat_audit.log_event(
+                        "chat.provider_call",
+                        provider=self.name,
+                        status="error",
+                        retries=attempt,
+                        error=type(exc).__name__,
+                        latency_ms=round((time.monotonic() - started) * 1000, 1),
+                    )
                     raise
                 attempt += 1
                 self._wait(attempt)
@@ -137,18 +156,44 @@ class RetryingProvider(LLMProvider):
     ) -> Iterator[str]:
         messages = list(messages)
         attempt = 0
+        started = time.monotonic()
         while True:
             try:
                 iterator = self.provider.stream(messages, model=model, params=params)
                 first = next(iterator)
                 break
             except StopIteration:
+                chat_audit.log_event(
+                    "chat.provider_call",
+                    provider=self.name,
+                    status="success",
+                    retries=attempt,
+                    stream=True,
+                    latency_ms=round((time.monotonic() - started) * 1000, 1),
+                )
                 return
             except ProviderError as exc:
                 if not is_transient_error(exc) or attempt >= self.max_retries:
+                    chat_audit.log_event(
+                        "chat.provider_call",
+                        provider=self.name,
+                        status="error",
+                        retries=attempt,
+                        error=type(exc).__name__,
+                        stream=True,
+                        latency_ms=round((time.monotonic() - started) * 1000, 1),
+                    )
                     raise
                 attempt += 1
                 self._wait(attempt)
+        chat_audit.log_event(
+            "chat.provider_call",
+            provider=self.name,
+            status="success",
+            retries=attempt,
+            stream=True,
+            latency_ms=round((time.monotonic() - started) * 1000, 1),
+        )
         yield first
         yield from iterator
 
