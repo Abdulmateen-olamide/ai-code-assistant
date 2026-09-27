@@ -24,6 +24,11 @@ class Message(db.Model):
     )
     role = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
+    # Token usage recorded for the provider response that produced this message
+    # (issue #13). ``None`` for user messages and for historical rows.
+    prompt_tokens = db.Column(db.Integer, nullable=True)
+    completion_tokens = db.Column(db.Integer, nullable=True)
+    total_tokens = db.Column(db.Integer, nullable=True)
     created_at = db.Column(
         db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
@@ -38,11 +43,19 @@ class Message(db.Model):
 
     def to_dict(self) -> dict:
         """Serialize the message for JSON API responses."""
+        usage = None
+        if self.total_tokens is not None:
+            usage = {
+                "prompt_tokens": self.prompt_tokens or 0,
+                "completion_tokens": self.completion_tokens or 0,
+                "total_tokens": self.total_tokens or 0,
+            }
         return {
             "id": self.id,
             "role": self.role,
             "content": self.content,
             "attachments": [attachment.to_dict() for attachment in self.attachments],
+            "token_usage": usage,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

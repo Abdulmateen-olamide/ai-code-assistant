@@ -126,7 +126,23 @@ class TestMigrationHead:
     def test_head_is_latest_revision(self):
         result = _run_flask(["db", "heads"], {"DATABASE_URL": "sqlite:///:memory:"})
         assert result.returncode == 0, result.stderr
-        assert "9a8b7c6d5e4f" in (result.stdout + result.stderr)
+        assert "d8e9f0a1b2c3" in (result.stdout + result.stderr)
+
+    def test_message_token_columns_upgraded(self):
+        with _migration_db() as db_url, _inspect(db_url) as insp:
+            columns = {col["name"] for col in insp.get_columns("messages")}
+            assert {"prompt_tokens", "completion_tokens", "total_tokens"} <= columns
+
+    def test_message_token_columns_downgrade_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_url = f"sqlite:///{os.path.join(tmp, 'mig_tokens.db')}"
+            up = _run_flask(["db", "upgrade"], {"DATABASE_URL": db_url})
+            assert up.returncode == 0, up.stderr
+            down = _run_flask(["db", "downgrade", "9a8b7c6d5e4f"], {"DATABASE_URL": db_url})
+            assert down.returncode == 0, down.stderr
+            with _inspect(db_url) as insp:
+                columns = {col["name"] for col in insp.get_columns("messages")}
+                assert {"prompt_tokens", "completion_tokens", "total_tokens"}.isdisjoint(columns)
 
     def test_audit_logs_table_upgraded(self):
         expected = {

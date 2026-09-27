@@ -729,6 +729,13 @@ a:hover {
   margin-top: 8px;
 }
 
+.message-usage {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-family: var(--font-mono);
+}
+
 .conversation-actions {
   display: flex;
   gap: 8px;

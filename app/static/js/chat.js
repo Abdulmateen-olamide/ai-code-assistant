@@ -9,6 +9,8 @@
   var inputEl = document.getElementById("chat-input");
   var sendBtn = document.getElementById("send-message");
   var composerErrorEl = document.getElementById("composer-error");
+  var usageEl = document.getElementById("conversation-usage");
+  var conversationUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   var listEl = document.getElementById("conversation-list");
   var searchEl = document.getElementById("conversation-search");
   var actionsEl = document.getElementById("conversation-actions");
@@ -106,7 +108,35 @@
       .join("");
   }
 
-  function addMessage(role, content, attachments) {
+  // Render the running conversation total (issue #13).
+  function renderUsage() {
+    if (!usageEl) return;
+    var total = conversationUsage && conversationUsage.total_tokens;
+    usageEl.textContent = total
+      ? "This conversation: " +
+        total.toLocaleString() +
+        " tokens (" +
+        (conversationUsage.prompt_tokens || 0).toLocaleString() +
+        " prompt / " +
+        (conversationUsage.completion_tokens || 0).toLocaleString() +
+        " completion)"
+      : "";
+  }
+
+  function usageLine(usage) {
+    if (!usage || !usage.total_tokens) return "";
+    return (
+      '<div class="message-usage">' +
+      usage.total_tokens.toLocaleString() +
+      " tokens (" +
+      (usage.prompt_tokens || 0).toLocaleString() +
+      " + " +
+      (usage.completion_tokens || 0).toLocaleString() +
+      ")</div>"
+    );
+  }
+
+  function addMessage(role, content, attachments, usage) {
     var el = document.createElement("div");
     el.className = "chat-message chat-" + role;
     var label = role === "user" ? "You" : "Assistant";
@@ -116,7 +146,8 @@
       '</div><div class="message-body">' +
       (role === "user" ? escapeHtml(content) : renderMarkdown(content)) +
       "</div>" +
-      renderAttachments(attachments);
+      renderAttachments(attachments) +
+      (role === "user" ? "" : usageLine(usage));
     el.innerHTML = body;
     messagesEl.appendChild(el);
     scrollToBottom();
@@ -179,8 +210,11 @@
     return api("/chat/conversations/" + id)
       .then(function (data) {
         data.messages.forEach(function (message) {
-          addMessage(message.role, message.content, message.attachments);
+          addMessage(message.role, message.content, message.attachments, message.token_usage);
         });
+        conversationUsage =
+          data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+        renderUsage();
         if (data.messages.length === 0) {
           messagesEl.innerHTML =
             '<div class="chat-placeholder"><p>Ask the AI assistant for help with your code.</p></div>';
@@ -199,6 +233,8 @@
     currentId = null;
     messagesEl.innerHTML = '<div class="chat-placeholder"><p>Start a new conversation.</p></div>';
     actionsEl.hidden = true;
+    conversationUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    renderUsage();
     clearComposerError();
     autoGrowComposer();
     inputEl.focus();
@@ -430,6 +466,23 @@
                 renderMarkdown(payload.message.content) +
                 renderAttachments(payload.message.attachments);
               highlightCode(streamBody);
+              var usage = payload.message.token_usage;
+              if (usage) {
+                var usageRow = document.createElement("div");
+                usageRow.className = "message-usage";
+                usageRow.textContent =
+                  usage.total_tokens.toLocaleString() +
+                  " tokens (" +
+                  (usage.prompt_tokens || 0).toLocaleString() +
+                  " + " +
+                  (usage.completion_tokens || 0).toLocaleString() +
+                  ")";
+                typing.appendChild(usageRow);
+                conversationUsage.prompt_tokens += usage.prompt_tokens || 0;
+                conversationUsage.completion_tokens += usage.completion_tokens || 0;
+                conversationUsage.total_tokens += usage.total_tokens || 0;
+                renderUsage();
+              }
             }
             scrollToBottom();
           }
