@@ -16,6 +16,7 @@
   var chatInputEl = document.getElementById("project-chat-input");
   var chatSendBtn = document.getElementById("project-chat-send");
   var chatAttachmentsEl = document.getElementById("project-chat-attachments");
+  var chatEstimateEl = document.getElementById("project-chat-estimate");
   var reviewSummaryEl = document.getElementById("review-summary");
   var streaming = false;
   var chatLoaded = false;
@@ -498,6 +499,38 @@
     });
   }
 
+  // Pre-flight token/cost estimate (issue #104). Best-effort: failures clear
+  // the hint rather than surfacing an error, so typing is never interrupted.
+  function formatEstimate(estimate) {
+    var tokens = Number(estimate && estimate.prompt_tokens) || 0;
+    var cost = Number(estimate && estimate.estimated_cost_usd) || 0;
+    return "Estimated: ~" + tokens.toLocaleString() + " tokens (~$" + cost.toFixed(4) + ")";
+  }
+
+  var chatEstimateTimer = null;
+  function estimateChat() {
+    if (!chatEstimateEl) return;
+    var content = chatInputEl.value.trim();
+    if (!content) {
+      chatEstimateEl.textContent = "";
+      return;
+    }
+    window.clearTimeout(chatEstimateTimer);
+    chatEstimateTimer = window.setTimeout(function () {
+      api("/workspaces/api/projects/" + PROJECT_ID + "/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "chat", content: content, attachments: pendingAttachments }),
+      })
+        .then(function (estimate) {
+          chatEstimateEl.textContent = formatEstimate(estimate);
+        })
+        .catch(function () {
+          chatEstimateEl.textContent = "";
+        });
+    }, 400);
+  }
+
   async function startChat() {
     var content = chatInputEl.value.trim();
     if (!content || streaming) return;
@@ -589,20 +622,34 @@
 
   // ------------------------------------------------------------- analysis
 
-  function runAnalysis(kind) {
+  async function runAnalysis(kind) {
     var output = document.getElementById("analysis-output");
     output.innerHTML = '<p class="sidebar-empty">Analyzing project (bounded context), please wait...</p>';
-    api("/workspaces/api/projects/" + PROJECT_ID + "/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: kind }),
-    })
-      .then(function (data) {
-        renderAnalysis(output, data.analysis);
-      })
-      .catch(function (error) {
-        output.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+
+    // Show the pre-flight estimate for the exact context that will be sent.
+    try {
+      var estimate = await api("/workspaces/api/projects/" + PROJECT_ID + "/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "analysis", kind: kind }),
       });
+      output.innerHTML =
+        '<p class="chat-hint">' + escapeHtml(formatEstimate(estimate)) + "</p>" +
+        '<p class="sidebar-empty">Analyzing project (bounded context), please wait...</p>';
+    } catch (error) {
+      /* estimation is best-effort; continue with the analysis */
+    }
+
+    try {
+      var data = await api("/workspaces/api/projects/" + PROJECT_ID + "/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: kind }),
+      });
+      renderAnalysis(output, data.analysis);
+    } catch (error) {
+      output.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+    }
   }
 
   // ---------------------------------------------------------------- stats
@@ -1203,6 +1250,7 @@
 
     chatSendBtn.addEventListener("click", startChat);
     newChatSessionBtn.addEventListener("click", createChatSession);
+    chatInputEl.addEventListener("input", estimateChat);
     chatInputEl.addEventListener("keydown", function (event) {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();

@@ -1282,6 +1282,43 @@ def api_project_chat_stream(project_id: int):
 # --------------------------------------------------------------------------
 
 
+@bp.route("/api/projects/<int:project_id>/estimate", methods=["POST"])
+@login_required
+def api_project_estimate(project_id: int):
+    """Pre-flight token/cost estimate for chat or an analysis (issue #104).
+
+    Computed from the same bounded context the real request sends (via
+    ``build_messages`` / ``build_context`` / ``_bounded_blocks``); no provider
+    is contacted, so estimating consumes no tokens.
+    """
+    project = _get_project(project_id)
+    if project.status != STATUS_READY:
+        return jsonify({"error": "This project has not finished indexing."}), 409
+
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "chat").strip().lower()
+
+    if mode == "analysis":
+        kind = (data.get("kind") or "architecture").strip().lower()
+        if kind not in project_analysis.ANALYSIS_KINDS:
+            return jsonify({"error": "Unsupported analysis kind."}), 400
+        estimate = project_analysis.estimate_analysis(project, kind)
+    elif mode == "chat":
+        content = (data.get("content") or "").strip()
+        attachments = data.get("attachments") or []
+        if not isinstance(attachments, list) or not all(
+            isinstance(path, str) for path in attachments
+        ):
+            return jsonify({"error": "Attachments must be a list of file paths."}), 400
+        if not content:
+            return jsonify({"error": "A message is required."}), 400
+        estimate = project_analysis.estimate_chat(project, content, attachments=attachments)
+    else:
+        return jsonify({"error": "mode must be 'chat' or 'analysis'."}), 400
+
+    return jsonify(estimate)
+
+
 @bp.route("/api/projects/<int:project_id>/analyze", methods=["POST"])
 @login_required
 @per_user_limit(
