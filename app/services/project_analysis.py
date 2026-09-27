@@ -713,6 +713,103 @@ def chat_with_project(
     }
 
 
+# --------------------------------------------------------------------------
+# Pre-flight token / cost estimation (issue #104)
+# --------------------------------------------------------------------------
+
+#: Rough characters-per-token ratio for source code and English. Close enough
+#: for a "before you send" figure and, crucially, needs no provider round-trip.
+CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str | None) -> int:
+    """Estimate the token count of ``text`` without calling any provider."""
+    if not text:
+        return 0
+    return max(1, (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN)
+
+
+def _estimate_cost(tokens: int) -> float:
+    """Estimated USD cost for ``tokens`` using the configured per-1k rate."""
+    from flask import current_app
+
+    rate = float(current_app.config.get("LLM_ESTIMATE_USD_PER_1K_TOKENS", 0.0) or 0.0)
+    return round(tokens / 1000 * rate, 6)
+
+
+def estimate_chat(
+    project,
+    question: str,
+    history: list | None = None,
+    attachments: list[str] | None = None,
+) -> dict:
+    """Estimate the tokens a project-chat request will send (issue #104).
+
+    Built from the *same* :func:`build_messages` (and therefore
+    :func:`build_context`) output the real request uses, so the figure matches
+    what will actually be sent. No provider is contacted.
+    """
+    _assert_accessible(project)
+    messages = build_messages(project, question, history or [], attachments)
+    tokens = sum(estimate_tokens(m.get("content")) for m in messages)
+    return {
+        "mode": "chat",
+        "prompt_tokens": tokens,
+        "estimated_cost_usd": _estimate_cost(tokens),
+    }
+
+
+def estimate_analysis(project, kind: str) -> dict:
+    """Estimate the context tokens an analysis of ``kind`` will send (#104).
+
+    Uses the same :func:`build_context` / :func:`_bounded_blocks` selection the
+    real analysis performs for each kind, so the estimate tracks the exact
+    context blocks that will be sent. No provider is contacted.
+    """
+    _assert_accessible(project)
+    kind = (kind or "").strip().lower()
+    if kind not in ANALYSIS_KINDS:
+        kind = "architecture"
+
+    structure = project_structure(project)
+    budget = _budget()
+    source = _source_files(project)
+    header = _context_header(project)
+
+    if kind == "architecture":
+        context = build_context(project, "architecture main components structure")
+        body = context["blocks"] or ""
+        structure_clip = _clip(structure, 12000)
+    elif kind == "docs":
+        docs_files = [
+            f
+            for f in project.files.all()
+            if f.content is not None and f.path.rsplit(".", 1)[-1].lower() in ("md", "rst", "txt")
+        ]
+        body = _bounded_blocks(docs_files, budget)
+        structure_clip = _clip(structure, 6000)
+    elif kind == "dependencies":
+        inventory = dependency_inventory(project)
+        body = "\n".join(
+            f"- {item['file']}: {item['name']} {item['constraint']}".rstrip()
+            for item in inventory[:200]
+        )
+        structure_clip = ""
+    else:
+        # bugs/refactor/tests and the delegated quality/security/review/stellar
+        # analyses all bound the source files the same way.
+        body = _bounded_blocks(source, budget)
+        structure_clip = _clip(structure, 6000)
+
+    tokens = estimate_tokens(f"{header}\n{structure_clip}\n{body}")
+    return {
+        "mode": "analysis",
+        "kind": kind,
+        "prompt_tokens": tokens,
+        "estimated_cost_usd": _estimate_cost(tokens),
+    }
+
+
 def analyze_project(project, kind: str) -> dict:
     """Run a bounded analysis of ``project`` of the given kind."""
     _assert_accessible(project)
