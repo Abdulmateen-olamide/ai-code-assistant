@@ -2,6 +2,7 @@
 
 import base64
 import json
+from datetime import UTC, datetime, timedelta
 
 from flask import (
     Response,
@@ -29,7 +30,7 @@ from app.models import (
 )
 from app.models.message_attachment import ALLOWED_IMAGE_TYPES
 from app.models.project import STATUS_READY
-from app.services import audit
+from app.services import audit, token_usage
 from app.services.github import (
     GitHubError,
     GitHubNotConnectedError,
@@ -37,7 +38,7 @@ from app.services.github import (
     github_error_message,
 )
 from app.services.llm import LLMProviderError, provider_status
-from app.services.llm_cache import cached_complete
+from app.services.llm_cache import cached_chat
 from app.services.notifications import notify
 from app.services.provider_config import (
     DEFAULT_TEMPERATURE,
@@ -285,7 +286,49 @@ def get_conversation(conversation_id: int):
     payload = conversation.to_dict()
     payload["messages"] = [m.to_dict() for m in conversation.messages]
     payload["shared_user_ids"] = [s.user_id for s in conversation.shares]
+    # Cumulative token usage across the conversation (issue #13).
+    payload["usage"] = token_usage.sum_usage(conversation.messages)
     return jsonify(payload)
+
+
+@bp.route("/api/usage/daily")
+@login_required
+def api_usage_daily():
+    """Return the current user's daily token totals (issue #13).
+
+    Query param ``days`` (default 30, max 365) bounds the window. Days with no
+    usage are omitted. This backs the "daily per-user totals are queryable"
+    acceptance criterion and future quota/billing work.
+    """
+    days = request.args.get("days", 30, type=int) or 30
+    days = min(max(days, 1), 365)
+    since = datetime.now(UTC) - timedelta(days=days)
+
+    day = func.date(Message.created_at).label("day")
+    rows = (
+        db.session.query(
+            day,
+            func.coalesce(func.sum(Message.prompt_tokens), 0),
+            func.coalesce(func.sum(Message.completion_tokens), 0),
+            func.coalesce(func.sum(Message.total_tokens), 0),
+        )
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .filter(Conversation.user_id == current_user.id, Message.created_at >= since)
+        .group_by(day)
+        .order_by(day)
+        .all()
+    )
+    return jsonify(
+        [
+            {
+                "date": str(row[0]),
+                "prompt_tokens": int(row[1] or 0),
+                "completion_tokens": int(row[2] or 0),
+                "total_tokens": int(row[3] or 0),
+            }
+            for row in rows
+        ]
+    )
 
 
 @bp.route("/conversations/<int:conversation_id>", methods=["PATCH"])
@@ -533,7 +576,7 @@ def send_message(conversation_id: int):
     try:
         provider = RetryingProvider(build_provider(current_user, conversation.provider))
         generation = _generation_kwargs(conversation)
-        reply = cached_complete(
+        response = cached_chat(
             current_user,
             messages,
             provider=provider,
@@ -545,7 +588,8 @@ def send_message(conversation_id: int):
         db.session.rollback()
         return jsonify({"error": str(exc)}), 502
 
-    conversation.messages.append(Message(role="assistant", content=reply))
+    usage = token_usage.usage_from_response(response, messages)
+    conversation.messages.append(Message(role="assistant", content=response.content, **usage))
     if conversation.title == "New conversation":
         conversation.title = content.strip()[:60] or "New conversation"
     db.session.commit()
@@ -590,19 +634,24 @@ def stream_message(conversation_id: int):
     messages = _conversation_messages(conversation, context_messages)
     generation = _generation_kwargs(conversation)
 
-    def persist_assistant(reply: str):
+    def persist_assistant(reply: str, usage: dict | None = None):
         """Persist an assistant message, or return ``None`` when empty.
 
         Used both for the completed reply and for the partial text kept when
-        the client cancels mid-stream (issue #11).
+        the client cancels mid-stream (issue #11). ``usage`` records the token
+        counts for the message (issue #13).
         """
         reply = reply or ""
         if not reply.strip():
             return None
-        message = Message(role="assistant", content=reply)
+        message = Message(role="assistant", content=reply, **(usage or {}))
         conversation.messages.append(message)
         db.session.commit()
         return message
+
+    def stream_usage(reply: str) -> dict:
+        """Estimated usage for a streamed reply (streams report no token counts)."""
+        return token_usage.usage_from_text(token_usage.messages_text(messages), reply)
 
     def generate():
         # Accumulate chunks so a cancelled stream can still keep what it got.
@@ -615,20 +664,26 @@ def stream_message(conversation_id: int):
         except GeneratorExit:
             # The client disconnected (Stop button or closed tab). Persist the
             # partial reply so the user keeps what was generated, then stop.
-            persist_assistant("".join(chunks))
+            partial = "".join(chunks)
+            persist_assistant(partial, stream_usage(partial))
             raise
         except LLMProviderError as exc:
             # A provider failure mid-stream: keep the partial text too.
-            persist_assistant("".join(chunks))
+            partial = "".join(chunks)
+            persist_assistant(partial, stream_usage(partial))
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             return
 
-        message = persist_assistant("".join(chunks))
+        reply = "".join(chunks)
+        message = persist_assistant(reply, stream_usage(reply))
         if message is None:
             # The provider streamed no text; fall back to a single completion.
             try:
                 provider = RetryingProvider(build_provider(current_user, conversation.provider))
-                message = persist_assistant(provider.chat(messages, **generation).content)
+                response = provider.chat(messages, **generation)
+                message = persist_assistant(
+                    response.content, token_usage.usage_from_response(response, messages)
+                )
             except LLMProviderError as exc:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
                 return
