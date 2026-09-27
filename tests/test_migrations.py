@@ -453,3 +453,31 @@ class TestMigrationHead:
             with _inspect(db_url) as insp:
                 columns = {col["name"] for col in insp.get_columns("projects")}
                 assert "progress" not in columns
+
+    def test_chat_tables_upgraded(self):
+        # The chat schema (Phase 2/3) lands on top of the Phase 1 users table.
+        with _migration_db() as db_url, _inspect(db_url) as insp:
+            tables = set(insp.get_table_names())
+            assert {"conversations", "messages", "api_keys", "audit_logs"} <= tables
+            conversation_columns = {col["name"] for col in insp.get_columns("conversations")}
+            assert {
+                "id",
+                "user_id",
+                "title",
+                "is_pinned",
+                "created_at",
+                "updated_at",
+            } <= conversation_columns
+
+    def test_chat_tables_downgrade_to_phase_1_head_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_url = f"sqlite:///{os.path.join(tmp, 'mig_chat.db')}"
+            up = _run_flask(["db", "upgrade"], {"DATABASE_URL": db_url})
+            assert up.returncode == 0, up.stderr
+            down = _run_flask(["db", "downgrade", "5f57a9ef1df8"], {"DATABASE_URL": db_url})
+            assert down.returncode == 0, down.stderr
+            with _inspect(db_url) as insp:
+                tables = set(insp.get_table_names())
+                assert "conversations" not in tables
+                assert "messages" not in tables
+                assert "api_keys" not in tables
