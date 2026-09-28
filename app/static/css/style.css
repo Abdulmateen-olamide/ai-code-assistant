@@ -590,6 +590,54 @@ a:hover {
   font-family: var(--font-mono);
   font-size: 0.82rem;
   line-height: 1.5;
+  position: relative;
+}
+
+.message-body ol {
+  padding-left: 20px;
+  margin-bottom: 8px;
+}
+
+.message-body table {
+  border-collapse: collapse;
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  margin: 8px 0;
+  font-size: 0.85rem;
+}
+
+.message-body th,
+.message-body td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.message-body th {
+  background: var(--bg);
+  font-weight: 600;
+}
+
+/* Copy button injected into every rendered code block (issue #9). */
+.code-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 8px;
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  color: inherit;
+  background: var(--surface, rgba(0, 0, 0, 0.3));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.code-copy-btn:hover,
+.code-copy-btn:focus {
+  opacity: 1;
 }
 
 .inline-code {
