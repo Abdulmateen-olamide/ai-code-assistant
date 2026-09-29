@@ -105,7 +105,7 @@ from app.services.importing import (
 from app.services.invitations import cancel_pending_for_user
 from app.services.llm import LLMProviderError, get_provider
 from app.services.notifications import notify
-from app.services.permissions import resolve_workspace
+from app.services.permissions import require_workspace_capability
 from app.services.ratelimit import per_user_limit
 from app.services.search import SearchQueryError, search_project
 from app.services.stellar_detection import project_stellar_metadata
@@ -322,18 +322,28 @@ def api_delete_workspace(workspace_id: int):
 
 
 # --------------------------------------------------------------------------
-# API: workspace members
-# Listing is member-scoped (any member can see the team); add/update/remove
-# remain owner-only. Removal is a soft-delete that preserves history (135).
+# API: workspace members (#126)
+#
+# Every route delegates authorization to the shared capability matrix in
+# ``app/services/permissions.py`` so member management stays strictly
+# owner-only and membership is never leaked to non-owners:
+#
+#   * list                 -> ``view_members``    (owner + active members)
+#   * add / update / remove -> ``manage_members`` (owner only)
+#
+# ``require_workspace_capability`` resolves the workspace first, so a
+# non-member gets a uniform 404 (no existence oracle) while a *known* member
+# without the capability gets 403 - matching the documented contract.
+# Removal is a soft-delete that preserves history (#135).
 # --------------------------------------------------------------------------
 
 
 @bp.route("/api/workspaces/<int:workspace_id>/members", methods=["GET"])
 @login_required
+@require_workspace_capability("view_members")
 def api_list_members(workspace_id: int):
-    workspace = resolve_workspace(workspace_id)
     members = (
-        WorkspaceMember.query.filter_by(workspace_id=workspace.id, status=STATUS_ACTIVE)
+        WorkspaceMember.query.filter_by(workspace_id=workspace_id, status=STATUS_ACTIVE)
         .order_by(WorkspaceMember.joined_at)
         .all()
     )
@@ -342,8 +352,8 @@ def api_list_members(workspace_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/members", methods=["POST"])
 @login_required
+@require_workspace_capability("manage_members")
 def api_add_member(workspace_id: int):
-    _get_workspace(workspace_id)
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     role = (data.get("role") or ROLE_VIEWER).strip().lower()
@@ -400,9 +410,14 @@ def api_add_member(workspace_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/members/<int:user_id>", methods=["PATCH"])
 @login_required
+@require_workspace_capability("manage_members")
 def api_update_member(workspace_id: int, user_id: int):
-    _get_workspace(workspace_id)
+    workspace = db.session.get(Workspace, workspace_id)
     membership = _get_membership(workspace_id, user_id)
+    if user_id == workspace.user_id or membership.role == ROLE_OWNER:
+        return jsonify({"error": "The workspace owner's role cannot be changed."}), 400
+    if membership.status != STATUS_ACTIVE:
+        return jsonify({"error": "That member is not active."}), 409
     data = request.get_json(silent=True) or {}
     role = (data.get("role") or "").strip().lower()
     if role not in MEMBER_ROLES:
@@ -434,9 +449,12 @@ def api_update_member(workspace_id: int, user_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/members/<int:user_id>", methods=["DELETE"])
 @login_required
+@require_workspace_capability("manage_members")
 def api_remove_member(workspace_id: int, user_id: int):
-    _get_workspace(workspace_id)
+    workspace = db.session.get(Workspace, workspace_id)
     membership = _get_membership(workspace_id, user_id)
+    if user_id == workspace.user_id or membership.role == ROLE_OWNER:
+        return jsonify({"error": "The workspace owner cannot be removed."}), 400
     if membership.status != STATUS_ACTIVE:
         return jsonify({"error": "That member is already removed."}), 409
     membership.mark_removed()
