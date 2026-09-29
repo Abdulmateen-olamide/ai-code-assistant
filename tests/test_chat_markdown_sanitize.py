@@ -102,6 +102,27 @@ class TestRenderMarkdown:
         assert "<strong>bold</strong>" in result["rendered"]
         assert "<em>italic</em>" in result["rendered"]
 
+    def test_table_renders(self):
+        (result,) = _evaluate(["| a | b |\n| --- | --- |\n| 1 | 2 |"])
+        assert "<table>" in result["rendered"]
+        assert "<th>a</th>" in result["rendered"]
+        assert "<td>1</td>" in result["rendered"]
+
+    def test_table_cell_script_is_escaped(self):
+        (result,) = _evaluate(["| h |\n| --- |\n| <script>alert(1)</script> |"])
+        assert "<script" not in result["rendered"]
+        assert "&lt;script&gt;" in result["rendered"]
+
+    def test_ordered_list_renders(self):
+        (result,) = _evaluate(["1. one\n2. two"])
+        assert "<ol>" in result["rendered"]
+        assert result["rendered"].count("<li>") == 2
+
+    def test_unordered_list_still_renders(self):
+        (result,) = _evaluate(["- a\n- b"])
+        assert "<ul>" in result["rendered"]
+        assert result["rendered"].count("<li>") == 2
+
 
 class TestSanitizeHtml:
     def test_removes_script_with_contents(self):
@@ -148,3 +169,13 @@ class TestWiring:
         source = CHAT_JS_PATH.read_text(encoding="utf-8")
         assert "AICAMarkdown" in source
         assert "renderMarkdown" in source
+
+    def test_chat_js_adds_code_copy_buttons(self):
+        source = CHAT_JS_PATH.read_text(encoding="utf-8")
+        assert "code-copy-btn" in source
+        assert "clipboard" in source
+
+    def test_chat_js_does_not_hijack_scroll_while_streaming(self):
+        source = CHAT_JS_PATH.read_text(encoding="utf-8")
+        assert "maybeScrollToBottom" in source
+        assert "isNearBottom" in source

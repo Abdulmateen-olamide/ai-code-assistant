@@ -40,6 +40,12 @@
     h4: {},
     h5: {},
     h6: {},
+    table: {},
+    thead: {},
+    tbody: {},
+    tr: {},
+    th: {},
+    td: {},
   };
 
   // Elements removed together with their contents. Their payload must never be
@@ -169,53 +175,114 @@
   }
 
   // Minimal markdown renderer: code blocks, inline code, headings, bold,
-  // italics, links, and unordered lists. Output is always sanitized.
+  // italics, links, ordered/unordered lists, and GFM pipe tables. Output is
+  // always sanitized.
   function renderMarkdown(text) {
     var lines = String(text).split("\n");
     var html = "";
     var inCode = false;
     var codeLang = "";
     var codeLines = [];
-    var listOpen = false;
+    var listOpen = null; // "ul" | "ol" | null
 
     function flushList() {
       if (listOpen) {
-        html += "</ul>\n";
-        listOpen = false;
+        html += "</" + listOpen + ">\n";
+        listOpen = null;
       }
     }
 
-    lines.forEach(function (line) {
+    function flushCode() {
+      html +=
+        '<pre class="code-block"><code class="language-' +
+        escapeHtml(codeLang) +
+        '">' +
+        escapeHtml(codeLines.join("\n")) +
+        "</code></pre>\n";
+      inCode = false;
+      codeLines = [];
+      codeLang = "";
+    }
+
+    function splitRow(row) {
+      return row
+        .trim()
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map(function (cell) {
+          return cell.trim();
+        });
+    }
+
+    // A GFM alignment row: only pipes, colons, dashes and spaces, with at least
+    // one dash.
+    function isSeparatorRow(row) {
+      return /^[\s|:\-]+$/.test(row) && row.indexOf("-") !== -1;
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
       var codeMatch = line.match(/^```(\w*)/);
       if (codeMatch) {
         flushList();
-        if (inCode) {
-          html +=
-            '<pre class="code-block"><code class="language-' +
-            escapeHtml(codeLang) +
-            '">' +
-            escapeHtml(codeLines.join("\n")) +
-            "</code></pre>\n";
-          inCode = false;
-          codeLines = [];
-        } else {
+        if (inCode) flushCode();
+        else {
           inCode = true;
           codeLang = codeMatch[1] || "";
         }
-        return;
+        continue;
       }
       if (inCode) {
         codeLines.push(line);
-        return;
+        continue;
+      }
+
+      // GFM pipe table: a header row whose following line is a separator row.
+      if (
+        line.indexOf("|") !== -1 &&
+        i + 1 < lines.length &&
+        isSeparatorRow(lines[i + 1])
+      ) {
+        flushList();
+        var header = splitRow(line);
+        html += "<table><thead><tr>";
+        header.forEach(function (cell) {
+          html += "<th>" + renderInline(cell) + "</th>";
+        });
+        html += "</tr></thead><tbody>";
+        i += 2;
+        while (i < lines.length && lines[i].indexOf("|") !== -1 && !/^\s*$/.test(lines[i])) {
+          var cells = splitRow(lines[i]);
+          html += "<tr>";
+          cells.forEach(function (cell) {
+            html += "<td>" + renderInline(cell) + "</td>";
+          });
+          html += "</tr>";
+          i++;
+        }
+        i -= 1; // outer loop re-increments
+        html += "</tbody></table>\n";
+        continue;
       }
 
       if (/^\s*-\s+/.test(line) || /^\s*\*\s+/.test(line)) {
-        if (!listOpen) {
+        if (listOpen !== "ul") {
+          flushList();
           html += "<ul>\n";
-          listOpen = true;
+          listOpen = "ul";
         }
         html += "<li>" + renderInline(line.replace(/^\s*[-*]\s+/, "")) + "</li>\n";
-        return;
+        continue;
+      }
+      if (/^\s*\d+\.\s+/.test(line)) {
+        if (listOpen !== "ol") {
+          flushList();
+          html += "<ol>\n";
+          listOpen = "ol";
+        }
+        html += "<li>" + renderInline(line.replace(/^\s*\d+\.\s+/, "")) + "</li>\n";
+        continue;
       }
       flushList();
 
@@ -228,17 +295,10 @@
       } else {
         html += "<p>" + renderInline(line) + "</p>\n";
       }
-    });
+    }
 
     flushList();
-    if (inCode) {
-      html +=
-        '<pre class="code-block"><code class="language-' +
-        escapeHtml(codeLang) +
-        '">' +
-        escapeHtml(codeLines.join("\n")) +
-        "</code></pre>\n";
-    }
+    if (inCode) flushCode();
     return sanitizeHtml(html);
   }
 

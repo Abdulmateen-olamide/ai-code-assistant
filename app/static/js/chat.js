@@ -32,6 +32,12 @@
   var providerOptions = [];
   var defaults = { provider: "", model: "", temperature: 0.7, system_prompt: "" };
 
+  // Streaming scroll safety (issue #9): auto-follow new tokens only while the
+  // user is already pinned to the bottom, so scrolling up mid-stream is never
+  // yanked back down.
+  var stickToBottom = true;
+  var SCROLL_STICK_THRESHOLD_PX = 40;
+
   var CSRF_TOKEN = null;
 
   function getCsrf() {
@@ -150,6 +156,7 @@
       (role === "user" ? "" : usageLine(usage));
     el.innerHTML = body;
     messagesEl.appendChild(el);
+    if (role !== "user") enhanceCode(el);
     scrollToBottom();
     return el;
   }
@@ -163,8 +170,97 @@
     return el;
   }
 
+  function isNearBottom() {
+    if (!messagesEl) return true;
+    return (
+      messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <
+      SCROLL_STICK_THRESHOLD_PX
+    );
+  }
+
+  // Force-follow to the newest content. Used when the user sends a message or
+  // opens a conversation, where jumping to the bottom is the expected behavior.
   function scrollToBottom() {
+    stickToBottom = true;
     messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  // Follow new content only while the user is already pinned to the bottom, so
+  // a streaming token update never resets their scroll position (issue #9).
+  function maybeScrollToBottom() {
+    if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  if (messagesEl) {
+    messagesEl.addEventListener("scroll", function () {
+      stickToBottom = isNearBottom();
+    });
+  }
+
+  // Copy-to-clipboard helpers for code blocks (issue #9).
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () {
+          flashInfo("Copied to clipboard.");
+        },
+        function () {
+          fallbackCopyText(text);
+        }
+      );
+      return;
+    }
+    fallbackCopyText(text);
+  }
+
+  function fallbackCopyText(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "absolute";
+    area.style.left = "-9999px";
+    document.body.appendChild(area);
+    area.select();
+    try {
+      document.execCommand("copy");
+      flashInfo("Copied to clipboard.");
+    } catch (error) {
+      flashError("Copy failed.");
+    }
+    document.body.removeChild(area);
+  }
+
+  // Add a copy button to every rendered code block, skipping ones that already
+  // have one so repeated calls during streaming stay cheap.
+  function addCodeCopyButtons(container) {
+    if (!container || !container.querySelectorAll) return;
+    var blocks = container.querySelectorAll("pre.code-block");
+    Array.prototype.forEach.call(blocks, function (pre) {
+      if (pre.getElementsByClassName("code-copy-btn").length) return;
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "code-copy-btn";
+      button.textContent = "Copy";
+      button.setAttribute("aria-label", "Copy code to clipboard");
+      pre.appendChild(button);
+    });
+  }
+
+  function enhanceCode(container) {
+    highlightCode(container);
+    addCodeCopyButtons(container);
+  }
+
+  if (messagesEl) {
+    messagesEl.addEventListener("click", function (event) {
+      var target = event.target;
+      var button = target && target.closest ? target.closest(".code-copy-btn") : null;
+      if (!button) return;
+      var pre = button.closest("pre");
+      var code = pre ? pre.querySelector("code") : null;
+      if (!code) return;
+      copyTextToClipboard(code.innerText || code.textContent || "");
+    });
   }
 
   function setActiveItem(id) {
@@ -457,7 +553,7 @@
           if (payload.type === "token") {
             fullText += payload.content;
             streamBody.innerHTML = renderMarkdown(fullText);
-            scrollToBottom();
+            maybeScrollToBottom();
           } else if (payload.type === "error") {
             flashError(payload.error);
           } else if (payload.type === "done") {
@@ -465,7 +561,7 @@
               streamBody.innerHTML =
                 renderMarkdown(payload.message.content) +
                 renderAttachments(payload.message.attachments);
-              highlightCode(streamBody);
+              enhanceCode(streamBody);
               var usage = payload.message.token_usage;
               if (usage) {
                 var usageRow = document.createElement("div");
@@ -484,7 +580,7 @@
                 renderUsage();
               }
             }
-            scrollToBottom();
+            maybeScrollToBottom();
           }
         });
       }
@@ -500,7 +596,7 @@
       var finalBody = typing.querySelector(".message-body");
       if (finalBody && finalBody.textContent) {
         // Covers partial output too (e.g. stream cancelled before "done").
-        highlightCode(finalBody);
+        enhanceCode(finalBody);
       }
       if (!finalBody || !finalBody.textContent) {
         typing.remove();
