@@ -173,3 +173,108 @@ class TestOwnerOnlyIsolation:
 
         assert client.get(f"/workspaces/{first_workspace.id}").status_code == 200
         assert client.get(f"/workspaces/{second_workspace.id}").status_code == 404
+
+
+class TestMemberManagementAuthorization:
+    """#126: management is owner-only with correct 403/404 semantics."""
+
+    def _workspace_with_viewer_and_target(self):
+        owner = _create_user("owner", "owner@example.com")
+        viewer = _create_user("viewer", "viewer@example.com")
+        target = _create_user("target", "target@example.com")
+        workspace = _workspace_for(owner)
+        db.session.add_all(
+            [
+                WorkspaceMember(workspace_id=workspace.id, user_id=viewer.id, role=ROLE_VIEWER),
+                WorkspaceMember(workspace_id=workspace.id, user_id=target.id, role=ROLE_VIEWER),
+            ]
+        )
+        db.session.commit()
+        return workspace, viewer, target
+
+    def test_known_member_gets_403_on_management(self, client, make_user, login):
+        # A logged-in *member* without ``manage_members`` gets 403 (not the
+        # uniform 404 reserved for non-members, which would be misleading).
+        workspace, _viewer, target = self._workspace_with_viewer_and_target()
+        login(email="viewer@example.com")
+        assert (
+            client.post(
+                f"/workspaces/api/workspaces/{workspace.id}/members",
+                json={"username": "target", "role": "viewer"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.patch(
+                f"/workspaces/api/workspaces/{workspace.id}/members/{target.id}",
+                json={"role": "contributor"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.delete(
+                f"/workspaces/api/workspaces/{workspace.id}/members/{target.id}"
+            ).status_code
+            == 403
+        )
+        # ...but the read capability still works for the member.
+        assert client.get(f"/workspaces/api/workspaces/{workspace.id}/members").status_code == 200
+
+    def test_non_member_gets_404_and_no_leak(self, client, make_user, login):
+        # A user who is not in the workspace must not learn whether it exists.
+        workspace, _viewer, target = self._workspace_with_viewer_and_target()
+        make_user(username="outsider", email="outsider@example.com")
+        login(email="outsider@example.com")
+        assert client.get(f"/workspaces/api/workspaces/{workspace.id}/members").status_code == 404
+        assert (
+            client.delete(
+                f"/workspaces/api/workspaces/{workspace.id}/members/{target.id}"
+            ).status_code
+            == 404
+        )
+
+    def test_owner_row_cannot_be_changed_or_removed(self, client, make_user, login):
+        # After an ownership transfer the new owner owns a membership row whose
+        # role is ``owner``; it must never be demoted or removed via the API.
+        owner = _create_user("owner", "owner@example.com")
+        workspace = _workspace_for(owner)
+        db.session.add(
+            WorkspaceMember(workspace_id=workspace.id, user_id=owner.id, role=ROLE_OWNER)
+        )
+        db.session.commit()
+        login(email="owner@example.com")
+        assert (
+            client.patch(
+                f"/workspaces/api/workspaces/{workspace.id}/members/{owner.id}",
+                json={"role": "viewer"},
+            ).status_code
+            == 400
+        )
+        assert (
+            client.delete(
+                f"/workspaces/api/workspaces/{workspace.id}/members/{owner.id}"
+            ).status_code
+            == 400
+        )
+
+    def test_cannot_update_removed_member(self, client, make_user, login):
+        owner = _create_user("owner", "owner@example.com")
+        member = _create_user("member", "member@example.com")
+        workspace = _workspace_for(owner)
+        membership = WorkspaceMember(
+            workspace_id=workspace.id,
+            user_id=member.id,
+            role=ROLE_VIEWER,
+        )
+        db.session.add(membership)
+        db.session.commit()
+        membership.mark_removed()
+        db.session.commit()
+        login(email="owner@example.com")
+        assert (
+            client.patch(
+                f"/workspaces/api/workspaces/{workspace.id}/members/{member.id}",
+                json={"role": "contributor"},
+            ).status_code
+            == 409
+        )

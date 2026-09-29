@@ -183,32 +183,43 @@ Response `200`: `{"ok": true}`.
 Response `200` — array of memberships (see Accept response shape). Only
 `status: "active"` members are returned, ordered by join time.
 
-### Add member — #126, Phase 7 rewrite (notifications + activity)
+### Add member — #126 (owner-only)
 
 `POST /workspaces/api/workspaces/<workspace_id>/members` — **owner**
+(`manage_members`)
 
 Request: `{"username": "bob", "role": "viewer"}`.
 
 - `400` missing username / invalid role / owner already a member.
 - `404` no such username; `409` already an active member.
 - Reactivating a previously-removed member preserves the row.
+- `403` when the caller is a known member without `manage_members`; `404`
+  when the caller is not part of the workspace (no existence oracle).
 
 Response `201` with the membership.
 
-### Update member role — #126, Phase 7 rewrite (notifications + activity)
+### Update member role — #126 (owner-only)
 
 `PATCH /workspaces/api/workspaces/<workspace_id>/members/<user_id>` — **owner**
+(`manage_members`)
 
 Request: `{"role": "contributor"}`. Response `200` with the membership. A
 role change records an activity event and notifies the member.
 
-### Remove member — #126, Phase 7 rewrite (notifications + activity)
+- `400` when targeting the workspace owner's own membership row.
+- `403` for a known member without the capability; `404` for non-members.
+- `409` when the target membership is not active (already removed).
+
+### Remove member — #126 (owner-only)
 
 `DELETE /workspaces/api/workspaces/<workspace_id>/members/<user_id>` — **owner**
+(`manage_members`)
 
 Soft-delete: `status` → `removed`, pending invitations for that user are
 cancelled, the member is notified, and history is preserved.
-`409` if already removed. Response `200`: `{"ok": true}`.
+`409` if already removed. `400` when targeting the owner; `403` for a known
+member without the capability; `404` for non-members. Response `200`:
+`{"ok": true}`.
 
 ### Leave workspace — Phase 7
 
