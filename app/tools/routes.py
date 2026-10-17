@@ -15,7 +15,7 @@ from werkzeug.utils import secure_filename
 
 from app.extensions import db
 from app.models import AnalyzedFile, Conversation, FileAnalysis, Message
-from app.services import analysis, ratelimit
+from app.services import analysis, ratelimit, token_usage, usage_ledger
 from app.services.github import (
     GitHubError,
     get_github_client,
@@ -118,18 +118,97 @@ def _read_upload(field: str = "file") -> tuple[str, str] | tuple[None, str]:
     return secure_filename(file.filename), text
 
 
-def _run_action(action: str, prompt: str) -> str:
-    """Run a single AI action and return the model output."""
+def _conversation_from_payload(data: dict) -> Conversation | None:
+    """Resolve an optional ``conversation_id`` owned by the current user.
+
+    Tools can be launched from a chat conversation. The scope is attached to
+    the ledger row when it is valid; an unknown or foreign id is ignored so the
+    tool request still succeeds without leaking another user's conversation.
+    """
+    raw = data.get("conversation_id")
+    if raw in (None, ""):
+        return None
+    try:
+        conversation_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return Conversation.query.filter_by(id=conversation_id, user_id=current_user.id).first()
+
+
+def _complete_with_usage(provider, messages):
+    """Run a completion and return ``(content, provider_response_or_none)``.
+
+    ``chat`` is preferred because it carries vendor-reported token usage;
+    providers (or test doubles) that only implement ``complete`` stay supported.
+    """
+    if callable(getattr(provider, "chat", None)):
+        response = provider.chat(messages)
+        return response.content, response
+    return provider.complete(messages), None
+
+
+def _record_tool_usage(
+    provider,
+    response,
+    content: str,
+    messages,
+    *,
+    conversation: Conversation | None = None,
+) -> None:
+    """Append a ``tools`` ledger row without ever failing the tool request."""
+    if response is not None:
+        usage = token_usage.usage_from_response(response, messages)
+        model = getattr(response, "model", None)
+        estimated = getattr(provider, "name", None) == "mock" or any(
+            getattr(response, attribute, None) is None
+            for attribute in ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
+    else:
+        usage = token_usage.usage_from_text(token_usage.messages_text(messages), content)
+        model = None
+        estimated = True
+
+    if not model:
+        models = getattr(provider, "models", ()) or ()
+        model = models[0] if models else None
+
+    try:
+        usage_ledger.record_usage(
+            source=usage_ledger.SOURCE_TOOLS,
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            tokens_estimated=estimated,
+            provider=getattr(provider, "name", None),
+            model=model,
+            user=current_user,
+            workspace_id=conversation.workspace_id if conversation is not None else None,
+            conversation=conversation,
+        )
+    except Exception:  # instrumentation must never break the operation
+        db.session.rollback()
+        current_app.logger.exception("Could not record AI tool usage")
+
+
+def _run_action(
+    action: str,
+    prompt: str,
+    *,
+    conversation: Conversation | None = None,
+) -> str:
+    """Run a single AI action, record its usage, and return the model output."""
+    messages = [
+        {"role": "system", "content": "You are a helpful AI coding assistant."},
+        {"role": "user", "content": prompt},
+    ]
     try:
         provider = get_provider()
-        return provider.complete(
-            [
-                {"role": "system", "content": "You are a helpful AI coding assistant."},
-                {"role": "user", "content": prompt},
-            ]
-        )
+        content, response = _complete_with_usage(provider, messages)
     except LLMProviderError as exc:
         return f"[provider error] {exc}"
+
+    _record_tool_usage(provider, response, content, messages, conversation=conversation)
+    return content
 
 
 @bp.route("/generate", methods=["POST"])
@@ -144,7 +223,12 @@ def generate():
         return jsonify({"error": "A description is required."}), 400
 
     system = ACTION_PROMPTS["generate"].format(language=language)
-    result = _run_action("generate", f"{system}\n\nRequest: {description}")
+    conversation = _conversation_from_payload(data)
+    result = _run_action(
+        "generate",
+        f"{system}\n\nRequest: {description}",
+        conversation=conversation,
+    )
     return jsonify({"result": result, "language": language})
 
 
@@ -162,7 +246,12 @@ def code_action():
         return jsonify({"error": "Code or diff content is required."}), 400
 
     system = ACTION_PROMPTS[action]
-    result = _run_action(action, f"{system}\n\nCode:\n{code}")
+    conversation = _conversation_from_payload(data)
+    result = _run_action(
+        action,
+        f"{system}\n\nCode:\n{code}",
+        conversation=conversation,
+    )
     return jsonify({"action": action, "result": result})
 
 
@@ -214,14 +303,13 @@ def analyze_file():
                 }
             )
 
+    messages = [
+        {"role": "system", "content": "You are a helpful AI coding assistant."},
+        {"role": "user", "content": f"{system}\n\nFile: {filename}\n\nCode:\n{text}"},
+    ]
     try:
         provider = get_provider()
-        result = provider.complete(
-            [
-                {"role": "system", "content": "You are a helpful AI coding assistant."},
-                {"role": "user", "content": f"{system}\n\nFile: {filename}\n\nCode:\n{text}"},
-            ]
-        )
+        result, response = _complete_with_usage(provider, messages)
     except LLMProviderError as exc:
         return jsonify(
             {"filename": filename, "action": action, "result": f"[provider error] {exc}"}
@@ -242,6 +330,7 @@ def analyze_file():
     )
     db.session.add(record)
     db.session.commit()
+    _record_tool_usage(provider, response, result, messages)
     return jsonify(
         {
             "filename": filename,

@@ -133,4 +133,10 @@ def create_app(config_name: str | None = None) -> Flask:
 
     register_plugins_cli(app)
 
+    # Usage-ledger maintenance (historical chat backfill and future retention
+    # commands). The backfill is bounded and idempotent.
+    from app.services.usage_cli import register_usage_cli
+
+    register_usage_cli(app)
+
     return app

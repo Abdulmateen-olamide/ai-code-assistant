@@ -12,8 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import or_
+
 from app.extensions import db
-from app.models import UsageRecord
+from app.models import Message, UsageRecord
 from app.services import pricing
 
 #: Operation families understood by the ledger. Unknown values are grouped
@@ -31,6 +33,12 @@ SOURCES = (
     SOURCE_PROJECT_CHAT,
 )
 UNKNOWN_SOURCE = "unknown"
+
+#: Default/upper bounds for the historical chat-message backfill. The work is
+#: paginated by message id so a large conversation history is never loaded at
+#: once.
+BACKFILL_DEFAULT_BATCH_SIZE = 500
+BACKFILL_MAX_BATCH_SIZE = 5000
 
 #: Operation outcomes understood by the ledger (see docs/observability.md).
 STATUS_SUCCESS = "success"
@@ -321,7 +329,166 @@ def breakdown_payload(
     }
 
 
+def _message_usage(message: Message) -> dict[str, int] | None:
+    """Return validated token counts for a message, or ``None`` when absent."""
+    values = (
+        getattr(message, "prompt_tokens", None),
+        getattr(message, "completion_tokens", None),
+        getattr(message, "total_tokens", None),
+    )
+    if all(value is None for value in values):
+        return None
+    try:
+        return normalize_usage(*values)
+    except ValueError:
+        return None
+
+
+def _backfill_record_exists(
+    message: Message,
+    conversation_id: int,
+    user_id: int | None,
+    counts: dict[str, int],
+) -> bool:
+    """Return ``True`` when this message was already copied into the ledger.
+
+    The ledger predates a durable ``message_id`` column, so a backfilled row is
+    identified by its source, conversation, token counts, and the original
+    message timestamp. That tuple is stable across runs, which makes the
+    command idempotent without changing or annotating historical message rows.
+    """
+    if message.created_at is None:
+        return False
+    return (
+        UsageRecord.query.filter_by(
+            source=SOURCE_CHAT,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            prompt_tokens=counts["prompt_tokens"],
+            completion_tokens=counts["completion_tokens"],
+            total_tokens=counts["total_tokens"],
+        )
+        .filter(UsageRecord.created_at == message.created_at)
+        .first()
+        is not None
+    )
+
+
+def backfill_from_messages(
+    *,
+    batch_size: int = BACKFILL_DEFAULT_BATCH_SIZE,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Copy historical chat-message token counts into the usage ledger.
+
+    The operation is keyset-paginated and idempotent: existing message rows
+    are never modified, and re-running the command only skips rows that were
+    already backfilled. ``limit`` bounds the number of messages considered in a
+    single invocation, which is useful for a staged rollout. ``dry_run`` reports
+    what would be written without committing anything.
+
+    Raises:
+        ValueError: If ``batch_size``/``limit`` is outside the supported range.
+    """
+    if not isinstance(batch_size, int) or not 1 <= batch_size <= BACKFILL_MAX_BATCH_SIZE:
+        raise ValueError(f"batch_size must be an integer between 1 and {BACKFILL_MAX_BATCH_SIZE}.")
+    if limit is not None and (not isinstance(limit, int) or limit < 0):
+        raise ValueError("limit must be a non-negative integer.")
+
+    stats = {
+        "source": SOURCE_CHAT,
+        "scanned": 0,
+        "created": 0,
+        "skipped_existing": 0,
+        "skipped_incomplete": 0,
+        "skipped_orphan": 0,
+        "batches": 0,
+        "batch_size": batch_size,
+        "limit": limit,
+        "dry_run": bool(dry_run),
+    }
+    last_id = 0
+    processed = 0
+
+    try:
+        while limit is None or processed < limit:
+            size = batch_size if limit is None else min(batch_size, limit - processed)
+            if size <= 0:
+                break
+            messages = (
+                Message.query.filter(Message.id > last_id)
+                .filter(
+                    or_(
+                        Message.prompt_tokens.isnot(None),
+                        Message.completion_tokens.isnot(None),
+                        Message.total_tokens.isnot(None),
+                    )
+                )
+                .order_by(Message.id)
+                .limit(size)
+                .all()
+            )
+            if not messages:
+                break
+
+            stats["batches"] += 1
+            for message in messages:
+                if limit is not None and processed >= limit:
+                    break
+                last_id = message.id
+                processed += 1
+                stats["scanned"] += 1
+
+                counts = _message_usage(message)
+                if counts is None:
+                    stats["skipped_incomplete"] += 1
+                    continue
+                conversation = message.conversation
+                if conversation is None:
+                    stats["skipped_orphan"] += 1
+                    continue
+                if _backfill_record_exists(
+                    message,
+                    message.conversation_id,
+                    conversation.user_id,
+                    counts,
+                ):
+                    stats["skipped_existing"] += 1
+                    continue
+                if dry_run:
+                    stats["created"] += 1
+                    continue
+
+                record = record_usage(
+                    source=SOURCE_CHAT,
+                    prompt_tokens=counts["prompt_tokens"],
+                    completion_tokens=counts["completion_tokens"],
+                    total_tokens=counts["total_tokens"],
+                    # Historical columns do not record whether the provider
+                    # reported the counts or they were estimated.
+                    tokens_estimated=True,
+                    user_id=conversation.user_id,
+                    conversation_id=message.conversation_id,
+                    commit=False,
+                )
+                record.created_at = message.created_at
+                stats["created"] += 1
+
+            if not dry_run:
+                db.session.commit()
+            if len(messages) < size:
+                break
+    except Exception:
+        db.session.rollback()
+        raise
+
+    return stats
+
+
 __all__ = [
+    "BACKFILL_DEFAULT_BATCH_SIZE",
+    "BACKFILL_MAX_BATCH_SIZE",
     "SOURCES",
     "SOURCE_ANALYSIS",
     "SOURCE_CHAT",
@@ -332,6 +499,7 @@ __all__ = [
     "STATUS_ERROR",
     "STATUS_SUCCESS",
     "UNKNOWN_SOURCE",
+    "backfill_from_messages",
     "breakdown_by_source",
     "breakdown_payload",
     "current_provider_metadata",

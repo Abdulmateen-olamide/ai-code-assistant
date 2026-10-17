@@ -56,6 +56,26 @@ Open http://localhost:5000 in your browser.
 - Team collaboration and workspace-level permissions
 - Extensible plugin architecture for future integrations
 
+## Marketplace and plugin configuration
+
+Plugin installation and outbound requests are opt-in. The defaults are
+fail-closed, so a fresh install cannot reach a marketplace or the network:
+
+| Setting | Default | Why it is safe |
+| ------- | ------- | -------------- |
+| `PLUGIN_CATALOG_FILE` | empty | Remote/catalog installation is disabled until an operator points at a vetted catalog. |
+| `PLUGIN_TRUST_POLICY` | `if-present` | Accepts unsigned local plugins, but always refuses forged or untrusted signatures. Use `required` in production. |
+| `PLUGIN_TRUSTED_KEYS` | `{}` | No publisher is trusted by default; keys are validated at startup. |
+| `PLUGIN_NETWORK_ALLOWLIST` | empty | Every plugin outbound request is denied. Add only the hosts a plugin needs. |
+| `PLUGIN_NETWORK_HTTPS_ONLY` | `1` | Plugin traffic must use HTTPS. |
+| `PLUGIN_NETWORK_ALLOW_PRIVATE` | `0` | Blocks private, loopback, and link-local targets. |
+| `PLUGIN_EXECUTION_TIMEOUT` | `5` | Abandons a plugin callback after five seconds so it cannot stall a request. |
+
+The catalog is read from disk for each install request; there is no active
+cache TTL setting yet (caching is tracked in #377). See
+[the plugin guide](docs/plugins.md#configuration-reference) for the full
+reference, including signature and catalog formats.
+
 ## Documentation
 
 - [Chat feature guide](CONTRIBUTING.md#chat-feature-developer-guide)

@@ -5,10 +5,12 @@ source including unknown historical values (#451), and the instrumentation of
 project chat and project analysis.
 """
 
+import json
+
 import pytest
 
 from app.extensions import db
-from app.models import Project, ProjectFile, UsageRecord, Workspace
+from app.models import Conversation, Message, Project, ProjectFile, UsageRecord, Workspace
 from app.models.project import SOURCE_ARCHIVE, STATUS_READY
 from app.services import usage_ledger
 
@@ -327,6 +329,117 @@ class TestProjectInstrumentation:
             assert row.tokens_estimated is True
             assert row.provider == "mock"
             assert row.model == "mock-1"
+
+
+class TestMessageBackfill:
+    def _conversation(self, make_user, **kwargs):
+        user = make_user(**kwargs)
+        conversation = Conversation(user_id=user.id, title="Historical chat")
+        db.session.add(conversation)
+        db.session.commit()
+        return user, conversation
+
+    def _message(self, conversation, **fields):
+        values = {"role": "assistant", "content": "historical reply", **fields}
+        message = Message(conversation_id=conversation.id, **values)
+        db.session.add(message)
+        db.session.commit()
+        return message
+
+    def test_empty_database_reports_zero(self, app):
+        result = app.test_cli_runner().invoke(args=["usage", "backfill", "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["scanned"] == 0
+        assert payload["created"] == 0
+        assert payload["skipped_existing"] == 0
+        assert payload["batches"] == 0
+
+    def test_backfills_chat_messages_and_is_idempotent(self, app, db, make_user):
+        user, conversation = self._conversation(make_user)
+        first = self._message(
+            conversation,
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        )
+        second = self._message(
+            conversation,
+            prompt_tokens=4,
+            completion_tokens=6,
+            total_tokens=10,
+        )
+        self._message(conversation, role="user", content="no usage")  # ignored
+
+        runner = app.test_cli_runner()
+        initial = runner.invoke(args=["usage", "backfill", "--json"])
+
+        assert initial.exit_code == 0
+        initial_payload = json.loads(initial.output)
+        assert initial_payload["scanned"] == 2
+        assert initial_payload["created"] == 2
+        assert initial_payload["skipped_existing"] == 0
+
+        rows = UsageRecord.query.filter_by(source="chat").order_by(UsageRecord.id).all()
+        assert len(rows) == 2
+        assert {(row.prompt_tokens, row.completion_tokens, row.total_tokens) for row in rows} == {
+            (10, 5, 15),
+            (4, 6, 10),
+        }
+        assert all(row.user_id == user.id for row in rows)
+        assert all(row.conversation_id == conversation.id for row in rows)
+        assert all(row.tokens_estimated is True for row in rows)
+
+        # The source message rows are never modified.
+        assert db.session.get(Message, first.id).prompt_tokens == 10
+        assert db.session.get(Message, second.id).prompt_tokens == 4
+
+        repeat = runner.invoke(args=["usage", "backfill", "--json"])
+        assert repeat.exit_code == 0
+        repeat_payload = json.loads(repeat.output)
+        assert repeat_payload["scanned"] == 2
+        assert repeat_payload["created"] == 0
+        assert repeat_payload["skipped_existing"] == 2
+        assert UsageRecord.query.filter_by(source="chat").count() == 2
+
+    def test_batch_size_and_limit_bound_the_run(self, app, db, make_user):
+        _, conversation = self._conversation(make_user)
+        for _ in range(3):
+            self._message(
+                conversation,
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+            )
+
+        result = app.test_cli_runner().invoke(
+            args=["usage", "backfill", "--batch-size", "1", "--limit", "2", "--json"]
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["scanned"] == 2
+        assert payload["created"] == 2
+        assert payload["batches"] == 2
+        assert UsageRecord.query.filter_by(source="chat").count() == 2
+
+    def test_dry_run_writes_nothing(self, app, db, make_user):
+        _, conversation = self._conversation(make_user)
+        self._message(
+            conversation,
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+        )
+
+        result = app.test_cli_runner().invoke(args=["usage", "backfill", "--dry-run", "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["dry_run"] is True
+        assert payload["created"] == 1
+        assert UsageRecord.query.filter_by(source="chat").count() == 0
 
 
 class TestReviewInstrumentation:

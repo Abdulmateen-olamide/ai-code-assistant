@@ -462,6 +462,43 @@ existing failure-isolation behavior. Reports are read back owner-scoped via
 `GET /plugins/api/workspaces/<ws>/plugin-errors` (owner only,
 workspace-isolated) and operator-wide via `flask plugins errors [--json]`.
 
+## Configuration reference
+
+Marketplace and plugin settings are environment variables. The defaults are
+deliberately fail-closed: catalog installation is disabled, no publisher is
+trusted, and plugin outbound traffic is denied until an operator opts in.
+
+| Variable | Safe default | Purpose |
+| -------- | ------------ | ------- |
+| `PLUGIN_CATALOG_FILE` | empty | Path to the validated JSON catalog used by `POST .../plugins/install-from-catalog`. Empty disables catalog installation. |
+| `PLUGIN_DISCOVERY_DIR` | `plugins` | Read-only directory scanned for `manifest.json` files by `GET /plugins/discover`. Nothing is installed or executed. |
+| `PLUGIN_TRUST_POLICY` | `if-present` | `if-present` accepts unsigned manifests but always refuses forged or untrusted signatures; `required` also refuses unsigned manifests. Use `required` for a hosted marketplace. |
+| `PLUGIN_TRUSTED_KEYS` | `{}` | JSON object of canonical publisher ids to Ed25519 public keys (base64 raw 32 bytes or PEM). Invalid key material aborts startup. |
+| `PLUGIN_NETWORK_ALLOWLIST` | empty | Comma-separated outbound hosts. Empty denies every plugin request; `*` allows any public host and `*.example.com` allows subdomains. |
+| `PLUGIN_NETWORK_HTTPS_ONLY` | `1` | Rejects non-HTTPS plugin requests. Keep enabled outside isolated development. |
+| `PLUGIN_NETWORK_ALLOW_PRIVATE` | `0` | Allows private/loopback/link-local targets. Keep disabled in production. |
+| `PLUGIN_NETWORK_TIMEOUT` | `15` | Outbound request timeout in seconds. |
+| `PLUGIN_NETWORK_MAX_BYTES` | `2097152` | Maximum response body accepted from a plugin request (2 MiB). |
+| `PLUGIN_NETWORK_STRICT_DNS` | `0` | When enabled, an unresolvable host is rejected instead of tolerated. |
+| `PLUGIN_EXECUTION_TIMEOUT` | `5` | Seconds a plugin event handler or lifecycle hook may run before it is abandoned and recorded as a bounded error. `0` or negative disables the bound. |
+
+**Catalog cache:** there is no active cache TTL setting yet. The catalog file is
+validated and re-read for each install request, so an operator's catalog edit is
+visible immediately. A TTL cache and its `PLUGIN_MARKETPLACE_CACHE_TTL` setting
+are tracked separately in #377.
+
+Example production posture:
+
+```bash
+export PLUGIN_CATALOG_FILE=/etc/ai-code-assistant/catalog.json
+export PLUGIN_TRUST_POLICY=required
+export PLUGIN_TRUSTED_KEYS='{"acme-labs": "<base64 or PEM Ed25519 public key>"}'
+export PLUGIN_NETWORK_ALLOWLIST=plugins.example.com
+export PLUGIN_NETWORK_HTTPS_ONLY=1
+export PLUGIN_NETWORK_ALLOW_PRIVATE=0
+export PLUGIN_EXECUTION_TIMEOUT=5
+```
+
 ## Audit trail (capabilities & state)
 
 Security-relevant plugin actions are recorded in the shared, append-only
@@ -606,6 +643,9 @@ is reset between tests):
 - `tests/test_plugin_catalog_install.py` — catalog parsing/validation and the
   remote-install endpoint: authorization, trust policy, 4xx failure paths, and
   no implicit grants or code execution.
+- `tests/test_marketplace_e2e.py` — offline catalog-to-dispatch coverage:
+  install, explicit enable, dependency ordering, trust refusal, rollback, and
+  no implicit grants.
 - `tests/test_plugin_lock_entries.py` — the `PluginLockEntry` model, scoping,
   unique constraint, and canonical lockfile serialization.
 - `tests/test_plugin_audit.py` — the capability/state audit trail.
