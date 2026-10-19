@@ -8,11 +8,21 @@
   var PROJECT_ID = null;
   var treeEl = document.getElementById("project-tree");
   var viewerEl = document.getElementById("file-viewer");
+  var currentFile = null;
+  var breadcrumbsEl = document.getElementById("file-breadcrumbs");
+  var currentPath = "";
   var chatMessagesEl = document.getElementById("project-chat-messages");
+  var chatSessionListEl = document.getElementById("chat-session-list");
+  var newChatSessionBtn = document.getElementById("new-chat-session");
   var chatInputEl = document.getElementById("project-chat-input");
   var chatSendBtn = document.getElementById("project-chat-send");
+  var chatAttachmentsEl = document.getElementById("project-chat-attachments");
+  var chatEstimateEl = document.getElementById("project-chat-estimate");
+  var reviewSummaryEl = document.getElementById("review-summary");
   var streaming = false;
   var chatLoaded = false;
+  var activeSessionId = null;
+  var pendingAttachments = [];
 
   function getCsrf() {
     var meta = document.querySelector('meta[name="csrf-token"]');
@@ -138,11 +148,15 @@
     document.querySelectorAll("#project-tabs .repo-tab").forEach(function (tab) {
       tab.classList.toggle("active", tab.dataset.tab === name);
     });
-    ["files", "search", "chat", "analysis", "stats", "stellar", "discussion"].forEach(function (key) {
+    ["files", "search", "chat", "analysis", "stats", "reviews", "stellar", "discussion"].forEach(function (key) {
       document.getElementById("tab-" + key).hidden = key !== name;
     });
-    if (name === "chat" && !chatLoaded) loadChatHistory();
+    if (name === "chat") {
+      if (!chatLoaded) loadChatHistory();
+      loadReviewSummary();
+    }
     if (name === "stats") loadStats();
+    if (name === "reviews") loadProjectReviews();
     if (name === "stellar") loadStellar();
     if (name === "discussion") loadComments();
   }
@@ -173,9 +187,14 @@
       li.innerHTML =
         '<button class="tree-file-label" type="button">' +
         escapeHtml(file.path.split("/").pop()) +
+        fileBadges(file) +
         '<span class="tree-file-size">' + humanSize(file.size) + "</span></button>";
       li.addEventListener("click", function () {
         loadFile(file.path);
+        if (pendingAttachments.indexOf(file.path) === -1) {
+          pendingAttachments.push(file.path);
+          renderChatAttachments();
+        }
       });
       containerUl.appendChild(li);
     });
@@ -189,6 +208,17 @@
     if (size < 1024) return size + " B";
     if (size < 1048576) return (size / 1024).toFixed(1) + " KB";
     return (size / 1048576).toFixed(1) + " MB";
+  }
+
+  // Binary/oversized badges shown on tree rows and the viewer header (#95).
+  function fileBadges(file) {
+    if (file.is_binary) {
+      return '<span class="file-badge file-badge-binary">binary</span>';
+    }
+    if (file.searchable === false) {
+      return '<span class="file-badge file-badge-oversized">oversized</span>';
+    }
+    return "";
   }
 
   function loadDir(fullPath, containerUl) {
@@ -214,50 +244,155 @@
       }
       children.hidden = false;
       toggle.textContent = "▾";
+      setCurrentPath(fullPath);
     } else {
       children.hidden = true;
       toggle.textContent = "▸";
     }
   }
 
+  // ------------------------------------------------------------ breadcrumbs
+
+  function renderBreadcrumbs(path) {
+    if (!breadcrumbsEl) return;
+    var parts = (path || "").split("/").filter(Boolean);
+    var html = '<button type="button" class="file-crumb" data-path="">Project</button>';
+    var accumulated = "";
+    parts.forEach(function (segment, index) {
+      accumulated = accumulated ? accumulated + "/" + segment : segment;
+      html += '<span class="file-crumb-sep">/</span>';
+      if (index === parts.length - 1) {
+        html += '<span class="file-crumb-current">' + escapeHtml(segment) + "</span>";
+      } else {
+        html +=
+          '<button type="button" class="file-crumb" data-path="' +
+          escapeHtml(accumulated) +
+          '">' +
+          escapeHtml(segment) +
+          "</button>";
+      }
+    });
+    breadcrumbsEl.innerHTML = html;
+  }
+
+  function setCurrentPath(path) {
+    currentPath = path || "";
+    renderBreadcrumbs(currentPath);
+  }
+
+  function navigateToDir(path) {
+    var ul = document.createElement("ul");
+    ul.className = "tree-children";
+    treeEl.innerHTML = "";
+    treeEl.appendChild(ul);
+    loadDir(path || "", ul);
+    setCurrentPath(path || "");
+    switchTab("files");
+  }
+
   // ----------------------------------------------------------------- file
 
   function loadFile(path) {
     switchTab("files");
+    setCurrentPath(path);
+    currentFile = null;
     viewerEl.innerHTML = '<p class="sidebar-empty">Loading file...</p>';
     api("/workspaces/api/projects/" + PROJECT_ID + "/file?path=" + encodeURIComponent(path))
       .then(function (data) {
+        var meta = [];
+        if (data.language) meta.push('<span class="tag">' + escapeHtml(data.language) + "</span>");
+        var sizeText = humanSize(data.size);
+        if (sizeText) meta.push('<span class="tag">' + sizeText + "</span>");
+        meta.push(fileBadges(data));
+        var header =
+          '<div class="file-viewer-header"><code>' + escapeHtml(data.path) + "</code>" +
+          meta.join("") +
+          "</div>";
+
         if (!data.searchable) {
+          var reason = data.is_binary ? "binary" : "too large to display or search";
           viewerEl.innerHTML =
-            '<p class="repo-meta">' + escapeHtml(data.path) +
-            " — this file is binary or too large to display/search (size: " + humanSize(data.size) + ").</p>";
+            header + '<p class="repo-meta">This file is ' + reason + " — its contents are unavailable.</p>";
           return;
         }
-        viewerEl.innerHTML =
-          '<div class="file-viewer-header">' +
-          '<code>' + escapeHtml(data.path) + "</code>" +
-          '<span class="tag">' + escapeHtml(data.language || "text") + "</span>" +
-          "</div>" +
-          '<pre class="code-view">' + escapeHtml(data.content) + "</pre>";
+        currentFile = data;
+        var codeClass = data.language ? ' class="language-' + escapeHtml(data.language) + '"' : "";
+        viewerEl.innerHTML = header + renderFileBody(data, "rendered");
+        if (window.AICASyntaxHighlight) window.AICASyntaxHighlight.apply(viewerEl);
       })
       .catch(function (error) {
         viewerEl.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
       });
   }
 
+  function renderFileBody(data, mode) {
+    var codeClass = data.language ? ' class="language-' + escapeHtml(data.language) + '"' : "";
+    if (mode === "raw") {
+      var lines = String(data.content == null ? "" : data.content).split("\n");
+      var rows = lines.map(function (line, index) {
+        return '<span class="code-line"><span class="code-line-number">' + (index + 1) +
+          '</span><span class="code-line-content">' + escapeHtml(line) + "</span></span>";
+      }).join("\n");
+      return '<pre class="code-view code-view-raw"><code' + codeClass + ">" + rows + "</code></pre>";
+    }
+    return '<pre class="code-view"><code' + codeClass + ">" + escapeHtml(data.content) + "</code></pre>";
+  }
+
+  function setFileView(mode) {
+    if (!currentFile) return;
+    var header = viewerEl.querySelector(".file-viewer-header");
+    viewerEl.innerHTML = (header ? header.outerHTML : "") + renderFileBody(currentFile, mode);
+    viewerEl.querySelectorAll(".file-view-toggle").forEach(function (button) {
+      button.classList.toggle("active", button.dataset.view === mode);
+    });
+    if (mode === "rendered" && window.AICASyntaxHighlight) {
+      window.AICASyntaxHighlight.apply(viewerEl);
+    }
+  }
+
+  document.addEventListener("click", function (event) {
+    var toggle = event.target.closest(".file-view-toggle");
+    if (!toggle) return;
+    setFileView(toggle.dataset.view);
+  });
+
   // ---------------------------------------------------------------- search
+
+  function renderChatAttachments() {
+    if (!chatAttachmentsEl) return;
+    chatAttachmentsEl.innerHTML = pendingAttachments.map(function (path, index) {
+      return '<button type="button" class="chat-attachment" data-index="' + index + '" title="Remove attachment">' +
+        escapeHtml(path) + " x</button>";
+    }).join("");
+    chatAttachmentsEl.querySelectorAll(".chat-attachment").forEach(function (button) {
+      button.addEventListener("click", function () {
+        pendingAttachments.splice(parseInt(button.dataset.index, 10), 1);
+        renderChatAttachments();
+      });
+    });
+  }
 
   function runSearch() {
     var query = document.getElementById("search-query").value.trim();
     var caseSensitive = document.getElementById("search-case").checked;
+    var regex = document.getElementById("search-regex").checked;
+    var scopeEl = document.getElementById("search-scope");
+    var languageEl = document.getElementById("search-language");
     var resultsEl = document.getElementById("search-results");
     if (!query) {
       resultsEl.innerHTML = '<p class="sidebar-empty">Enter a query to search the project.</p>';
       return;
     }
     resultsEl.innerHTML = '<p class="sidebar-empty">Searching...</p>';
-    var url = "/workspaces/api/projects/" + PROJECT_ID + "/search?q=" + encodeURIComponent(query);
-    if (caseSensitive) url += "&case=1";
+    var params = ["q=" + encodeURIComponent(query)];
+    if (caseSensitive) params.push("case=1");
+    if (regex) params.push("regex=1");
+    if (scopeEl && scopeEl.value && scopeEl.value !== "all") {
+      params.push("scope=" + encodeURIComponent(scopeEl.value));
+    }
+    var language = languageEl ? languageEl.value.trim() : "";
+    if (language) params.push("language=" + encodeURIComponent(language));
+    var url = "/workspaces/api/projects/" + PROJECT_ID + "/search?" + params.join("&");
     api(url)
       .then(function (data) {
         resultsEl.innerHTML = "";
@@ -286,7 +421,7 @@
 
   // ----------------------------------------------------------------- chat
 
-  function addChatMessage(role, content, asMarkdown) {
+  function addChatMessage(role, content, asMarkdown, messageId) {
     var el = document.createElement("div");
     el.className = "chat-message chat-" + role;
     var label = role === "user" ? "You" : "Assistant";
@@ -295,9 +430,25 @@
       '<div class="message-body">' +
       (role === "user" || !asMarkdown ? escapeHtml(content) : renderMarkdown(content)) +
       "</div>";
+    if (role === "assistant" && messageId != null) {
+      el.__reviewContent = content;
+      attachReviewFooter(el, messageId);
+    }
     chatMessagesEl.appendChild(el);
     scrollChat();
     return el;
+  }
+
+  function attachReviewFooter(messageEl, messageId) {
+    if (messageEl.querySelector(".message-review")) return;
+    messageEl.setAttribute("data-message-id", messageId);
+    var footer = document.createElement("div");
+    footer.className = "message-review";
+    footer.innerHTML =
+      '<button class="btn btn-ghost btn-sm message-review-toggle" type="button">' +
+      "Inline review comments</button>" +
+      '<div class="message-review-panel" hidden></div>';
+    messageEl.appendChild(footer);
   }
 
   function addTypingIndicator() {
@@ -309,13 +460,44 @@
     return el;
   }
 
-  function loadChatHistory() {
-    chatLoaded = true;
-    api("/workspaces/api/projects/" + PROJECT_ID + "/messages")
+  function renderChatSessions(sessions) {
+    chatSessionListEl.innerHTML = "";
+    sessions.forEach(function (session) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "chat-session" + (session.id === activeSessionId ? " active" : "");
+      button.textContent = session.title;
+      button.title = session.title;
+      button.addEventListener("click", function () {
+        if (session.id === activeSessionId) return;
+        activeSessionId = session.id;
+        renderChatSessions(sessions);
+        loadChatMessages();
+      });
+      chatSessionListEl.appendChild(button);
+    });
+  }
+
+  function loadChatSessions() {
+    return api("/workspaces/api/projects/" + PROJECT_ID + "/sessions")
+      .then(function (sessions) {
+        if (!activeSessionId && sessions.length) activeSessionId = sessions[0].id;
+        renderChatSessions(sessions);
+      });
+  }
+
+  function loadChatMessages() {
+    var query = activeSessionId ? "?session_id=" + activeSessionId : "";
+    return api("/workspaces/api/projects/" + PROJECT_ID + "/messages" + query)
       .then(function (messages) {
         chatMessagesEl.innerHTML = "";
         messages.forEach(function (message) {
-          addChatMessage(message.role, message.content, true);
+          addChatMessage(
+            message.role,
+            message.content,
+            true,
+            message.role === "assistant" ? message.id : null
+          );
         });
         if (!messages.length) {
           chatMessagesEl.innerHTML =
@@ -327,9 +509,69 @@
       });
   }
 
+  function loadChatHistory() {
+    chatLoaded = true;
+    loadChatSessions().then(loadChatMessages).catch(function (error) {
+      flashError(error.message);
+    });
+  }
+
+  function createChatSession() {
+    var title = window.prompt("Session title");
+    if (!title || !title.trim()) return;
+    api("/workspaces/api/projects/" + PROJECT_ID + "/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    }).then(function (session) {
+      activeSessionId = session.id;
+      return loadChatSessions().then(loadChatMessages);
+    }).catch(function (error) {
+      flashError(error.message);
+    });
+  }
+
+  // Pre-flight token/cost estimate (issue #104). Best-effort: failures clear
+  // the hint rather than surfacing an error, so typing is never interrupted.
+  function formatEstimate(estimate) {
+    if (window.AICACurrency && typeof window.AICACurrency.formatEstimate === "function") {
+      return window.AICACurrency.formatEstimate(estimate);
+    }
+    var tokens = Number(estimate && estimate.prompt_tokens) || 0;
+    var cost = Number(estimate && estimate.estimated_cost_usd) || 0;
+    return "Estimated: ~" + tokens.toLocaleString() + " tokens (~$" + cost.toFixed(4) + " USD; estimate)";
+  }
+
+  var chatEstimateTimer = null;
+  function estimateChat() {
+    if (!chatEstimateEl) return;
+    var content = chatInputEl.value.trim();
+    if (!content) {
+      chatEstimateEl.textContent = "";
+      return;
+    }
+    window.clearTimeout(chatEstimateTimer);
+    chatEstimateTimer = window.setTimeout(function () {
+      api("/workspaces/api/projects/" + PROJECT_ID + "/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "chat", content: content, attachments: pendingAttachments }),
+      })
+        .then(function (estimate) {
+          chatEstimateEl.textContent = formatEstimate(estimate);
+        })
+        .catch(function () {
+          chatEstimateEl.textContent = "";
+        });
+    }, 400);
+  }
+
   async function startChat() {
     var content = chatInputEl.value.trim();
     if (!content || streaming) return;
+    var attachments = pendingAttachments.slice();
+    pendingAttachments = [];
+    renderChatAttachments();
     chatInputEl.value = "";
     chatSendBtn.disabled = true;
     streaming = true;
@@ -345,7 +587,7 @@
           "Content-Type": "application/json",
           "X-CSRFToken": getCsrf(),
         },
-        body: JSON.stringify({ content: content }),
+        body: JSON.stringify({ content: content, session_id: activeSessionId, attachments: attachments }),
       });
 
       if (!response.ok) {
@@ -388,10 +630,15 @@
             fullText += payload.content;
             streamBody.innerHTML = renderMarkdown(fullText);
             scrollChat();
+            loadChatSessions();
           } else if (payload.type === "error") {
             flashError(payload.error);
           } else if (payload.type === "done") {
             streamBody.innerHTML = renderMarkdown(payload.message.content);
+            if (payload.message && payload.message.id != null) {
+              typing.__reviewContent = payload.message.content;
+              attachReviewFooter(typing, payload.message.id);
+            }
             scrollChat();
           }
         });
@@ -410,20 +657,34 @@
 
   // ------------------------------------------------------------- analysis
 
-  function runAnalysis(kind) {
+  async function runAnalysis(kind) {
     var output = document.getElementById("analysis-output");
     output.innerHTML = '<p class="sidebar-empty">Analyzing project (bounded context), please wait...</p>';
-    api("/workspaces/api/projects/" + PROJECT_ID + "/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: kind }),
-    })
-      .then(function (data) {
-        renderAnalysis(output, data.analysis);
-      })
-      .catch(function (error) {
-        output.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+
+    // Show the pre-flight estimate for the exact context that will be sent.
+    try {
+      var estimate = await api("/workspaces/api/projects/" + PROJECT_ID + "/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "analysis", kind: kind }),
       });
+      output.innerHTML =
+        '<p class="chat-hint">' + escapeHtml(formatEstimate(estimate)) + "</p>" +
+        '<p class="sidebar-empty">Analyzing project (bounded context), please wait...</p>';
+    } catch (error) {
+      /* estimation is best-effort; continue with the analysis */
+    }
+
+    try {
+      var data = await api("/workspaces/api/projects/" + PROJECT_ID + "/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: kind }),
+      });
+      renderAnalysis(output, data.analysis);
+    } catch (error) {
+      output.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+    }
   }
 
   // ---------------------------------------------------------------- stats
@@ -461,6 +722,27 @@
           });
           html += "</ul>";
         }
+        var coverage = data.coverage_estimate;
+        if (coverage) {
+          html += '<h3 class="metric-title">Coverage (estimated)</h3>';
+          html += '<p class="field-hint">' + escapeHtml(coverage.note) + "</p>";
+          html += '<div class="metric-grid">';
+          html += metric("Estimate", (coverage.ratio * 100).toFixed(1) + "%");
+          html += metric("Test files", coverage.test_file_count);
+          html += metric("Source files", coverage.source_file_count);
+          html += metric("Signal", coverage.label);
+          html += "</div>";
+        }
+        if (data.ci_files && data.ci_files.length) {
+          html += '<h3 class="metric-title">CI configuration</h3><ul class="metric-list">';
+          data.ci_files.forEach(function (path) {
+            html += "<li><code>" + escapeHtml(path) + "</code></li>";
+          });
+          html += "</ul>";
+        } else {
+          html += '<h3 class="metric-title">CI configuration</h3>';
+          html += '<p class="sidebar-empty">No CI configuration detected.</p>';
+        }
         output.innerHTML = html;
       })
       .catch(function (error) {
@@ -471,6 +753,46 @@
   function metric(label, value) {
     return '<div class="metric-card"><span class="metric-value">' + escapeHtml(value) +
       '</span><span class="metric-label">' + escapeHtml(label) + "</div>";
+  }
+
+  // --------------------------------------------------------------- reviews
+
+  var reviewsLoaded = false;
+
+  function reviewStatusTag(review) {
+    var cls = review.status === "completed" ? "tag-public" :
+      review.status === "failed" ? "tag-private" : "";
+    return '<span class="tag ' + cls + '">' + escapeHtml(review.status) + "</span>";
+  }
+
+  function loadProjectReviews() {
+    var output = document.getElementById("project-reviews");
+    if (!output || reviewsLoaded) return;
+    reviewsLoaded = true;
+    api("/reviews/api/reviews?project_id=" + PROJECT_ID)
+      .then(function (data) {
+        var reviews = (data && data.items) || [];
+        if (!reviews.length) {
+          output.innerHTML =
+            '<p class="sidebar-empty">No reviews yet. Open the review runner to run one.</p>';
+          return;
+        }
+        var html = "";
+        reviews.forEach(function (review) {
+          html +=
+            '<a class="issue-item" href="/reviews/' + review.id + '">' +
+            '<div class="issue-item-title">' + reviewStatusTag(review) + " " +
+            escapeHtml(review.kind) + " review</div>" +
+            '<div class="issue-item-sub">' +
+            (review.findings_count || 0) + " findings &middot; " +
+            escapeHtml(review.created_at ? new Date(review.created_at).toLocaleString() : "") +
+            "</div></a>";
+        });
+        output.innerHTML = html;
+      })
+      .catch(function (error) {
+        output.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+      });
   }
 
   // -------------------------------------------------------------- stellar
@@ -631,6 +953,264 @@
       });
   }
 
+  // ------------------------------------------------- inline review comments
+
+  function countCodeBlocks(content) {
+    var matches = (content || "").match(/```/g);
+    return matches ? Math.floor(matches.length / 2) : 0;
+  }
+
+  function anchorText(comment) {
+    if (comment.block_index == null && comment.line_start == null) return "whole message";
+    var parts = [];
+    if (comment.block_index != null) parts.push("code block " + (comment.block_index + 1));
+    if (comment.line_start != null) {
+      parts.push(
+        "line " + comment.line_start +
+        (comment.line_end && comment.line_end !== comment.line_start ? "-" + comment.line_end : "")
+      );
+    }
+    return parts.join(" · ");
+  }
+
+  function reviewCommentUrl(messageId, commentId) {
+    var base =
+      "/workspaces/api/projects/" + PROJECT_ID + "/messages/" + messageId + "/review-comments";
+    return commentId == null ? base : base + "/" + commentId;
+  }
+
+  function metricPill(value, label) {
+    return (
+      '<div class="metric-card"><span class="metric-value">' + value +
+      '</span><span class="metric-label">' + label + "</span></div>"
+    );
+  }
+
+  function threadHtml(thread) {
+    var resolved = thread.resolved;
+    var html =
+      '<div class="review-thread' + (resolved ? " review-thread-resolved" : "") +
+      '" data-comment-id="' + thread.id + '">' +
+      '<div class="review-thread-head">' +
+      '<span class="review-anchor">' + escapeHtml(anchorText(thread)) + "</span>" +
+      '<span class="tag ' + (resolved ? "tag-confirmed" : "tag-suggestion") + '">' +
+      (resolved ? "resolved" : "open") + "</span>" +
+      '<button class="btn btn-ghost btn-sm review-resolve" type="button" data-resolved="' +
+      (resolved ? "0" : "1") + '">' + (resolved ? "Reopen" : "Resolve") + "</button>" +
+      '<button class="btn btn-ghost btn-sm review-delete" type="button">Delete</button>' +
+      "</div>" +
+      '<div class="review-comment">' + renderInline(thread.body) +
+      ' <span class="review-author">— ' + escapeHtml(thread.author_username || "unknown") +
+      "</span></div>";
+    (thread.replies || []).forEach(function (reply) {
+      html +=
+        '<div class="review-comment review-reply" data-comment-id="' + reply.id + '">' +
+        renderInline(reply.body) +
+        ' <span class="review-author">— ' + escapeHtml(reply.author_username || "unknown") +
+        '</span> <button class="btn btn-ghost btn-sm review-delete" type="button">Delete</button>' +
+        "</div>";
+    });
+    html +=
+      '<div class="review-reply-box">' +
+      '<input class="review-reply-input" type="text" maxlength="4000" placeholder="Reply...">' +
+      '<button class="btn btn-ghost btn-sm review-reply-btn" type="button">Reply</button>' +
+      "</div></div>";
+    return html;
+  }
+
+  function renderMessageReview(messageEl, messageId) {
+    var panel = messageEl.querySelector(".message-review-panel");
+    if (!panel) return;
+    var content = messageEl.__reviewContent || "";
+    api(reviewCommentUrl(messageId))
+      .then(function (data) {
+        var threads = data.items || [];
+        var html = "";
+        if (!threads.length) {
+          html += '<p class="sidebar-empty">No inline comments yet.</p>';
+        } else {
+          threads.forEach(function (thread) {
+            html += threadHtml(thread);
+          });
+        }
+        var blockCount = countCodeBlocks(content);
+        html +=
+          '<div class="review-composer">' +
+          '<textarea class="review-composer-input" rows="2" maxlength="4000" ' +
+          'placeholder="Add a review comment... @username to mention"></textarea>' +
+          '<div class="review-composer-controls">' +
+          '<select class="review-block-select"><option value="">Whole message</option>';
+        for (var i = 0; i < blockCount; i++) {
+          html += '<option value="' + i + '">Code block ' + (i + 1) + "</option>";
+        }
+        html +=
+          "</select>" +
+          '<input class="review-line-start" type="number" min="1" placeholder="start line">' +
+          '<input class="review-line-end" type="number" min="1" placeholder="end line">' +
+          '<button class="btn btn-primary btn-sm review-composer-btn" type="button">Comment</button>' +
+          "</div></div>";
+        panel.innerHTML = html;
+      })
+      .catch(function (error) {
+        panel.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+      });
+  }
+
+  function loadReviewSummary() {
+    if (!reviewSummaryEl) return;
+    api("/workspaces/api/projects/" + PROJECT_ID + "/review-summary")
+      .then(function (summary) {
+        if (!summary.total) {
+          reviewSummaryEl.innerHTML =
+            '<h3>Review threads</h3><p class="sidebar-empty">No inline review threads yet. ' +
+            "Open an assistant message to add one.</p>";
+          return;
+        }
+        var html = "<h3>Review threads</h3><div class='metric-grid'>" +
+          metricPill(summary.open, "open") +
+          metricPill(summary.resolved, "resolved") +
+          metricPill(summary.total, "total") +
+          "</div>";
+        summary.threads.forEach(function (thread) {
+          html +=
+            '<div class="review-summary-row">' +
+            '<span class="tag ' + (thread.resolved ? "tag-confirmed" : "tag-suggestion") + '">' +
+            (thread.resolved ? "resolved" : "open") + "</span> " +
+            '<a href="#" class="review-summary-jump" data-message-id="' + thread.message_id + '">' +
+            escapeHtml(anchorText(thread)) + "</a> " +
+            '<span class="review-author">' + escapeHtml(thread.author_username || "unknown") +
+            " &middot; " + (thread.reply_count || 0) +
+            " repl" + (thread.reply_count === 1 ? "y" : "ies") + "</span></div>";
+        });
+        reviewSummaryEl.innerHTML = html;
+      })
+      .catch(function () {
+        reviewSummaryEl.innerHTML =
+          '<h3>Review threads</h3><p class="sidebar-empty">Review threads unavailable.</p>';
+      });
+  }
+
+  function reloadMessageReview(messageEl) {
+    renderMessageReview(messageEl, messageEl.getAttribute("data-message-id"));
+  }
+
+  document.addEventListener("click", function (event) {
+    var toggle = event.target.closest(".message-review-toggle");
+    if (toggle) {
+      var messageEl = toggle.closest(".chat-message");
+      var panel = toggle.closest(".message-review").querySelector(".message-review-panel");
+      if (panel.hidden) {
+        panel.hidden = false;
+        renderMessageReview(messageEl, messageEl.getAttribute("data-message-id"));
+      } else {
+        panel.hidden = true;
+      }
+      return;
+    }
+
+    var composerBtn = event.target.closest(".review-composer-btn");
+    if (composerBtn) {
+      var panelC = composerBtn.closest(".message-review-panel");
+      var msgEl = composerBtn.closest(".chat-message");
+      var input = panelC.querySelector(".review-composer-input");
+      var body = input.value.trim();
+      if (!body) {
+        input.focus();
+        return;
+      }
+      var payload = { body: body };
+      var blockSel = panelC.querySelector(".review-block-select");
+      if (blockSel && blockSel.value !== "") payload.block_index = parseInt(blockSel.value, 10);
+      var lineStart = panelC.querySelector(".review-line-start");
+      var lineEnd = panelC.querySelector(".review-line-end");
+      if (lineStart && lineStart.value) payload.line_start = parseInt(lineStart.value, 10);
+      if (lineEnd && lineEnd.value) payload.line_end = parseInt(lineEnd.value, 10);
+      composerBtn.disabled = true;
+      api(reviewCommentUrl(msgEl.getAttribute("data-message-id")), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(function () {
+        reloadMessageReview(msgEl);
+        loadReviewSummary();
+      }).catch(function (error) {
+        flashError(error.message);
+        composerBtn.disabled = false;
+      });
+      return;
+    }
+
+    var replyBtn = event.target.closest(".review-reply-btn");
+    if (replyBtn) {
+      var thread = replyBtn.closest(".review-thread");
+      var msgEl2 = replyBtn.closest(".chat-message");
+      var replyInput = thread.querySelector(".review-reply-input");
+      var replyBody = replyInput.value.trim();
+      if (!replyBody) {
+        replyInput.focus();
+        return;
+      }
+      replyBtn.disabled = true;
+      api(reviewCommentUrl(msgEl2.getAttribute("data-message-id")), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          body: replyBody,
+          parent_id: parseInt(thread.getAttribute("data-comment-id"), 10),
+        }),
+      }).then(function () {
+        reloadMessageReview(msgEl2);
+        loadReviewSummary();
+      }).catch(function (error) {
+        flashError(error.message);
+        replyBtn.disabled = false;
+      });
+      return;
+    }
+
+    var resolveBtn = event.target.closest(".review-resolve");
+    if (resolveBtn) {
+      var threadR = resolveBtn.closest(".review-thread");
+      var msgEl3 = resolveBtn.closest(".chat-message");
+      api(reviewCommentUrl(msgEl3.getAttribute("data-message-id"), threadR.getAttribute("data-comment-id")), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolved: resolveBtn.getAttribute("data-resolved") === "1" }),
+      }).then(function () {
+        reloadMessageReview(msgEl3);
+        loadReviewSummary();
+      }).catch(function (error) {
+        flashError(error.message);
+      });
+      return;
+    }
+
+    var deleteBtn = event.target.closest(".review-delete");
+    if (deleteBtn) {
+      var target = deleteBtn.closest("[data-comment-id]");
+      var msgEl4 = deleteBtn.closest(".chat-message");
+      if (!window.confirm("Delete this review comment?")) return;
+      api(reviewCommentUrl(msgEl4.getAttribute("data-message-id"), target.getAttribute("data-comment-id")), {
+        method: "DELETE",
+      }).then(function () {
+        reloadMessageReview(msgEl4);
+        loadReviewSummary();
+      }).catch(function (error) {
+        flashError(error.message);
+      });
+      return;
+    }
+
+    var jump = event.target.closest(".review-summary-jump");
+    if (jump) {
+      event.preventDefault();
+      var targetMsg = chatMessagesEl.querySelector(
+        '.chat-message[data-message-id="' + jump.getAttribute("data-message-id") + '"]'
+      );
+      if (targetMsg) targetMsg.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  });
+
   // ----------------------------------------------------------------- init
 
   document.addEventListener("DOMContentLoaded", function () {
@@ -641,6 +1221,15 @@
     rootUl.className = "tree-children";
     treeEl.appendChild(rootUl);
     loadDir("", rootUl);
+    renderBreadcrumbs("");
+
+    if (breadcrumbsEl) {
+      breadcrumbsEl.addEventListener("click", function (event) {
+        var crumb = event.target.closest(".file-crumb");
+        if (!crumb) return;
+        navigateToDir(crumb.getAttribute("data-path") || "");
+      });
+    }
 
     document.getElementById("refresh-tree").addEventListener("click", function () {
       treeEl.innerHTML = "";
@@ -696,6 +1285,8 @@
     }
 
     chatSendBtn.addEventListener("click", startChat);
+    newChatSessionBtn.addEventListener("click", createChatSession);
+    chatInputEl.addEventListener("input", estimateChat);
     chatInputEl.addEventListener("keydown", function (event) {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -719,6 +1310,53 @@
         postComment();
       }
     });
+
+    // Export (#107): normal navigation download. When the server answers with
+    // JSON instead of a zip, surface the error message instead of saving it.
+    var exportLink = document.getElementById("export-project");
+    if (exportLink) {
+      exportLink.addEventListener("click", function (event) {
+        var response = null;
+        var check = fetch(exportLink.href, { headers: { Accept: "application/zip" } })
+          .then(function (res) {
+            response = res;
+            var type = res.headers.get("Content-Type") || "";
+            if (type.indexOf("application/json") === -1) return null;
+            return res.json();
+          })
+          .then(function (data) {
+            if (data && data.error) {
+              event.preventDefault();
+              flashError(data.error);
+            }
+          })
+          .catch(function () {
+            /* network hiccup: let the navigation proceed */
+          });
+        if (check && check.then) event.preventDefault();
+      });
+    }
+
+    // Refresh (#88): re-import from the original source and swap the file set.
+    var refreshBtn = document.getElementById("refresh-project");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", function () {
+        if (!confirm("Re-import this project from its source? The stored files will be replaced.")) {
+          return;
+        }
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = "Refreshing...";
+        api("/workspaces/api/projects/" + PROJECT_ID + "/refresh", { method: "POST" })
+          .then(function () {
+            window.location.reload();
+          })
+          .catch(function (error) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = "Refresh";
+            flashError(error.message);
+          });
+      });
+    }
 
     document.getElementById("delete-project").addEventListener("click", function () {
       if (!confirm("Delete this project and its indexed files?")) return;

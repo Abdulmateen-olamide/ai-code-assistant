@@ -24,10 +24,12 @@ from flask import current_app
 
 from app.extensions import db
 from app.models import Plugin
+from app.services.plugin_compat import enforce_compatible
 from app.services.plugins import (
     ManifestValidationError,
     PluginError,
     PluginManifest,
+    PluginRegistry,
 )
 
 #: Anything with a URL scheme is refused as a "local path".
@@ -40,9 +42,51 @@ class PluginNotFoundError(ValueError):
     """Raised when a plugin id does not exist in the database."""
 
 
+class PluginUpdateError(ValueError):
+    """Raised when a manifest cannot be applied to a registered plugin."""
+
+
+class PluginEntryPointMismatchError(PluginUpdateError):
+    """Raised when an update would retarget a registered plugin's entry point."""
+
+
+class PluginDependencyResolutionError(ValueError):
+    """Raised when a plugin cannot be enabled because dependencies are unsatisfied."""
+
+
 def list_plugins() -> list[Plugin]:
     """Return all registered plugins, ordered by id."""
     return Plugin.query.order_by(Plugin.id).all()
+
+
+def discover_plugins() -> list[dict]:
+    """Return discoverable-but-not-registered plugin manifests (#172).
+
+    Reads ``PLUGIN_DISCOVERY_DIR`` (a local directory of plugin folders, each
+    containing a ``manifest.json``), validates each manifest, and returns only
+    the plugins that are not already registered in the database. The operation
+    is read-only: it never installs, loads, or mutates plugin state, and an
+    absent/unreadable directory simply yields an empty list.
+    """
+    configured = current_app.config.get("PLUGIN_DISCOVERY_DIR")
+    if not configured:
+        return []
+
+    manifest_list = PluginRegistry().discover(Path(configured))
+    registered_ids = {row.id for row in Plugin.query.all()}
+    discovered = [
+        {
+            "id": manifest.id,
+            "name": manifest.name,
+            "version": manifest.version,
+            "description": manifest.description,
+            "capabilities": list(manifest.capabilities or []),
+        }
+        for manifest in manifest_list
+        if manifest.id not in registered_ids
+    ]
+    discovered.sort(key=lambda item: item["id"])
+    return discovered
 
 
 def get_plugin(plugin_id: str) -> Plugin:
@@ -56,13 +100,50 @@ def get_plugin(plugin_id: str) -> Plugin:
 def set_plugin_enabled(plugin_id: str, enabled: bool) -> Plugin:
     """Enable or disable a plugin (operator scope) and persist the change.
 
-    Enabling never creates capability grants; disabling never revokes them
-    (per-workspace grants are revoked only through the workspace API).
+    Enabling resolves the plugin's declared dependencies first: registered
+    plugin dependencies must exist and be enabled, and Python package
+    dependencies must be installed at a satisfying version. When resolution
+    fails the plugin stays disabled and :class:`PluginDependencyResolutionError`
+    is raised. Enabling never creates capability grants; disabling never
+    revokes them (per-workspace grants are revoked only through the workspace
+    API).
     """
     plugin = get_plugin(plugin_id)
+    if enabled:
+        resolve_plugin_dependencies(plugin)
     plugin.enabled = bool(enabled)
     db.session.commit()
     return plugin
+
+
+def resolve_plugin_dependencies(plugin: Plugin) -> None:
+    """Resolve a persisted plugin's declared dependencies.
+
+    Raises :class:`PluginDependencyResolutionError` (never mutating the plugin)
+    when a required dependency is missing, disabled, version-incompatible, or
+    cyclic. Used by the enable path and available to the HTTP API so workspace
+    enable requests surface the same clear errors.
+    """
+    from app.services.plugin_deps import DependencyResolver, PluginDependencyError, PluginRef
+
+    def _ref(plugin_id: str) -> PluginRef | None:
+        row = db.session.get(Plugin, plugin_id)
+        if row is None:
+            return None
+        return PluginRef(
+            id=row.id,
+            version=row.version,
+            enabled=row.enabled,
+            dependencies=tuple(row.dependencies or ()),
+        )
+
+    resolver = DependencyResolver(_ref)
+    try:
+        resolver.resolve(_ref(plugin.id))
+    except PluginDependencyError as exc:
+        raise PluginDependencyResolutionError(
+            f"Cannot enable plugin {plugin.id}: {exc.message}"
+        ) from exc
 
 
 def _resolve_manifest_file(path: str) -> Path:
@@ -122,13 +203,68 @@ def install_from_local_dir(path: str) -> Plugin:
     return plugin
 
 
+def update_plugin(plugin_id: str, manifest: PluginManifest) -> Plugin:
+    """Apply a validated manifest to an already-registered plugin.
+
+    Updates are identity-bound like installs: the manifest id must equal
+    ``plugin_id`` and the entry point must not change, so an update can never
+    retarget an installed plugin at different code.
+
+    The declared PEP 440 ``compatibility`` range is enforced against the
+    running application *before* anything is written. An update whose range
+    excludes this app version raises
+    :class:`~app.services.plugin_compat.IncompatibleCompatibilityError` naming
+    both the range and the current version, and leaves the registered plugin
+    untouched. Invalid specifiers raise
+    :class:`~app.services.plugin_compat.InvalidCompatibilityError`.
+
+    Capability grants are intentionally not modified: they stay explicit and
+    per-workspace, and are managed only through the capability endpoints.
+    """
+    plugin = get_plugin(plugin_id)
+
+    if manifest.id != plugin_id:
+        raise PluginUpdateError(
+            f"Manifest id {manifest.id!r} does not match the plugin being updated "
+            f"({plugin_id!r})."
+        )
+    if manifest.entry_point != plugin.entry_point:
+        raise PluginEntryPointMismatchError(
+            f"Manifest entry_point does not match the registered plugin {plugin_id}."
+        )
+
+    enforce_compatible(
+        manifest.compatibility,
+        subject=f"Plugin {plugin_id} {manifest.version}",
+    )
+
+    plugin.name = manifest.name
+    plugin.version = manifest.version
+    plugin.description = manifest.description
+    plugin.author = manifest.author
+    plugin.capabilities = list(manifest.capabilities)
+    plugin.permissions = list(manifest.permissions or [])
+    plugin.dependencies = list(manifest.dependencies or [])
+    plugin.compatibility = manifest.compatibility
+    plugin.configuration = dict(manifest.configuration or {})
+    plugin.trust_state = manifest.trust_state
+    plugin.trust_publisher = manifest.trust_publisher
+    db.session.commit()
+    return plugin
+
+
 __all__ = [
     "ManifestValidationError",
+    "PluginDependencyResolutionError",
     "PluginError",
     "PluginManifest",
     "PluginNotFoundError",
+    "PluginUpdateError",
+    "discover_plugins",
     "get_plugin",
     "install_from_local_dir",
     "list_plugins",
+    "resolve_plugin_dependencies",
     "set_plugin_enabled",
+    "update_plugin",
 ]

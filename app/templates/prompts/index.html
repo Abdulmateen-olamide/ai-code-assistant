@@ -9,6 +9,11 @@
 </div>
 
 <div class="prompts-toolbar">
+  <select id="prompt-scope" class="prompt-filter" aria-label="Prompt library scope">
+    <option value="personal">Personal prompts</option>
+    <option value="team">Team library</option>
+  </select>
+  <select id="prompt-workspace" class="prompt-filter" aria-label="Team workspace" hidden></select>
   <input id="prompt-search" class="sidebar-search" type="search" placeholder="Search prompts...">
   <select id="prompt-category-filter" class="prompt-filter">
     <option value="">All categories</option>
@@ -17,13 +22,19 @@
     <input type="checkbox" id="prompt-fav-only">
     Favorites only
   </label>
+  <label class="btn btn-ghost btn-sm" for="prompt-import-file">Import</label>
+  <input id="prompt-import-file" type="file" accept=".json,.csv" hidden>
+  <a class="btn btn-ghost btn-sm" href="{{ url_for('prompts.export_prompts') }}" download>Export</a>
 </div>
+<p id="prompt-import-status" class="field-hint" role="status" aria-live="polite"></p>
 
 <div id="prompt-list" class="prompt-grid"></div>
 
 <div id="prompt-editor" class="prompt-editor" hidden>
   <h2 id="prompt-editor-title">New Prompt</h2>
   <input id="prompt-title" class="field-input" placeholder="Title">
+  <label class="checkbox"><input type="checkbox" id="prompt-is-team"> Add to team library</label>
+  <select id="prompt-editor-workspace" class="field-input" aria-label="Team workspace" hidden></select>
   <input id="prompt-category" class="field-input" placeholder="Category (default: General)">
   <textarea id="prompt-content" class="field-textarea" rows="8" placeholder="Prompt template content..."></textarea>
   <div class="prompt-editor-actions">

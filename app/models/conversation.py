@@ -20,6 +20,19 @@ class Conversation(db.Model):
     )
     title = db.Column(db.String(200), nullable=False, default="New conversation")
     is_pinned = db.Column(db.Boolean, nullable=False, default=False)
+    # Optional project grouping. ``None`` means "not filed under any workspace"
+    # (the default for existing conversations). Deleting a workspace sets this to
+    # ``NULL`` rather than cascading, so a conversation is never destroyed by a
+    # container being removed - it simply falls back to the unscoped list.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Per-conversation generation settings (issue #12). ``None`` means "use the
+    # provider/app default", so existing conversations keep working unchanged.
+    provider = db.Column(db.String(50), nullable=True)
+    model = db.Column(db.String(100), nullable=True)
+    temperature = db.Column(db.Float, nullable=True)
+    system_prompt = db.Column(db.Text, nullable=True)
     created_at = db.Column(
         db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
@@ -30,12 +43,22 @@ class Conversation(db.Model):
         onupdate=lambda: datetime.now(UTC),
     )
 
+    workspace = db.relationship("Workspace", back_populates="conversations")
     messages = db.relationship(
         "Message",
         back_populates="conversation",
         cascade="all, delete-orphan",
         order_by="Message.created_at",
     )
+    shares = db.relationship(
+        "ConversationShare",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+    )
+
+    def is_shared_with(self, user_id: int) -> bool:
+        """Return ``True`` when the conversation was shared with ``user_id``."""
+        return any(share.user_id == user_id for share in self.shares)
 
     def to_dict(self) -> dict:
         """Serialize the conversation for JSON API responses."""
@@ -43,6 +66,12 @@ class Conversation(db.Model):
             "id": self.id,
             "title": self.title,
             "is_pinned": self.is_pinned,
+            "workspace_id": self.workspace_id,
+            "is_shared": len(self.shares) > 0,
+            "provider": self.provider,
+            "model": self.model,
+            "temperature": self.temperature,
+            "system_prompt": self.system_prompt,
             "message_count": len(self.messages),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

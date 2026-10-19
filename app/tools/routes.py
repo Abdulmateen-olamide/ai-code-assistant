@@ -5,15 +5,25 @@ LLM provider. File analysis reads plain-text uploads and has the model explain,
 refactor, review, or comment on them.
 """
 
+import hashlib
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from flask import jsonify, request
+from flask import current_app, jsonify, render_template, request
 from flask_login import current_user, login_required
 from werkzeug.utils import secure_filename
 
 from app.extensions import db
-from app.models import Conversation, Message
+from app.models import AnalyzedFile, Conversation, FileAnalysis, Message
+from app.services import analysis, ratelimit, token_usage, usage_ledger
+from app.services.github import (
+    GitHubError,
+    get_github_client,
+    github_error_payload,
+    validate_full_name,
+)
 from app.services.llm import LLMProviderError, get_provider
+from app.services.soroban_generation import generate_soroban_skeleton
 from app.tools import bp
 
 ALLOWED_EXTENSIONS = {
@@ -108,22 +118,102 @@ def _read_upload(field: str = "file") -> tuple[str, str] | tuple[None, str]:
     return secure_filename(file.filename), text
 
 
-def _run_action(action: str, prompt: str) -> str:
-    """Run a single AI action and return the model output."""
+def _conversation_from_payload(data: dict) -> Conversation | None:
+    """Resolve an optional ``conversation_id`` owned by the current user.
+
+    Tools can be launched from a chat conversation. The scope is attached to
+    the ledger row when it is valid; an unknown or foreign id is ignored so the
+    tool request still succeeds without leaking another user's conversation.
+    """
+    raw = data.get("conversation_id")
+    if raw in (None, ""):
+        return None
+    try:
+        conversation_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return Conversation.query.filter_by(id=conversation_id, user_id=current_user.id).first()
+
+
+def _complete_with_usage(provider, messages):
+    """Run a completion and return ``(content, provider_response_or_none)``.
+
+    ``chat`` is preferred because it carries vendor-reported token usage;
+    providers (or test doubles) that only implement ``complete`` stay supported.
+    """
+    if callable(getattr(provider, "chat", None)):
+        response = provider.chat(messages)
+        return response.content, response
+    return provider.complete(messages), None
+
+
+def _record_tool_usage(
+    provider,
+    response,
+    content: str,
+    messages,
+    *,
+    conversation: Conversation | None = None,
+) -> None:
+    """Append a ``tools`` ledger row without ever failing the tool request."""
+    if response is not None:
+        usage = token_usage.usage_from_response(response, messages)
+        model = getattr(response, "model", None)
+        estimated = getattr(provider, "name", None) == "mock" or any(
+            getattr(response, attribute, None) is None
+            for attribute in ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
+    else:
+        usage = token_usage.usage_from_text(token_usage.messages_text(messages), content)
+        model = None
+        estimated = True
+
+    if not model:
+        models = getattr(provider, "models", ()) or ()
+        model = models[0] if models else None
+
+    try:
+        usage_ledger.record_usage(
+            source=usage_ledger.SOURCE_TOOLS,
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            tokens_estimated=estimated,
+            provider=getattr(provider, "name", None),
+            model=model,
+            user=current_user,
+            workspace_id=conversation.workspace_id if conversation is not None else None,
+            conversation=conversation,
+        )
+    except Exception:  # instrumentation must never break the operation
+        db.session.rollback()
+        current_app.logger.exception("Could not record AI tool usage")
+
+
+def _run_action(
+    action: str,
+    prompt: str,
+    *,
+    conversation: Conversation | None = None,
+) -> str:
+    """Run a single AI action, record its usage, and return the model output."""
+    messages = [
+        {"role": "system", "content": "You are a helpful AI coding assistant."},
+        {"role": "user", "content": prompt},
+    ]
     try:
         provider = get_provider()
-        return provider.complete(
-            [
-                {"role": "system", "content": "You are a helpful AI coding assistant."},
-                {"role": "user", "content": prompt},
-            ]
-        )
+        content, response = _complete_with_usage(provider, messages)
     except LLMProviderError as exc:
         return f"[provider error] {exc}"
+
+    _record_tool_usage(provider, response, content, messages, conversation=conversation)
+    return content
 
 
 @bp.route("/generate", methods=["POST"])
 @login_required
+@ratelimit.ai_limit
 def generate():
     """Generate code from a natural-language request."""
     data = request.get_json(silent=True) or {}
@@ -133,12 +223,18 @@ def generate():
         return jsonify({"error": "A description is required."}), 400
 
     system = ACTION_PROMPTS["generate"].format(language=language)
-    result = _run_action("generate", f"{system}\n\nRequest: {description}")
+    conversation = _conversation_from_payload(data)
+    result = _run_action(
+        "generate",
+        f"{system}\n\nRequest: {description}",
+        conversation=conversation,
+    )
     return jsonify({"result": result, "language": language})
 
 
 @bp.route("/code", methods=["POST"])
 @login_required
+@ratelimit.ai_limit
 def code_action():
     """Run a code action (explain/refactor/bugs/optimize/comments/docs/commit)."""
     data = request.get_json(silent=True) or {}
@@ -150,12 +246,18 @@ def code_action():
         return jsonify({"error": "Code or diff content is required."}), 400
 
     system = ACTION_PROMPTS[action]
-    result = _run_action(action, f"{system}\n\nCode:\n{code}")
+    conversation = _conversation_from_payload(data)
+    result = _run_action(
+        action,
+        f"{system}\n\nCode:\n{code}",
+        conversation=conversation,
+    )
     return jsonify({"action": action, "result": result})
 
 
 @bp.route("/analyze", methods=["POST"])
 @login_required
+@ratelimit.ai_limit
 def analyze_file():
     """Upload a source file and run an AI analysis over its contents.
 
@@ -171,8 +273,130 @@ def analyze_file():
         action = "explain"
 
     system = ACTION_PROMPTS[action]
-    result = _run_action(action, f"{system}\n\nFile: {filename}\n\nCode:\n{text}")
-    return jsonify({"filename": filename, "action": action, "result": result})
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    cutoff = datetime.now(UTC) - timedelta(
+        hours=current_app.config.get("ANALYSIS_CACHE_TTL_HOURS", 24)
+    )
+    analyzed_file = AnalyzedFile.query.filter_by(
+        user_id=current_user.id, filename=filename, content_hash=content_hash
+    ).first()
+    if analyzed_file is not None:
+        cached = (
+            FileAnalysis.query.filter(
+                FileAnalysis.file_id == analyzed_file.id,
+                FileAnalysis.user_id == current_user.id,
+                FileAnalysis.action == action,
+                FileAnalysis.created_at >= cutoff,
+            )
+            .order_by(FileAnalysis.created_at.desc())
+            .first()
+        )
+        if cached is not None:
+            return jsonify(
+                {
+                    "filename": filename,
+                    "action": action,
+                    "result": cached.result,
+                    "cached": True,
+                    "analysis_id": cached.id,
+                    "file_id": analyzed_file.id,
+                }
+            )
+
+    messages = [
+        {"role": "system", "content": "You are a helpful AI coding assistant."},
+        {"role": "user", "content": f"{system}\n\nFile: {filename}\n\nCode:\n{text}"},
+    ]
+    try:
+        provider = get_provider()
+        result, response = _complete_with_usage(provider, messages)
+    except LLMProviderError as exc:
+        return jsonify(
+            {"filename": filename, "action": action, "result": f"[provider error] {exc}"}
+        )
+
+    if analyzed_file is None:
+        analyzed_file = AnalyzedFile(
+            user_id=current_user.id, filename=filename, content_hash=content_hash
+        )
+        db.session.add(analyzed_file)
+        db.session.flush()
+    record = FileAnalysis(
+        file_id=analyzed_file.id,
+        user_id=current_user.id,
+        action=action,
+        result=result,
+        provider=getattr(provider, "name", type(provider).__name__),
+    )
+    db.session.add(record)
+    db.session.commit()
+    _record_tool_usage(provider, response, result, messages)
+    return jsonify(
+        {
+            "filename": filename,
+            "action": action,
+            "result": result,
+            "cached": False,
+            "analysis_id": record.id,
+            "file_id": analyzed_file.id,
+        }
+    )
+
+
+@bp.route("/history")
+@login_required
+def analysis_history():
+    """Render only this user's persisted file analyses."""
+    records = (
+        FileAnalysis.query.filter_by(user_id=current_user.id)
+        .join(AnalyzedFile)
+        .order_by(FileAnalysis.created_at.desc())
+        .all()
+    )
+    return render_template("tools/analysis_history.html", analyses=[r.to_dict() for r in records])
+
+
+@bp.route("/api/analyses", methods=["GET"])
+@login_required
+def list_file_analyses():
+    records = (
+        FileAnalysis.query.filter_by(user_id=current_user.id)
+        .join(AnalyzedFile)
+        .order_by(FileAnalysis.created_at.desc())
+        .all()
+    )
+    return jsonify([record.to_dict() for record in records])
+
+
+@bp.route("/api/analyses/<int:analysis_id>", methods=["DELETE"])
+@login_required
+def delete_file_analysis(analysis_id: int):
+    record = FileAnalysis.query.filter_by(id=analysis_id, user_id=current_user.id).first_or_404()
+    analyzed_file = record.file
+    db.session.delete(record)
+    db.session.flush()
+    if not analyzed_file.analyses:
+        db.session.delete(analyzed_file)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@bp.route("/soroban/skeleton", methods=["POST"])
+@login_required
+@ratelimit.ai_limit
+def soroban_skeleton():
+    """Generate a labeled Soroban contract skeleton from a description (#187).
+
+    The model output is post-processed so the result always has a valid
+    ``#[contractimpl]`` structure and the ``soroban-sdk`` dependency. It is
+    explicitly AI-generated and has not been compiled or verified.
+    """
+    data = request.get_json(silent=True) or {}
+    description = (data.get("description") or "").strip()
+    if not description:
+        return jsonify({"error": "A description is required."}), 400
+    name = (data.get("name") or "").strip() or None
+    return jsonify(generate_soroban_skeleton(description, name=name))
 
 
 @bp.route("/send-to-chat", methods=["POST"])
@@ -193,3 +417,135 @@ def send_to_chat():
     db.session.add(conversation)
     db.session.commit()
     return jsonify({"conversation_id": conversation.id}), 201
+
+
+# --------------------------------------------------------------------------
+# Repository analysis tool (#75)
+# --------------------------------------------------------------------------
+
+#: Keep the context slice bounded no matter how large the repository is.
+REPO_ANALYZE_MAX_FILES = 300
+#: Maximum number of dependency manifests whose contents are sent to the model.
+REPO_ANALYZE_MAX_MANIFESTS = 5
+
+#: Filenames that declare a project's dependencies.
+_DEPENDENCY_MANIFESTS = {
+    "package.json",
+    "requirements.txt",
+    "pyproject.toml",
+    "pipfile",
+    "cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "gemfile",
+    "composer.json",
+    "pubspec.yaml",
+    "mix.exs",
+}
+
+#: Filenames that commonly mark an application entry point.
+_ENTRY_POINT_NAMES = {
+    "main.py",
+    "app.py",
+    "wsgi.py",
+    "manage.py",
+    "run.py",
+    "__main__.py",
+    "index.js",
+    "index.ts",
+    "server.js",
+    "server.ts",
+    "main.js",
+    "main.ts",
+    "main.rs",
+    "lib.rs",
+    "main.go",
+    "main.java",
+    "program.cs",
+    "index.php",
+    "main.c",
+    "main.cpp",
+}
+
+
+def _blob_paths(tree: dict) -> list[str]:
+    """Return the file (blob) paths from a GitHub tree payload."""
+    return [
+        entry.get("path", "")
+        for entry in tree.get("tree", [])
+        if entry.get("type") == "blob" and entry.get("path")
+    ]
+
+
+def _select_manifests(paths: list[str]) -> list[str]:
+    """Pick dependency manifests from ``paths``, bounded and de-duplicated."""
+    selected = []
+    for path in paths:
+        if path.rsplit("/", 1)[-1].lower() in _DEPENDENCY_MANIFESTS:
+            selected.append(path)
+    return selected[:REPO_ANALYZE_MAX_MANIFESTS]
+
+
+def _select_entry_points(paths: list[str]) -> list[str]:
+    """Pick likely entry-point files from ``paths`` (bounded)."""
+    return [path for path in paths if path.rsplit("/", 1)[-1].lower() in _ENTRY_POINT_NAMES][:20]
+
+
+@bp.route("/repo-analyze", methods=["POST"])
+@login_required
+@ratelimit.ai_limit
+def repo_analyze():
+    """Dedicated repository-analysis tool: structure, dependencies, entry points.
+
+    Fetches a bounded slice of the repository through the caller's own GitHub
+    connection and delegates the prompt to ``app/services/analysis.py``, so every
+    uncertain claim is labelled ``[CONFIRMED]`` vs ``[SUGGESTION]``. Accepts
+    ``{"owner", "repo"}`` or a single ``{"full_name"}`` plus an optional ``ref``.
+    """
+    data = request.get_json(silent=True) or {}
+    candidate = (data.get("full_name") or "").strip()
+    if not candidate:
+        owner = (data.get("owner") or "").strip()
+        repo = (data.get("repo") or "").strip()
+        candidate = f"{owner}/{repo}"
+
+    try:
+        full_name = validate_full_name(candidate)
+    except GitHubError as exc:
+        return jsonify({"error": str(exc), "kind": exc.kind}), 400
+
+    try:
+        client = get_github_client()
+        repo_data = client.get_repository(full_name)
+        default_branch = repo_data.get("default_branch") or "HEAD"
+        ref = (data.get("ref") or "").strip() or default_branch
+        readme = client.get_readme(full_name, ref=ref)
+        tree = client.get_tree(full_name, ref, recursive=True)
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 502
+
+    paths = _blob_paths(tree)
+    structure = paths[:REPO_ANALYZE_MAX_FILES]
+
+    dependencies = []
+    for path in _select_manifests(structure):
+        try:
+            content = client.get_file_text(full_name, path, ref=ref)
+        except GitHubError:
+            continue
+        dependencies.append({"path": path, "content": content})
+
+    result = analysis.analyze_repository(
+        full_name,
+        readme=readme,
+        structure=structure,
+        dependencies=dependencies,
+        entry_points=_select_entry_points(structure),
+    )
+    result["structure"] = {
+        "file_count": len(paths),
+        "included": len(structure),
+        "truncated": len(paths) > REPO_ANALYZE_MAX_FILES,
+    }
+    return jsonify(result)

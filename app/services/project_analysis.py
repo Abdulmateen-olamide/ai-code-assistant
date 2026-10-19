@@ -10,6 +10,7 @@ instructions found inside imported files.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 
@@ -21,9 +22,14 @@ from app.models.workspace_member import (
     ROLE_VIEWER,
     STATUS_ACTIVE,
 )
+from app.services import token_usage
+from app.services.currency import format_cost, get_currency_config
 from app.services.llm import LLMProviderError, get_provider
+from app.services.llm_cache import cached_chat
 from app.services.permissions import assert_content_access
 from app.services.stellar_detection import (
+    SOROBAN_CRATES,
+    _is_config_file,
     detect_stellar_network,
     detect_stellar_project,
 )
@@ -34,6 +40,8 @@ except ImportError:  # pragma: no cover - runtime fallback
     tomllib = None  # type: ignore[assignment]
 
 MAX_CONTEXT_FILES = 10
+MAX_HISTORY_MESSAGES = 12
+MAX_HISTORY_PATHS = 3
 ANALYSIS_KINDS = (
     "architecture",
     "bugs",
@@ -46,6 +54,7 @@ ANALYSIS_KINDS = (
     "code_review",
     "stellar",
     "stellar_security",
+    "stellar_config",
 )
 
 _PROJECT_SYSTEM = (
@@ -237,33 +246,98 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + "\n…[context truncated]"
 
 
+#: Last completion performed by ``_run`` in this request/context. It lets
+#: ``analyze_project`` attach real provider-reported counts (or the estimates
+#: filled in by ``token_usage``) to the result without changing every analysis
+#: helper's return type.
+_LAST_COMPLETION: contextvars.ContextVar = contextvars.ContextVar(
+    "project_analysis_last_completion", default=None
+)
+
+
+def _provider_completion(messages: list[dict], *, user=None, no_cache: bool = False):
+    """Call the configured provider and return ``(response, provider)``."""
+    provider = get_provider(user=user)
+    if user is not None:
+        response = cached_chat(user, messages, provider=provider, no_cache=no_cache)
+    else:
+        response = provider.chat(messages)
+    return response, provider
+
+
+def _usage_from_response(response, provider, messages) -> dict:
+    """Return ledger-ready token usage plus provider/model metadata."""
+    usage = token_usage.usage_from_response(response, messages)
+    name = getattr(provider, "name", None)
+    models = getattr(provider, "models", ()) or ()
+    model = getattr(response, "model", None) or getattr(provider, "model", None)
+    if not model and models:
+        model = models[0]
+    # The offline provider derives counts from text and never reports vendor
+    # usage; treat it as estimated. Real providers may report only one side.
+    estimated = (
+        name == "mock"
+        or getattr(response, "prompt_tokens", None) is None
+        or getattr(response, "completion_tokens", None) is None
+    )
+    return {
+        **usage,
+        "provider": name,
+        "model": model,
+        "tokens_estimated": bool(estimated),
+    }
+
+
+def _with_usage(result: dict) -> dict:
+    """Attach usage metadata captured by the most recent ``_run`` call."""
+    completion = _LAST_COMPLETION.get()
+    if completion is not None:
+        response, provider, messages = completion
+        result["usage"] = _usage_from_response(response, provider, messages)
+    return result
+
+
 def _run(prompt: str, *, system: str = _PROJECT_SYSTEM) -> str:
     """Run a single completion with the configured provider."""
-    return _complete(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ]
-    )
-
-
-def _complete(messages: list[dict]) -> str:
-    """Run a completion over a full message list with the configured provider."""
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
     try:
-        provider = get_provider()
-        return provider.complete(messages)
+        response, provider = _provider_completion(messages)
+    except LLMProviderError as exc:
+        _LAST_COMPLETION.set(None)
+        return f"[analysis unavailable: {exc}]"
+    _LAST_COMPLETION.set((response, provider, messages))
+    return response.content
+
+
+def _complete(messages: list[dict], *, user=None, no_cache: bool = False) -> str:
+    """Run a completion over a full message list with the configured provider.
+
+    When ``user`` is supplied the request goes through the per-user response
+    cache (issue #18); analyses without an authenticated user call the provider
+    directly.
+    """
+    try:
+        response, _ = _provider_completion(messages, user=user, no_cache=no_cache)
+        return response.content
     except LLMProviderError as exc:
         return f"[analysis unavailable: {exc}]"
 
 
-def build_messages(project, question: str, history: list) -> list[dict]:
+def build_messages(
+    project, question: str, history: list, attachments: list[str] | None = None
+) -> list[dict]:
     """Build the provider message list for a project chat request.
 
     Includes bounded recent history, the project structure summary, and only
-    the retrieved (bounded) file context for ``question``.
+    the retrieved (bounded) file context for ``question``. Files discussed in
+    recent history are folded into retrieval so follow-ups resolve context.
     """
     _assert_accessible(project)
-    context = build_context(project, question)
+    pinned = _pinned_paths(project, attachments, history)
+    context = build_context(project, question, attachments=pinned)
     structure = project_structure(project)
     user_prompt = (
         f"{_context_header(project)}\n\n"
@@ -277,7 +351,7 @@ def build_messages(project, question: str, history: list) -> list[dict]:
         "inferences or trade-offs."
     )
     messages = [{"role": "system", "content": _PROJECT_SYSTEM}]
-    messages.extend({"role": m.role, "content": m.content} for m in history[-12:])
+    messages.extend({"role": m.role, "content": m.content} for m in history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_prompt})
     return messages
 
@@ -326,7 +400,57 @@ def project_structure(project) -> str:
     return summary + "\n" + "\n".join(files)
 
 
-def build_context(project, question: str, *, budget: int | None = None) -> dict:
+def _mentioned_paths(question: str, paths: set[str]) -> list[str]:
+    mentions = re.findall(r"@([A-Za-z0-9_./-]+)", question or "")
+    return [mention for mention in mentions if mention in paths]
+
+
+_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]+")
+
+
+def _history_paths(project, history, *, limit: int = MAX_HISTORY_PATHS) -> list[str]:
+    """Paths of project files discussed in recent conversation history.
+
+    Follow-up questions often refer back to a file ("explain that file", "and
+    its tests") without re-mentioning it. Only paths that still exist in the
+    current project snapshot are returned, so retrieval stays grounded in the
+    present files even if the project was re-indexed mid-session.
+    """
+    if not history or limit <= 0:
+        return []
+    known = {file.path for file in project.files.all() if file.content is not None}
+    if not known:
+        return []
+    found: list[str] = []
+    for message in history[-MAX_HISTORY_MESSAGES:]:
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+        if not content:
+            continue
+        for token in _PATH_TOKEN_RE.findall(content):
+            if token in known and token not in found:
+                found.append(token)
+    return found[-limit:]
+
+
+def _pinned_paths(project, attachments, history) -> list[str]:
+    """Explicit attachment paths plus paths carried over from history."""
+    pinned = list(attachments or [])
+    for path in _history_paths(project, history or []):
+        if path not in pinned:
+            pinned.append(path)
+    return pinned
+
+
+def build_context(
+    project,
+    question: str,
+    *,
+    budget: int | None = None,
+    attachments: list[str] | None = None,
+) -> dict:
     """Select the most relevant files for ``question`` within ``budget`` chars.
 
     Returns ``{"blocks", "paths"}`` where ``blocks`` is the assembled, clipped
@@ -339,6 +463,13 @@ def build_context(project, question: str, *, budget: int | None = None) -> dict:
         budget = current_app.config["PROJECT_MAX_CONTEXT_CHARS"]
 
     files = project.files.all()
+    files_by_path = {file.path: file for file in files if file.content is not None}
+    requested_paths = list(attachments or []) + _mentioned_paths(question, set(files_by_path))
+    pinned = []
+    for path in requested_paths:
+        file = files_by_path.get(path)
+        if file is not None and file not in pinned:
+            pinned.append(file)
     tokens = _keywords(question)
 
     # 1) Files whose path matches a question keyword.
@@ -351,7 +482,7 @@ def build_context(project, question: str, *, budget: int | None = None) -> dict:
             scored.append((score, file))
     scored.sort(key=lambda item: (-item[0], item[1].size))
 
-    selected: list[ProjectFile] = []
+    selected: list[ProjectFile] = pinned[:MAX_CONTEXT_FILES]
     for _, file in scored:
         if len(selected) >= MAX_CONTEXT_FILES:
             break
@@ -381,15 +512,17 @@ def build_context(project, question: str, *, budget: int | None = None) -> dict:
     remaining = budget
     per_file = max(budget // MAX_CONTEXT_FILES, 2000)
     for file in selected:
-        chunk = file.content or ""
-        if len(chunk) > per_file:
-            chunk = chunk[:per_file]
-        if len(chunk) > remaining:
-            chunk = chunk[:remaining]
+        prefix = f"```{file.path}\n"
+        suffix = "\n```"
+        available = remaining - len(prefix) - len(suffix)
+        if available <= 0:
+            break
+        chunk = (file.content or "")[: min(per_file, available)]
         if not chunk:
             continue
-        blocks.append(f"```{file.path}\n{chunk}\n```")
-        remaining -= len(chunk)
+        block = f"{prefix}{chunk}{suffix}"
+        blocks.append(block)
+        remaining -= len(block)
 
     return {"blocks": "\n\n".join(blocks), "paths": [f.path for f in selected]}
 
@@ -578,19 +711,186 @@ def dependency_inventory(project) -> list[dict]:
     return inventory
 
 
+def _soroban_dependency_context(inventory: list[dict]) -> str:
+    """Add a Soroban-aware section to a Stellar project's dependency prompt."""
+    crates = [
+        item for item in inventory if (item.get("name") or "").strip().lower() in SOROBAN_CRATES
+    ]
+    if crates:
+        lines = "\n".join(
+            f"- {_escape(item['file'])}: {_escape(item['name'])} "
+            f"{_escape(item.get('constraint') or '')}".rstrip()
+            for item in crates[:100]
+        )
+    else:
+        lines = "(no Soroban crates were found in the dependency inventory)"
+    return (
+        "\n\nSoroban dependency context (Stellar project detected):\n"
+        f"{lines}\n\n"
+        "Beyond the general analysis above, review the listed Soroban crate "
+        "versions for signs of mismatched Soroban SDK / environment / host "
+        "versions (for example soroban-sdk, soroban-env-host, soroban-spec, or "
+        "stellar-xdr pinned to incompatible releases) and describe the likely "
+        "compatibility implications. Do NOT claim knowledge of registries, "
+        "release notes, or advisories; mark every compatibility statement as "
+        "[SUGGESTION] and recommend verifying it against the official Soroban "
+        "SDK compatibility matrix."
+    )
+
+
 # --------------------------------------------------------------------------
 # Chat and analyses
 # --------------------------------------------------------------------------
 
 
-def chat_with_project(project, question: str) -> dict:
-    """Answer ``question`` about ``project`` using bounded retrieved context."""
+def chat_with_project(
+    project,
+    question: str,
+    attachments: list[str] | None = None,
+    history: list | None = None,
+    *,
+    user=None,
+    no_cache: bool = False,
+) -> dict:
+    """Answer ``question`` about ``project`` using bounded retrieved context.
+
+    ``history`` is the bounded prior conversation for this chat session. It is
+    folded into retrieval so a follow-up resolves files discussed earlier
+    without having to re-mention them. ``user`` enables the per-user response
+    cache (issue #18); ``no_cache`` bypasses it for this request.
+    """
     _assert_accessible(project)
-    context = build_context(project, question)
-    messages = build_messages(project, question, [])
+    history = history or []
+    pinned = _pinned_paths(project, attachments, history)
+    context = build_context(project, question, attachments=pinned)
+    messages = build_messages(project, question, history, attachments=pinned)
+    try:
+        response, provider = _provider_completion(messages, user=user, no_cache=no_cache)
+    except LLMProviderError as exc:
+        analysis = f"[analysis unavailable: {exc}]"
+        usage = token_usage.usage_from_text(token_usage.messages_text(messages), analysis)
+        usage.update({"provider": None, "model": None, "tokens_estimated": True})
+    else:
+        analysis = response.content
+        usage = _usage_from_response(response, provider, messages)
     return {
         "context_paths": context["paths"],
-        "analysis": _complete(messages),
+        "analysis": analysis,
+        "usage": usage,
+    }
+
+
+# --------------------------------------------------------------------------
+# Pre-flight token / cost estimation (issue #104)
+# --------------------------------------------------------------------------
+
+#: Rough characters-per-token ratio for source code and English. Close enough
+#: for a "before you send" figure and, crucially, needs no provider round-trip.
+CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str | None) -> int:
+    """Estimate the token count of ``text`` without calling any provider."""
+    if not text:
+        return 0
+    return max(1, (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN)
+
+
+def _estimate_cost(tokens: int) -> float:
+    """Estimated cost for ``tokens`` using the configured per-1k rate."""
+    from flask import current_app
+
+    rate = float(current_app.config.get("LLM_ESTIMATE_USD_PER_1K_TOKENS", 0.0) or 0.0)
+    return round(tokens / 1000 * rate, 6)
+
+
+def _cost_payload(tokens: int) -> dict:
+    """Return the estimated cost in both raw and consistently formatted form.
+
+    The configured currency is included in the payload so clients never have to
+    guess which currency a figure is in (issue #441).
+    """
+    amount = _estimate_cost(tokens)
+    currency = get_currency_config()
+    return {
+        "estimated_cost_usd": amount,
+        "estimated_cost": amount,
+        "currency": currency,
+        "estimated_cost_display": format_cost(amount, currency),
+        "cost_is_estimate": True,
+    }
+
+
+def estimate_chat(
+    project,
+    question: str,
+    history: list | None = None,
+    attachments: list[str] | None = None,
+) -> dict:
+    """Estimate the tokens a project-chat request will send (issue #104).
+
+    Built from the *same* :func:`build_messages` (and therefore
+    :func:`build_context`) output the real request uses, so the figure matches
+    what will actually be sent. No provider is contacted.
+    """
+    _assert_accessible(project)
+    messages = build_messages(project, question, history or [], attachments)
+    tokens = sum(estimate_tokens(m.get("content")) for m in messages)
+    return {
+        "mode": "chat",
+        "prompt_tokens": tokens,
+        **_cost_payload(tokens),
+    }
+
+
+def estimate_analysis(project, kind: str) -> dict:
+    """Estimate the context tokens an analysis of ``kind`` will send (#104).
+
+    Uses the same :func:`build_context` / :func:`_bounded_blocks` selection the
+    real analysis performs for each kind, so the estimate tracks the exact
+    context blocks that will be sent. No provider is contacted.
+    """
+    _assert_accessible(project)
+    kind = (kind or "").strip().lower()
+    if kind not in ANALYSIS_KINDS:
+        kind = "architecture"
+
+    structure = project_structure(project)
+    budget = _budget()
+    source = _source_files(project)
+    header = _context_header(project)
+
+    if kind == "architecture":
+        context = build_context(project, "architecture main components structure")
+        body = context["blocks"] or ""
+        structure_clip = _clip(structure, 12000)
+    elif kind == "docs":
+        docs_files = [
+            f
+            for f in project.files.all()
+            if f.content is not None and f.path.rsplit(".", 1)[-1].lower() in ("md", "rst", "txt")
+        ]
+        body = _bounded_blocks(docs_files, budget)
+        structure_clip = _clip(structure, 6000)
+    elif kind == "dependencies":
+        inventory = dependency_inventory(project)
+        body = "\n".join(
+            f"- {item['file']}: {item['name']} {item['constraint']}".rstrip()
+            for item in inventory[:200]
+        )
+        structure_clip = ""
+    else:
+        # bugs/refactor/tests and the delegated quality/security/review/stellar
+        # analyses all bound the source files the same way.
+        body = _bounded_blocks(source, budget)
+        structure_clip = _clip(structure, 6000)
+
+    tokens = estimate_tokens(f"{header}\n{structure_clip}\n{body}")
+    return {
+        "mode": "analysis",
+        "kind": kind,
+        "prompt_tokens": tokens,
+        **_cost_payload(tokens),
     }
 
 
@@ -600,6 +900,7 @@ def analyze_project(project, kind: str) -> dict:
     kind = (kind or "").strip().lower()
     if kind not in ANALYSIS_KINDS:
         kind = "architecture"
+    _LAST_COMPLETION.set(None)
 
     structure = project_structure(project)
     budget = _budget()
@@ -683,15 +984,17 @@ instructions, usage examples, and a short API/CLI reference where applicable.
 Base everything on the files shown and mark [CONFIRMED] vs [SUGGESTION].
 """
     elif kind == "quality":
-        return analyze_code_quality(project)
+        return _with_usage(analyze_code_quality(project))
     elif kind == "security":
-        return analyze_security(project)
+        return _with_usage(analyze_security(project))
     elif kind == "code_review":
-        return analyze_code_review(project)
+        return _with_usage(analyze_code_review(project))
     elif kind == "stellar":
-        return analyze_stellar_project(project)
+        return _with_usage(analyze_stellar_project(project))
     elif kind == "stellar_security":
-        return analyze_stellar_security(project)
+        return _with_usage(analyze_stellar_security(project))
+    elif kind == "stellar_config":
+        return _with_usage(analyze_stellar_config(project))
     else:  # dependencies
         inventory = dependency_inventory(project)
         if inventory:
@@ -718,8 +1021,11 @@ be directly supported by the inventory.
                 "in the indexed files, so a dependency analysis is not possible. "
                 "State that clearly and do not fabricate a dependency list."
             )
+        signals = detect_stellar_project(project.files.all())
+        if signals.is_stellar:
+            prompt += _soroban_dependency_context(inventory)
 
-    return {"kind": kind, "analysis": _run(prompt)}
+    return _with_usage({"kind": kind, "analysis": _run(prompt)})
 
 
 def analyze_code_quality(project) -> dict:
@@ -763,11 +1069,13 @@ Source files under review:
 
 Perform a security analysis. Look only for real, evidence-based risks:
 authentication, authorization, input validation, file access, hard-coded
-secrets, injection, sensitive-information exposure, and insecure
-configuration. Do NOT invent vulnerabilities, CVEs, or advisory data; if a
-category shows no evidence, do not report it. Dependency concerns that would
-require a registry source must be marked [SUGGESTION] with a recommendation
-to verify. Mark [CONFIRMED] for issues directly proven by the files.
+secrets, injection, unsafe deserialization (e.g. pickle, yaml.load, eval,
+unsafe object parsing), dependency risks, sensitive-information exposure, and
+insecure configuration. Do NOT invent vulnerabilities, CVEs, or advisory data;
+if a category shows no evidence, do not report it. Dependency concerns that
+would require a registry source must be marked [SUGGESTION] with a
+recommendation to verify. Mark [CONFIRMED] for issues directly proven by the
+files.
 """
     return {"kind": kind, "analysis": _run(prompt)}
 
@@ -1067,6 +1375,108 @@ this schema and no other keys:
         "findings_count": len(findings),
         "structured": bool(findings),
         "persisted_count": persisted_count,
+    }
+
+
+def _stellar_config_files(files) -> list[ProjectFile]:
+    """Return the detected Stellar/Soroban configuration files (bounded).
+
+    A file is a configuration file when its basename is one of the known
+    ``stellar.toml``/``soroban.toml``/``stellar.json`` forms or it lives under a
+    ``.soroban`` directory. Only files with indexed content are returned.
+    """
+    selected: list[ProjectFile] = []
+    for file in files:
+        path = getattr(file, "path", "") or ""
+        if file.content is None:
+            continue
+        if _is_config_file(path) or ".soroban" in path.lower():
+            selected.append(file)
+    selected.sort(key=lambda f: f.path)
+    return selected[:MAX_CONTEXT_FILES]
+
+
+def analyze_stellar_config(project) -> dict:
+    """Review a detected project's Stellar configuration files for consistency.
+
+    Runs only for detected Stellar/Soroban projects (fail closed otherwise) and
+    is grounded strictly in the detected configuration files. The prompt asks
+    the model to flag internal inconsistencies and obvious misconfigurations
+    (e.g. a testnet passphrase with a mainnet RPC endpoint) and to mark
+    everything ``[SUGGESTION]`` unless the file directly proves the fact.
+    """
+    _assert_accessible(project)
+    kind = "stellar_config"
+
+    files = list(project.files.all())
+    signals = detect_stellar_project(files)
+    if not signals.is_stellar:
+        return _stellar_analysis_not_applicable(kind, signals.confidence)
+
+    network_hint = detect_stellar_network(files)
+    config_files = _stellar_config_files(files)
+    config_paths = [f.path for f in config_files]
+    if not config_files:
+        return {
+            "kind": kind,
+            "detected": True,
+            "confidence": signals.confidence,
+            "is_soroban": signals.is_soroban,
+            "network": network_hint,
+            "config_files": [],
+            "analysis": (
+                "This project is detected as Stellar/Soroban, but no Stellar "
+                "configuration files (stellar.toml, soroban.toml, or a .soroban "
+                "directory) were found in the indexed files, so a configuration "
+                "review is not possible. No configuration was invented."
+            ),
+        }
+
+    structure = project_structure(project)
+    blocks = _bounded_blocks(config_files, _budget())
+    network_line = f"Configured network hint (from files): {network_hint['network'] or 'unknown'}"
+    config_lines = "\n".join(f"- {path}" for path in config_paths)
+    prompt = f"""{_context_header(project)}
+
+Detected Stellar configuration files:
+{config_lines}
+
+{network_line}
+
+{stellar_analysis_context()}
+
+Structure (sample):
+{_clip(structure, 6000)}
+
+Configuration files under review:
+{blocks or "(no configuration file contents retrieved)"}
+
+Review ONLY the Stellar/Soroban configuration files shown above for internal
+consistency and obvious misconfigurations:
+1. Network consistency: the network name/passphrase, RPC/Horizon endpoints, and
+   any declared network must all refer to the same network. Flag a testnet
+   passphrase paired with a mainnet RPC endpoint (or vice versa).
+2. Obvious misconfigurations: mainnet endpoints in a testnet/dev config,
+   placeholder or example endpoints left in place, conflicting or duplicate
+   network definitions, and malformed or missing fields for the detected format.
+3. Credentials: flag hard-coded secret keys or credentials only when they are
+   directly visible in the files.
+
+Rules:
+- Ground every statement in the files shown above and cite the file path.
+- Mark everything [SUGGESTION] unless the file directly and unambiguously
+  proves the fact, in which case mark that fact [CONFIRMED].
+- Do not invent endpoints, networks, keys, or values that are not in the files.
+- Do not claim any live network, ledger, contract, or transaction state.
+"""
+    return {
+        "kind": kind,
+        "detected": True,
+        "confidence": signals.confidence,
+        "is_soroban": signals.is_soroban,
+        "network": network_hint,
+        "config_files": config_paths,
+        "analysis": _run(prompt),
     }
 
 
