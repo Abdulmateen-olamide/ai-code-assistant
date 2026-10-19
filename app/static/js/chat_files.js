@@ -1,0 +1,200 @@
+// AI Code Assistant — multi-file project tree in the chat sidebar.
+// Renders the user's workspaces → projects → files, opens a file with the
+// shared syntax highlighter (js/highlight.js), and offers an "Ask about this
+// file" action.
+
+(function () {
+  "use strict";
+
+  var treeEl = document.getElementById("project-file-tree");
+  if (!treeEl) return;
+  var viewerEl = document.getElementById("project-file-viewer");
+  var metaEl = document.getElementById("project-file-meta");
+  var contentEl = document.getElementById("project-file-content");
+  var backBtn = document.getElementById("project-file-back");
+  var askBtn = document.getElementById("project-file-ask");
+  var inputEl = document.getElementById("chat-input");
+
+  function escapeHtml(text) {
+    var div = document.createElement("div");
+    div.textContent = text == null ? "" : String(text);
+    return div.innerHTML;
+  }
+
+  function humanSize(bytes) {
+    var value = Number(bytes) || 0;
+    if (value < 1024) return value + " B";
+    if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB";
+    return (value / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  // Binary/oversized badges shown on tree rows and the viewer header (#95).
+  function fileBadges(file) {
+    if (file.is_binary) {
+      return '<span class="file-badge file-badge-binary">binary</span>';
+    }
+    if (file.searchable === false) {
+      return '<span class="file-badge file-badge-oversized">oversized</span>';
+    }
+    return "";
+  }
+
+  function formatDate(iso) {
+    if (!iso) return "";
+    var date = new Date(iso);
+    return isNaN(date.getTime()) ? "" : date.toLocaleDateString();
+  }
+
+  // Render the file through the shared highlighter: a `pre > code.language-*`
+  // node that `AICASyntaxHighlight.apply` recognizes. It uses the real
+  // highlight.js grammar when one is vendored, and a small built-in tokenizer
+  // otherwise, so every stored language highlights consistently (issue #94).
+  function renderContent(content, language) {
+    var codeClass = language ? ' class="language-' + escapeHtml(language) + '"' : "";
+    contentEl.innerHTML = "<code" + codeClass + ">" + escapeHtml(content || "") + "</code>";
+    if (window.AICASyntaxHighlight) window.AICASyntaxHighlight.apply(contentEl);
+  }
+
+  function get(url) {
+    return fetch(url, { headers: { Accept: "application/json" } }).then(function (response) {
+      return response.json().then(function (data) {
+        if (!response.ok) {
+          throw new Error((data && data.error) || "Request failed (" + response.status + ").");
+        }
+        return data;
+      });
+    });
+  }
+
+  function renderWorkspaces(workspaces) {
+    treeEl.innerHTML = "";
+    if (!workspaces.length) {
+      treeEl.innerHTML =
+        '<p class="sidebar-empty">No workspaces yet. Import a project in Workspaces to browse files here.</p>';
+      return;
+    }
+
+    workspaces.forEach(function (workspace) {
+      var wsEl = document.createElement("details");
+      wsEl.className = "file-tree-workspace";
+      wsEl.open = true;
+      var wsSummary = document.createElement("summary");
+      wsSummary.textContent = workspace.name;
+      wsEl.appendChild(wsSummary);
+
+      var body = document.createElement("div");
+      if (!workspace.projects.length) {
+        body.innerHTML = '<p class="sidebar-empty">No projects in this workspace.</p>';
+      }
+
+      workspace.projects.forEach(function (project) {
+        var pEl = document.createElement("details");
+        pEl.className = "file-tree-project";
+        pEl.open = true;
+        var pSummary = document.createElement("summary");
+        pSummary.textContent = project.name;
+        if (project.status !== "ready") {
+          var tag = document.createElement("span");
+          tag.className = "tag";
+          tag.textContent = project.status;
+          pSummary.appendChild(document.createTextNode(" "));
+          pSummary.appendChild(tag);
+        }
+        pEl.appendChild(pSummary);
+
+        var filesEl = document.createElement("ul");
+        filesEl.className = "file-tree-files";
+        if (project.status !== "ready") {
+          filesEl.innerHTML = '<li class="sidebar-empty">Indexing…</li>';
+        } else if (!project.files.length) {
+          filesEl.innerHTML = '<li class="sidebar-empty">No files.</li>';
+        } else {
+          project.files.forEach(function (file) {
+            var li = document.createElement("li");
+            li.className = "file-tree-file";
+            li.dataset.project = project.id;
+            li.dataset.path = file.path;
+            li.dataset.language = file.language || "";
+            li.innerHTML =
+              '<span class="file-tree-name">' + escapeHtml(file.path) + "</span>" +
+              fileBadges(file) +
+              '<span class="file-tree-meta">' + humanSize(file.size) +
+              (file.created_at ? " · " + formatDate(file.created_at) : "") + "</span>";
+            filesEl.appendChild(li);
+          });
+          if (project.truncated) {
+            var note = document.createElement("li");
+            note.className = "sidebar-empty";
+            note.textContent = "Showing the first " + project.files.length + " files.";
+            filesEl.appendChild(note);
+          }
+        }
+        pEl.appendChild(filesEl);
+        body.appendChild(pEl);
+      });
+
+      wsEl.appendChild(body);
+      treeEl.appendChild(wsEl);
+    });
+  }
+
+  function loadTree() {
+    get("/chat/api/project-files")
+      .then(renderWorkspaces)
+      .catch(function (error) {
+        treeEl.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
+      });
+  }
+
+  function showFile(projectId, path) {
+    viewerEl.hidden = false;
+    treeEl.hidden = true;
+    metaEl.textContent = path;
+    contentEl.textContent = "Loading…";
+
+    get(
+      "/workspaces/api/projects/" + projectId + "/file?path=" + encodeURIComponent(path),
+    )
+      .then(function (data) {
+        metaEl.innerHTML =
+          escapeHtml(data.path) + " · " + humanSize(data.size) +
+          (data.language ? " · " + escapeHtml(data.language) : "") +
+          " " + fileBadges(data);
+        if (data.is_binary || !data.searchable) {
+          contentEl.textContent = data.is_binary
+            ? "This file is binary; its contents are unavailable."
+            : "This file is too large to display; its contents are unavailable.";
+        } else {
+          renderContent(data.content, data.language);
+        }
+      })
+      .catch(function (error) {
+        contentEl.textContent = error.message;
+      });
+
+    askBtn.dataset.project = projectId;
+    askBtn.dataset.path = path;
+  }
+
+  function hideViewer() {
+    viewerEl.hidden = true;
+    treeEl.hidden = false;
+  }
+
+  treeEl.addEventListener("click", function (event) {
+    var item = event.target.closest(".file-tree-file");
+    if (!item) return;
+    showFile(item.dataset.project, item.dataset.path);
+  });
+
+  backBtn.addEventListener("click", hideViewer);
+
+  askBtn.addEventListener("click", function () {
+    var path = askBtn.dataset.path;
+    if (!path || !inputEl) return;
+    inputEl.value = "Explain the file `" + path + "` and summarize what it does.";
+    inputEl.focus();
+  });
+
+  document.addEventListener("DOMContentLoaded", loadTree);
+})();

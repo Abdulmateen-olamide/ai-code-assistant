@@ -12,6 +12,7 @@ Pages (HTML)
     /github/repos/<owner>/<repo>/issues/<n> issue detail
     /github/repos/<owner>/<repo>/pulls      pull request list
     /github/repos/<owner>/<repo>/pulls/<n>  pull request detail
+    /github/repos/lookup                    repository lookup form
 
 API (JSON)
     /github/api/status                      connection status
@@ -23,9 +24,14 @@ API (JSON)
     /github/api/repos/.../issues/<n>        single issue + AI analysis
     /github/api/repos/.../pulls             pull request list
     /github/api/repos/.../pulls/<n>         single PR + AI analysis
+    /github/api/repos/.../compare/<a>...<b> diff between two refs
     /github/api/repos/.../analyze-file      AI analysis of one file
+    /github/api/repos/lookup                resolve owner/name to a repository
 """
 
+import logging
+import re
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import requests
@@ -35,19 +41,35 @@ from flask_login import current_user, login_required
 from app.extensions import db
 from app.github import bp
 from app.models import GithubAccount
-from app.services import analysis
+from app.services import analysis, ratelimit
 from app.services.github import (
     GITHUB_AUTHORIZE_URL,
     GITHUB_TOKEN_URL,
+    PAGE_SIZE_DEFAULT,
+    PAGE_SIZE_MAX,
     GitHubClient,
     GitHubError,
+    GitHubPage,
     get_github_client,
+    github_error_payload,
     issue_payload,
     pull_request_payload,
     repo_payload,
+    revoke_github_token,
     validate_full_name,
     validate_path,
 )
+
+#: Shape of a valid ``owner/name`` repository identifier.
+_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+#: Cap on the number of files whose last commit is resolved for the browser.
+#: The lookups are batched into one GraphQL request, but keeping the count
+#: bounded avoids pathological query sizes on very large repositories.
+MAX_TREE_LAST_COMMITS = 100
+
+logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------
 # OAuth connection
@@ -57,9 +79,39 @@ from app.services.github import (
 @bp.route("/")
 @login_required
 def index():
-    """Dashboard showing the user's GitHub connection status."""
+    """Dashboard showing the user's GitHub connection status.
+
+    Displays the scopes GitHub actually *granted* (issue #57), falling back to
+    the scopes captured at connect time, and warns when the ``repo`` scope is
+    missing (private repositories will not load).
+    """
     account = GithubAccount.query.filter_by(user_id=current_user.id).first()
-    return render_template("github/index.html", account=account)
+    granted_scopes = _granted_scopes(account)
+    repo_scope_missing = bool(granted_scopes) and "repo" not in granted_scopes
+    return render_template(
+        "github/index.html",
+        account=account,
+        granted_scopes=granted_scopes,
+        repo_scope_missing=repo_scope_missing,
+    )
+
+
+def _granted_scopes(account: GithubAccount | None) -> list[str]:
+    """Return the scopes to display for the dashboard.
+
+    Prefers a live ``GET /user`` read (the token's current grants) and falls
+    back to the scopes stored at connect time. Best-effort: a failed read never
+    breaks the dashboard, and the value is used for display only — never for an
+    authorization decision (issue #57).
+    """
+    if account is None:
+        return []
+    stored = [scope.strip() for scope in (account.scopes or "").split(",") if scope.strip()]
+    try:
+        live = _client().get_granted_scopes()
+    except GitHubError:
+        live = []
+    return live or stored
 
 
 @bp.route("/connect")
@@ -82,18 +134,30 @@ def connect():
 @login_required
 def callback():
     """Exchange the authorization code for a token and store the connection."""
+    key = _callback_limit_key()
+    blocked, retry_after = _callback_blocked()
+    if blocked:
+        return _throttled_response(retry_after)
+
     error = request.args.get("error")
     if error:
-        flash(f"GitHub authorization failed: {error}", "error")
+        ratelimit.record(key)
+        if error == "access_denied":
+            # The user cancelled GitHub's consent screen: show the dedicated
+            # denial page instead of a red "authorization failed" banner.
+            return render_template("github/index.html", account=None, denied=True)
+        flash("GitHub authorization failed. Please try again.", "error")
         return redirect(url_for("github.index"))
 
     state = request.args.get("state")
     if state != _get_state():
+        ratelimit.record(key)
         flash("GitHub authorization failed: state mismatch.", "error")
         return redirect(url_for("github.index"))
 
     code = request.args.get("code")
     if not code:
+        ratelimit.record(key)
         flash("GitHub authorization failed: missing code.", "error")
         return redirect(url_for("github.index"))
 
@@ -112,9 +176,26 @@ def callback():
     try:
         token_data = response.json()
     except ValueError:
+        token_data = None
+    # GitHub answers a failed exchange with a JSON object, but a proxy or
+    # gateway in front of it can return anything (``null``, a list, HTML).
+    # Normalize to a dict so a malformed body degrades to the friendly
+    # failure path instead of raising.
+    if not isinstance(token_data, dict):
         token_data = {}
     if response.status_code >= 400 or "access_token" not in token_data:
-        message = token_data.get("error_description") or token_data.get("error") or response.text
+        ratelimit.record(key)
+        # Only GitHub's own structured error fields are surfaced to the user.
+        # The raw response body may be a gateway HTML page carrying internal
+        # detail, so it is logged rather than flashed (issue #82).
+        message = token_data.get("error_description") or token_data.get("error")
+        if not message:
+            logger.warning(
+                "GitHub token exchange failed (HTTP %s): %s",
+                response.status_code,
+                response.text[:200],
+            )
+            message = "GitHub did not return a token. Please try again."
         flash(f"GitHub authorization failed: {message}", "error")
         return redirect(url_for("github.index"))
 
@@ -123,7 +204,9 @@ def callback():
     try:
         user = client.get_user()
     except GitHubError as exc:
-        flash(f"Could not verify your GitHub account: {exc}", "error")
+        ratelimit.record(key)
+        current_app.logger.warning("GitHub user verification failed: %s", exc)
+        flash("Could not verify your GitHub account. Please try again.", "error")
         return redirect(url_for("github.index"))
 
     account = GithubAccount.query.filter_by(user_id=current_user.id).first()
@@ -132,9 +215,20 @@ def callback():
         db.session.add(account)
     account.github_user_id = user["id"]
     account.github_username = user.get("login", "")
-    account.scopes = token_data.get("scope", "")
+    # Prefer the scopes GitHub reports as actually granted (captured from the
+    # ``X-OAuth-Scopes`` header on ``GET /user``), falling back to the
+    # token-exchange response. This value is shown to the user only;
+    # authorization always defers to GitHub's own responses (issue #57).
+    granted = client.granted_scopes
+    account.scopes = ",".join(granted) or (token_data.get("scope") or "")
     account.token_type = token_data.get("token_type", "bearer")
     account.set_access_token(token)
+    account.set_refresh_token(token_data.get("refresh_token"))
+    account.token_expires_at = (
+        datetime.now(UTC) + timedelta(seconds=int(token_data["expires_in"]))
+        if token_data.get("expires_in")
+        else None
+    )
     db.session.commit()
 
     from app.services.events import emit_event
@@ -144,6 +238,10 @@ def callback():
         data={"github_username": account.github_username},
         user_id=current_user.id,
     )
+
+    # A successful connection proves the user's own state, so clear any
+    # accumulated failure hits: legitimate connects are never throttled.
+    ratelimit.clear(key)
 
     flash(f"Connected to GitHub as @{account.github_username}.", "success")
     return redirect(url_for("github.index"))
@@ -155,6 +253,12 @@ def disconnect():
     """Remove the GitHub connection and its stored token."""
     account = GithubAccount.query.filter_by(user_id=current_user.id).first()
     if account is not None:
+        try:
+            from app.services.crypto import decrypt_secret
+
+            revoke_github_token(decrypt_secret(account.access_token_encrypted))
+        except ValueError:
+            pass
         db.session.delete(account)
         db.session.commit()
         flash("Disconnected your GitHub account.", "info")
@@ -164,11 +268,55 @@ def disconnect():
 @bp.route("/api/status")
 @login_required
 def status():
-    """Return whether the current user has a GitHub connection."""
+    """Return GitHub connection status plus the remaining API quota.
+
+    When the user is connected, a best-effort ``rate_limit`` summary is
+    included so the dashboard can warn before the core API budget runs out.
+    Only non-sensitive numeric fields are exposed — never the token or any
+    response headers (issue #77).
+    """
     account = GithubAccount.query.filter_by(user_id=current_user.id).first()
-    return jsonify(
-        {"connected": account is not None, "account": account.to_dict() if account else None}
-    )
+    payload: dict = {
+        "connected": account is not None,
+        "account": account.to_dict() if account else None,
+    }
+    if account is not None:
+        granted = account.granted_scopes
+        payload["scopes"] = granted
+        # A missing ``repo`` scope means private repositories will not load.
+        # This drives a warning banner only; it is never used to gate access
+        # (issue #57).
+        payload["missing_repo_scope"] = "repo" not in granted
+        payload["rate_limit"] = _rate_limit_summary()
+        scopes = [scope.strip() for scope in (account.scopes or "").split(",") if scope.strip()]
+        payload["repo_scope_missing"] = bool(scopes) and "repo" not in scopes
+    return jsonify(payload)
+
+
+def _rate_limit_summary() -> dict:
+    """Best-effort GitHub core rate-limit summary for the dashboard.
+
+    Never fails the status request: if the budget cannot be read the payload
+    reports ``available: false``. ``low`` is true when the remaining quota is
+    at or below ``GITHUB_LOW_QUOTA_THRESHOLD``.
+    """
+    try:
+        budget = _client().get_rate_limit()
+    except GitHubError:
+        budget = None
+    if not budget:
+        return {"available": False}
+    threshold = current_app.config.get("GITHUB_LOW_QUOTA_THRESHOLD", 100)
+    remaining = budget.get("remaining")
+    return {
+        "available": True,
+        "limit": budget.get("limit"),
+        "remaining": remaining,
+        "reset": budget.get("reset"),
+        "used": budget.get("used"),
+        "threshold": threshold,
+        "low": remaining is not None and remaining <= threshold,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +342,37 @@ def _get_state() -> str | None:
     return session.pop(_STATE_SESSION_KEY, None)
 
 
+def _callback_limit_key() -> str:
+    """Build the OAuth callback limiter key for the current user and client IP."""
+    return ratelimit.client_key(f"github_oauth:{current_user.get_id()}")
+
+
+def _callback_blocked() -> tuple[bool, int]:
+    """Return ``(blocked, retry_after)`` for repeated callback failures.
+
+    Only failed callback attempts are recorded (see ``callback``), so a user who
+    connects successfully is never affected; the limit exists purely to blunt
+    brute-force ``state`` probing.
+    """
+    max_hits = current_app.config.get("RATE_LIMIT_OAUTH_CALLBACK_MAX", 10)
+    window = current_app.config.get("RATE_LIMIT_OAUTH_CALLBACK_WINDOW", 300)
+    key = _callback_limit_key()
+    if ratelimit.count(key, window=window) >= max_hits:
+        return True, ratelimit.retry_after(key, window=window)
+    return False, 0
+
+
+def _throttled_response(retry_after: int):
+    """Return a ``429`` response (with ``Retry-After``) for a throttled callback."""
+    response = current_app.response_class(
+        "Too many failed GitHub authorization attempts. Please try again later.",
+        status=429,
+        mimetype="text/plain",
+    )
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
 # --------------------------------------------------------------------------
 # Pages
 # --------------------------------------------------------------------------
@@ -206,11 +385,25 @@ def repos():
     return render_template("github/repos.html")
 
 
+@bp.route("/repos/lookup")
+@login_required
+def repo_lookup():
+    """Repository lookup form: browse an arbitrary public repository by owner/name."""
+    return render_template("github/repo_lookup.html")
+
+
 @bp.route("/repos/<owner>/<repo>")
 @login_required
 def repo_detail(owner: str, repo: str):
     """Repository detail page."""
     return render_template("github/repo_detail.html", owner=owner, repo=repo)
+
+
+@bp.route("/repos/<owner>/<repo>/commits/<sha>")
+@login_required
+def commit_detail(owner: str, repo: str, sha: str):
+    """Single commit page with the full message and per-file diffs."""
+    return render_template("github/commit_detail.html", owner=owner, repo=repo, sha=sha)
 
 
 @bp.route("/repos/<owner>/<repo>/issues")
@@ -250,6 +443,25 @@ def _client() -> GitHubClient:
     return get_github_client()
 
 
+def _page_params() -> tuple[int, int]:
+    """Return the requested ``(page, per_page)``, bounded to safe values."""
+    page = request.args.get("page", type=int) or 1
+    per_page = request.args.get("per_page", type=int) or PAGE_SIZE_DEFAULT
+    return max(1, page), max(1, min(per_page, PAGE_SIZE_MAX))
+
+
+def _paginated_payload(result: GitHubPage, item_fn) -> dict:
+    """Serialize a :class:`GitHubPage` into the list-endpoint JSON envelope."""
+    return {
+        "items": [item_fn(item) for item in result.items],
+        "page": result.page,
+        "per_page": result.per_page,
+        "has_next": result.has_next,
+        "has_prev": result.has_prev,
+        "total_pages": result.total_pages,
+    }
+
+
 def _stellar_repo_context(client: GitHubClient, full_name: str) -> list[dict]:
     """Return a bounded, detection-relevant repo context for Stellar analysis.
 
@@ -286,6 +498,82 @@ def _repo_matches_query(repo: dict, query: str) -> bool:
     return False
 
 
+def _normalize_full_name(raw: str) -> str | None:
+    """Normalize a user-supplied ``owner/name`` string.
+
+    Accepts an optional ``https://github.com/`` prefix and trailing ``.git``,
+    returning the canonical ``owner/name`` or ``None`` when the input does not
+    look like a repository identifier. The result is still validated by
+    :func:`validate_full_name` before any GitHub call is made.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None
+    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix) :]
+            break
+    value = value.strip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    if not _FULL_NAME_RE.match(value):
+        return None
+    return value
+
+
+@bp.route("/api/repos/lookup")
+@login_required
+def api_repo_lookup():
+    """Resolve an arbitrary ``owner/name`` to a repository the user can access.
+
+    The lookup is performed with the user's own token, so GitHub's access model
+    is authoritative: private repositories the user cannot see return a clear
+    permission error and no metadata is leaked. Public repositories are always
+    resolvable, matching GitHub's own visibility rules.
+    """
+    raw = request.args.get("full_name") or request.args.get("q") or ""
+    full_name = _normalize_full_name(raw)
+    if not full_name:
+        return (
+            jsonify(
+                {
+                    "error": "Enter a repository as owner/name (for example, octocat/Hello-World).",
+                    "code": "invalid_full_name",
+                }
+            ),
+            400,
+        )
+
+    try:
+        client = _client()
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 403
+
+    try:
+        data = client.get_repository(validate_full_name(full_name))
+    except GitHubError as exc:
+        status = getattr(exc, "status_code", None)
+        if status in (403, 404):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Repository '{full_name}' was not found or you do not have "
+                            "permission to view it."
+                        ),
+                        "code": "not_found_or_forbidden",
+                        "full_name": full_name,
+                    }
+                ),
+                404,
+            )
+        return jsonify(github_error_payload(exc)), 502
+
+    payload = repo_payload(data)
+    payload["readme"] = client.get_readme(data.get("full_name", full_name))
+    return jsonify(payload)
+
+
 @bp.route("/api/repos")
 @login_required
 def api_repos():
@@ -298,13 +586,13 @@ def api_repos():
     try:
         client = _client()
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 403
+        return jsonify(github_error_payload(exc)), 403
 
     query = request.args.get("q", "").strip().lower()
     try:
         repos = client.list_repositories()
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     if query:
         repos = [r for r in repos if _repo_matches_query(r, query)]
@@ -320,7 +608,7 @@ def api_repo_detail(owner: str, repo: str):
         client = _client()
         data = client.get_repository(validate_full_name(f"{owner}/{repo}"))
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
     payload = repo_payload(data)
     payload["readme"] = client.get_readme(data.get("full_name", f"{owner}/{repo}"))
     return jsonify(payload)
@@ -335,7 +623,7 @@ def api_branches(owner: str, repo: str):
         client = _client()
         data = client.list_branches(full_name)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
     return jsonify(
         [
             {
@@ -345,6 +633,36 @@ def api_branches(owner: str, repo: str):
             }
             for branch in data
         ]
+    )
+
+
+@bp.route("/api/compare/<owner>/<repo>/<base>...<head>")
+@bp.route("/api/repos/<owner>/<repo>/compare/<base>...<head>")
+@login_required
+def api_compare(owner: str, repo: str, base: str, head: str):
+    """Return GitHub's diff between two refs (``base...head``).
+
+    Exposed at ``/github/api/compare/...`` and, for the repository browser, at
+    ``/github/api/repos/<owner>/<repo>/compare/...``.
+    """
+    full_name = validate_full_name(f"{owner}/{repo}")
+    try:
+        client = _client()
+        data = client.compare_refs(full_name, base, head)
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 502
+    files = data.get("files") or []
+    return jsonify(
+        {
+            "status": data.get("status"),
+            "ahead_by": data.get("ahead_by"),
+            "behind_by": data.get("behind_by"),
+            "total_commits": data.get("total_commits"),
+            "commits": data.get("commits") or [],
+            "files": files,
+            "additions": sum(file.get("additions") or 0 for file in files),
+            "deletions": sum(file.get("deletions") or 0 for file in files),
+        }
     )
 
 
@@ -358,7 +676,7 @@ def api_tree(owner: str, repo: str):
         client = _client()
         tree = client.get_tree(full_name, ref, recursive=True)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     entries = []
     for entry in tree.get("tree", []):
@@ -368,8 +686,23 @@ def api_tree(owner: str, repo: str):
                 "type": entry.get("type"),
                 "mode": entry.get("mode"),
                 "size": entry.get("size"),
+                "last_commit": None,
             }
         )
+
+    # Attach the last commit per file in one batched request (issue #63). This
+    # is best-effort: a GraphQL failure must never break the file browser, and
+    # only the first ``MAX_TREE_LAST_COMMITS`` files are resolved so large
+    # directories stay responsive.
+    blob_paths = [e["path"] for e in entries if e["type"] == "blob" and e["path"]]
+    if blob_paths:
+        try:
+            commits = client.get_last_commits(full_name, blob_paths[:MAX_TREE_LAST_COMMITS], ref)
+        except GitHubError:
+            commits = {}
+        for entry in entries:
+            entry["last_commit"] = commits.get(entry["path"])
+
     return jsonify(
         {
             "ref": ref,
@@ -390,7 +723,7 @@ def api_contents(owner: str, repo: str):
         client = _client()
         data = client.get_contents(full_name, path, ref=ref)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     if isinstance(data, dict):
         # A single file: return decoded text.
@@ -398,7 +731,7 @@ def api_contents(owner: str, repo: str):
         try:
             text = client.get_file_text(full_name, file_path, ref=ref)
         except GitHubError as exc:
-            return jsonify({"error": str(exc), "kind": exc.kind}), 422
+            return jsonify(github_error_payload(exc)), 422
         return jsonify(
             {
                 "type": "file",
@@ -428,34 +761,47 @@ def api_contents(owner: str, repo: str):
 # --------------------------------------------------------------------------
 
 
+def _commit_summary(commit: dict) -> dict:
+    """Normalize a GitHub commit entry for the browser list."""
+    commit_data = commit.get("commit") or {}
+    author = commit_data.get("author") or {}
+    return {
+        "sha": commit.get("sha"),
+        "short_sha": (commit.get("sha") or "")[:7],
+        "message": (commit_data.get("message") or "").splitlines()[0],
+        "author": author.get("name") or (commit.get("author") or {}).get("login"),
+        "date": author.get("date"),
+        "html_url": commit.get("html_url"),
+    }
+
+
 @bp.route("/api/repos/<owner>/<repo>/commits")
 @login_required
 def api_commits(owner: str, repo: str):
-    """Return commit history for a ref and/or path."""
+    """Return one page of commit history for a ref and/or path (issue #66)."""
     full_name = validate_full_name(f"{owner}/{repo}")
     ref = request.args.get("ref", "").strip() or None
     path = request.args.get("path", "").strip() or None
+    page = request.args.get("page", 1, type=int) or 1
+    per_page = request.args.get("per_page", PAGE_SIZE_DEFAULT, type=int) or PAGE_SIZE_DEFAULT
     try:
         client = _client()
-        data = client.list_commits(full_name, ref=ref, path=path)
-    except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
-
-    items = []
-    for commit in data:
-        commit_data = commit.get("commit") or {}
-        author = commit_data.get("author") or {}
-        items.append(
-            {
-                "sha": commit.get("sha"),
-                "short_sha": (commit.get("sha") or "")[:7],
-                "message": (commit_data.get("message") or "").splitlines()[0],
-                "author": author.get("name") or (commit.get("author") or {}).get("login"),
-                "date": author.get("date"),
-                "html_url": commit.get("html_url"),
-            }
+        result = client.list_commits_page(
+            full_name, ref=ref, path=path, page=page, per_page=per_page
         )
-    return jsonify(items)
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 502
+
+    return jsonify(
+        {
+            "items": [_commit_summary(commit) for commit in result.items],
+            "page": result.page,
+            "per_page": result.per_page,
+            "has_next": result.has_next,
+            "has_prev": result.has_prev,
+            "total_pages": result.total_pages,
+        }
+    )
 
 
 @bp.route("/api/repos/<owner>/<repo>/commits/<sha>")
@@ -467,7 +813,7 @@ def api_commit_detail(owner: str, repo: str, sha: str):
         client = _client()
         commit = client.get_commit(full_name, sha)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
 
     commit_data = commit.get("commit") or {}
     author = commit_data.get("author") or {}
@@ -506,12 +852,31 @@ def api_issues(owner: str, repo: str):
     state = request.args.get("state", "open")
     if state not in ("open", "closed", "all"):
         state = "open"
+    labels = request.args.get("labels", "").strip() or None
+    assignee = request.args.get("assignee", "").strip() or None
+    search = request.args.get("q", "").strip() or None
+    page, per_page = _page_params()
+    # Only forward the optional filters when they are actually supplied so the
+    # call stays compatible with clients/tests that do not know about them.
+    filters = {}
+    if labels:
+        filters["labels"] = labels
+    if assignee:
+        filters["assignee"] = assignee
+    if search:
+        filters["search"] = search
     try:
         client = _client()
-        data = client.list_issues(full_name, state=state)
+        result = client.list_issues_page(
+            full_name,
+            state=state,
+            page=page,
+            per_page=per_page,
+            **filters,
+        )
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
-    return jsonify([issue_payload(i) for i in data])
+        return jsonify(github_error_payload(exc)), 502
+    return jsonify(_paginated_payload(result, issue_payload))
 
 
 @bp.route("/api/repos/<owner>/<repo>/issues/<int:number>")
@@ -524,7 +889,7 @@ def api_issue_detail(owner: str, repo: str, number: int):
         client = _client()
         data = client.get_issue(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
 
     payload = issue_payload(data)
     if analyze:
@@ -547,12 +912,15 @@ def api_pulls(owner: str, repo: str):
     state = request.args.get("state", "open")
     if state not in ("open", "closed", "all"):
         state = "open"
+    page, per_page = _page_params()
     try:
         client = _client()
-        data = client.list_pull_requests(full_name, state=state)
+        result = client.list_pull_requests_page(
+            full_name, state=state, page=page, per_page=per_page
+        )
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
-    return jsonify([pull_request_payload(pr) for pr in data])
+        return jsonify(github_error_payload(exc)), 502
+    return jsonify(_paginated_payload(result, pull_request_payload))
 
 
 @bp.route("/api/repos/<owner>/<repo>/pulls/<int:number>")
@@ -566,9 +934,44 @@ def api_pull_detail(owner: str, repo: str, number: int):
         pr = client.get_pull_request(full_name, number)
         files = client.list_pull_request_files(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 404
+        return jsonify(github_error_payload(exc)), 404
 
     payload = pull_request_payload(pr)
+    head_sha = payload.get("head_sha")
+    payload["checks"] = {"available": False, "runs": [], "status": None}
+    if head_sha:
+        checks = payload["checks"]
+        try:
+            result = client.list_check_runs(full_name, head_sha)
+            checks["runs"] = [
+                {
+                    "name": item.get("name"),
+                    "status": item.get("status"),
+                    "conclusion": item.get("conclusion"),
+                    "details_url": item.get("details_url"),
+                }
+                for item in result.get("check_runs", [])
+            ]
+            checks["available"] = True
+        except GitHubError:
+            pass
+        try:
+            result = client.get_commit_status(full_name, head_sha)
+            checks["status"] = {
+                "state": result.get("state"),
+                "statuses": [
+                    {
+                        "context": item.get("context"),
+                        "state": item.get("state"),
+                        "description": item.get("description"),
+                        "target_url": item.get("target_url"),
+                    }
+                    for item in result.get("statuses", [])
+                ],
+            }
+            checks["available"] = True
+        except GitHubError:
+            pass
     payload["files"] = [
         {
             "filename": f.get("filename"),
@@ -603,7 +1006,7 @@ def api_analyze_repo(owner: str, repo: str):
         readme = client.get_readme(full_name, ref=default_branch)
         tree = client.get_tree(full_name, default_branch, recursive=True)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     file_list = [
         entry.get("path", "") for entry in tree.get("tree", []) if entry.get("type") == "blob"
@@ -627,7 +1030,7 @@ def api_analyze_file(owner: str, repo: str):
         client = _client()
         text = client.get_file_text(full_name, path, ref=ref)
     except GitHubError as exc:
-        return jsonify({"error": str(exc), "kind": exc.kind}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     language = (path.rsplit(".", 1)[-1] if "." in path else "") or "text"
     return jsonify(analysis.analyze_file(path, language, text, question=question))

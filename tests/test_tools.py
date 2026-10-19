@@ -4,6 +4,9 @@ from io import BytesIO
 
 import pytest
 
+from app.extensions import db as database
+from app.models import Conversation, FileAnalysis, UsageRecord
+
 
 def _register(client, username="tester", email="tester@example.com"):
     client.post(
@@ -77,6 +80,22 @@ class TestCodeActions:
 
 
 class TestAnalyzeFile:
+    def test_analysis_history_is_private_to_owner(self, client, db):
+        _register(client, username="owner", email="owner@example.com")
+        created = client.post(
+            "/tools/analyze",
+            data={"file": (BytesIO(b"print('owner')"), "owner.py")},
+            content_type="multipart/form-data",
+        ).get_json()
+        client.post("/auth/logout")
+        _register(client, username="other", email="other@example.com")
+        assert client.get("/tools/api/analyses").get_json() == []
+        denied = client.delete(
+            f"/tools/api/analyses/{created['analysis_id']}",
+            headers={"X-CSRFToken": "ignored"},
+        )
+        assert denied.status_code == 404
+
     def test_analyze_python_file(self, client):
         _register(client)
         data = {
@@ -111,6 +130,36 @@ class TestAnalyzeFile:
         assert response.status_code == 200
         assert response.get_json()["action"] == "bugs"
 
+    def test_analysis_is_persisted_cached_and_deletable(self, client, db):
+        _register(client)
+        data = {"file": (BytesIO(b"print('persistent')"), "main.py")}
+        first = client.post(
+            "/tools/analyze", data=data, content_type="multipart/form-data"
+        ).get_json()
+        assert first["cached"] is False
+        record = database.session.get(FileAnalysis, first["analysis_id"])
+        assert record.file_id == first["file_id"]
+        assert record.user_id is not None
+        assert record.provider
+
+        again = client.post(
+            "/tools/analyze",
+            data={"file": (BytesIO(b"print('persistent')"), "main.py")},
+            content_type="multipart/form-data",
+        ).get_json()
+        assert again["cached"] is True
+        assert again["analysis_id"] == first["analysis_id"]
+        assert FileAnalysis.query.count() == 1
+
+        history = client.get("/tools/history")
+        assert history.status_code == 200
+        assert b"main.py" in history.data
+        removed = client.delete(
+            f"/tools/api/analyses/{record.id}", headers={"X-CSRFToken": "ignored"}
+        )
+        assert removed.status_code == 200
+        assert FileAnalysis.query.count() == 0
+
 
 class TestSendToChat:
     def test_send_to_chat_creates_conversation(self, client, db):
@@ -131,3 +180,81 @@ class TestSendToChat:
             headers={"X-CSRFToken": "ignored"},
         )
         assert response.status_code == 400
+
+
+class TestToolUsageLedger:
+    def test_generate_records_a_tools_row(self, client, db, make_user, login):
+        user = make_user()
+        login()
+
+        response = client.post(
+            "/tools/generate",
+            json={"description": "Build a REST API in Flask", "language": "python"},
+            headers={"X-CSRFToken": "ignored"},
+        )
+
+        assert response.status_code == 200
+        row = UsageRecord.query.filter_by(source="tools").one()
+        assert row.user_id == user.id
+        assert row.provider == "mock"
+        assert row.model == "mock-1"
+        assert row.total_tokens > 0
+        assert row.tokens_estimated is True
+
+    def test_code_action_records_a_tools_row_with_conversation_scope(
+        self, client, db, make_user, login
+    ):
+        user = make_user()
+        login()
+        conversation = Conversation(user_id=user.id, title="Tool follow-up")
+        db.session.add(conversation)
+        db.session.commit()
+
+        response = client.post(
+            "/tools/code",
+            json={
+                "action": "explain",
+                "code": "def foo():\n    return 1",
+                "conversation_id": conversation.id,
+            },
+            headers={"X-CSRFToken": "ignored"},
+        )
+
+        assert response.status_code == 200
+        row = UsageRecord.query.filter_by(source="tools").one()
+        assert row.user_id == user.id
+        assert row.conversation_id == conversation.id
+        assert row.total_tokens > 0
+
+    def test_foreign_conversation_is_not_attached(self, client, db, make_user, login):
+        owner = make_user()
+        other = make_user(username="other", email="other@example.com")
+        foreign = Conversation(user_id=other.id, title="Private")
+        db.session.add(foreign)
+        db.session.commit()
+        login(email=owner.email)
+
+        response = client.post(
+            "/tools/generate",
+            json={"description": "Write a function", "conversation_id": foreign.id},
+            headers={"X-CSRFToken": "ignored"},
+        )
+
+        assert response.status_code == 200
+        row = UsageRecord.query.filter_by(source="tools").one()
+        assert row.conversation_id is None
+
+    def test_analyze_file_records_a_tools_row(self, client, db, make_user, login):
+        user = make_user()
+        login()
+
+        response = client.post(
+            "/tools/analyze",
+            data={"file": (BytesIO(b"def add(a, b):\n    return a + b"), "calc.py")},
+            content_type="multipart/form-data",
+        )
+
+        assert response.status_code == 200
+        row = UsageRecord.query.filter_by(source="tools").one()
+        assert row.user_id == user.id
+        assert row.total_tokens > 0
