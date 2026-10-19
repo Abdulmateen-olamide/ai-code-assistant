@@ -10,13 +10,17 @@ import json
 import pytest
 
 from app.services.github import (
+    PAGE_SIZE_MAX,
     GitHubAuthError,
     GitHubClient,
     GitHubError,
     GitHubNetworkError,
     GitHubNotFoundError,
+    GitHubPage,
     GitHubPermissionError,
     GitHubRateLimitError,
+    compare_refs,
+    parse_link_header,
     validate_full_name,
     validate_path,
 )
@@ -94,6 +98,23 @@ class TestRequestHandling:
         client.get_user()
         assert session.headers["Authorization"] == "Bearer gho_test_token"
         assert session.headers["X-GitHub-Api-Version"] == "2022-11-28"
+
+    def test_captures_granted_scopes_header(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(200, {"id": 1}, headers={"X-OAuth-Scopes": "repo, read:user"})
+        ]
+        client.get_user()
+        assert client.granted_scopes == ["repo", "read:user"]
+
+    def test_granted_scopes_default_to_empty(self):
+        assert GitHubClient("gho_token").granted_scopes == []
+
+    def test_granted_scopes_ignores_absent_header(self, ok_client):
+        client, session = ok_client
+        session.responses = [FakeResponse.from_json(200, {"id": 1})]
+        client.get_user()
+        assert client.granted_scopes == []
 
     def test_not_found_raises_typed_error(self, ok_client):
         client, session = ok_client
@@ -194,6 +215,166 @@ class TestRepositoryMethods:
         assert [i["number"] for i in issues] == [2]
 
 
+class TestPagination:
+    def test_parse_link_header(self):
+        header = (
+            '<https://api.github.com/repos/o/r/issues?page=3>; rel="next", '
+            '<https://api.github.com/repos/o/r/issues?page=1>; rel="prev", '
+            '<https://api.github.com/repos/o/r/issues?page=7>; rel="last"'
+        )
+        links = parse_link_header(header)
+        assert links["next"].endswith("page=3")
+        assert links["prev"].endswith("page=1")
+        assert links["last"].endswith("page=7")
+        assert parse_link_header("") == {}
+
+    def test_issues_page_reports_navigation_from_link_header(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                [{"number": 2, "title": "feature"}],
+                headers={
+                    "Link": (
+                        '<https://api.github.com/repos/o/r/issues?page=2>; rel="next", '
+                        '<https://api.github.com/repos/o/r/issues?page=9>; rel="last"'
+                    )
+                },
+            )
+        ]
+        page = client.list_issues_page("owner/repo", state="open", page=1, per_page=50)
+        assert isinstance(page, GitHubPage)
+        assert [i["number"] for i in page.items] == [2]
+        assert page.page == 1
+        assert page.per_page == 50
+        assert page.has_next is True
+        assert page.has_prev is False
+        assert page.total_pages == 9
+
+    def test_issues_page_excludes_pull_requests(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                [
+                    {"number": 1, "title": "pr", "pull_request": {}},
+                    {"number": 2, "title": "issue"},
+                ],
+            )
+        ]
+        page = client.list_issues_page("owner/repo")
+        assert [i["number"] for i in page.items] == [2]
+
+    def test_commits_page_preserves_ref_and_path_filters(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                [{"sha": "abc1234567890", "commit": {"message": "m", "author": {"name": "A"}}}],
+                headers={
+                    "Link": (
+                        '<https://api.github.com/repos/o/r/commits?page=2>; rel="next", '
+                        '<https://api.github.com/repos/o/r/commits?page=5>; rel="last"'
+                    )
+                },
+            )
+        ]
+        page = client.list_commits_page(
+            "owner/repo", ref="main", path="app/x.py", page=1, per_page=30
+        )
+        assert isinstance(page, GitHubPage)
+        assert [c["sha"] for c in page.items] == ["abc1234567890"]
+        assert page.has_next is True
+        assert page.total_pages == 5
+        params = session.calls[0]["params"]
+        assert params["sha"] == "main"
+        assert params["path"] == "app/x.py"
+        assert params["page"] == 1
+        assert params["per_page"] == 30
+
+    def test_pulls_page_passes_page_and_clamps_per_page(self, ok_client):
+        client, session = ok_client
+        session.responses = [FakeResponse.from_json(200, [{"number": 5, "title": "pr"}])]
+        page = client.list_pull_requests_page(
+            "owner/repo", state="closed", page=3, per_page=PAGE_SIZE_MAX + 100
+        )
+        assert page.per_page == PAGE_SIZE_MAX
+        assert page.page == 3
+        assert session.calls[0]["params"]["page"] == 3
+        assert session.calls[0]["params"]["per_page"] == PAGE_SIZE_MAX
+        assert session.calls[0]["params"]["state"] == "closed"
+
+    def test_page_without_next_has_no_total(self, ok_client):
+        client, session = ok_client
+        session.responses = [FakeResponse.from_json(200, [{"number": 1}])]
+        page = client.list_pull_requests_page("owner/repo")
+        assert page.has_next is False
+        assert page.has_prev is False
+        assert page.total_pages == 1
+
+    def test_page_error_is_translated_to_typed_error(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse(404, data={"message": "Not Found"}),
+            FakeResponse(404, data={"message": "Not Found"}),
+        ]
+        with pytest.raises(GitHubNotFoundError):
+            client.list_issues_page("owner/repo")
+
+
+class TestRateLimit:
+    def test_get_rate_limit_normalizes_core(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                {
+                    "resources": {
+                        "core": {
+                            "limit": 5000,
+                            "remaining": 12,
+                            "reset": 1_700_000_000,
+                            "used": 4988,
+                        }
+                    },
+                    "rate": {"limit": 5000, "remaining": 12, "reset": 1_700_000_000},
+                },
+            )
+        ]
+        budget = client.get_rate_limit()
+        assert budget == {
+            "limit": 5000,
+            "remaining": 12,
+            "reset": 1_700_000_000,
+            "used": 4988,
+        }
+        assert session.calls[0]["url"].endswith("/rate_limit")
+
+    def test_get_rate_limit_falls_back_to_rate_object(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200, {"rate": {"limit": 60, "remaining": 60, "reset": 1_700_000_000}}
+            )
+        ]
+        assert client.get_rate_limit() == {
+            "limit": 60,
+            "remaining": 60,
+            "reset": 1_700_000_000,
+            "used": None,
+        }
+
+    def test_get_rate_limit_returns_none_when_missing(self, ok_client):
+        client, session = ok_client
+        session.responses = [FakeResponse.from_json(200, {"resources": {}})]
+        assert client.get_rate_limit() is None
+
+    def test_get_rate_limit_returns_none_on_non_dict(self, ok_client):
+        client, session = ok_client
+        session.responses = [FakeResponse.from_json(200, [])]
+        assert client.get_rate_limit() is None
+
+
 class TestValidation:
     def test_validate_full_name_accepts_valid(self):
         assert validate_full_name("owner/repo") == "owner/repo"
@@ -209,3 +390,116 @@ class TestValidation:
         for bad in ["../secret", "foo/../../etc/passwd", "..", "a/../b"]:
             with pytest.raises(GitHubError):
                 validate_path(bad)
+
+
+class TestGrantedScopes:
+    """get_granted_scopes reads the X-OAuth-Scopes header (issue #57)."""
+
+    def test_reads_and_splits_the_header(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse(200, data={"id": 1}, headers={"X-OAuth-Scopes": "read:user, repo, gist"})
+        ]
+        assert client.get_granted_scopes() == ["read:user", "repo", "gist"]
+
+    def test_trims_whitespace_and_ignores_blanks(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse(200, data={"id": 1}, headers={"X-OAuth-Scopes": " repo ,, read:user "})
+        ]
+        assert client.get_granted_scopes() == ["repo", "read:user"]
+
+    def test_empty_when_header_absent(self, ok_client):
+        client, session = ok_client
+        session.responses = [FakeResponse(200, data={"id": 1})]
+        assert client.get_granted_scopes() == []
+
+
+class TestCompareRefs:
+    def test_compare_refs_uses_github_compare_endpoint(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                {
+                    "status": "ahead",
+                    "ahead_by": 2,
+                    "behind_by": 0,
+                    "total_commits": 2,
+                    "files": [
+                        {
+                            "filename": "app/x.py",
+                            "status": "modified",
+                            "additions": 3,
+                            "deletions": 1,
+                            "changes": 4,
+                        }
+                    ],
+                },
+            )
+        ]
+        result = client.compare_refs("owner/repo", "main", "feature")
+        assert result["files"][0]["filename"] == "app/x.py"
+        assert session.calls[0]["method"] == "GET"
+        assert session.calls[0]["url"].endswith("/repos/owner/repo/compare/main...feature")
+
+    def test_compare_refs_accepts_dot_dot_dot_refs_and_returns_summary(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                {
+                    "status": "diverged",
+                    "ahead_by": 1,
+                    "behind_by": 1,
+                    "total_commits": 2,
+                    "files": [
+                        {
+                            "filename": "README.md",
+                            "status": "added",
+                            "additions": 5,
+                            "deletions": 0,
+                            "changes": 5,
+                        },
+                        {
+                            "filename": "app/y.py",
+                            "status": "removed",
+                            "additions": 0,
+                            "deletions": 7,
+                            "changes": 7,
+                        },
+                    ],
+                },
+            )
+        ]
+        result = client.compare_refs("owner/repo", "v1.0.0", "main")
+        assert result["status"] == "diverged"
+        assert len(result["files"]) == 2
+        assert session.calls[0]["url"].endswith("/repos/owner/repo/compare/v1.0.0...main")
+
+    def test_compare_refs_free_function_delegates_to_client(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse.from_json(
+                200,
+                {
+                    "status": "ahead",
+                    "ahead_by": 1,
+                    "behind_by": 0,
+                    "total_commits": 1,
+                    "files": [],
+                },
+            )
+        ]
+        result = compare_refs(client, "owner/repo", "main", "feature")
+        assert result["status"] == "ahead"
+        assert session.calls[0]["url"].endswith("/repos/owner/repo/compare/main...feature")
+
+    def test_compare_refs_raises_on_not_found(self, ok_client):
+        client, session = ok_client
+        session.responses = [
+            FakeResponse(404, data={"message": "Not Found"}),
+            FakeResponse(404, data={"message": "Not Found"}),
+        ]
+        with pytest.raises(GitHubNotFoundError):
+            client.compare_refs("owner/repo", "main", "missing")

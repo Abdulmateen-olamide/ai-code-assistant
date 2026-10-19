@@ -53,6 +53,21 @@ def _reset_rate_limiter():
     ratelimit.reset()
 
 
+@pytest.fixture(autouse=True)
+def _reset_github_response_cache():
+    """Clear the shared GitHub response cache around each test.
+
+    The ETag cache is a module-level singleton, so without a reset an entry
+    cached by one test would be replayed (and its 304 consumed) by the next,
+    masking the very request the later test expects to make.
+    """
+    from app.services import github_cache
+
+    github_cache.reset()
+    yield
+    github_cache.reset()
+
+
 @pytest.fixture()
 def app():
     """Create a fresh application instance for each test."""
@@ -106,3 +121,31 @@ def login(client):
         )
 
     return _login
+
+
+@pytest.fixture(autouse=True)
+def _reset_alert_state():
+    """Clear alert dedupe / dispatch state around each test.
+
+    Alert services may keep process-local memory of already-emitted notifications
+    (dedupe keys). Reset it so alerts emitted in one test do not suppress the
+    same alert in another. The reset is best-effort: modules that do not expose
+    a reset hook are simply skipped.
+    """
+    import importlib
+
+    resetters = []
+    for module_name in ("app.services.alerts", "app.services.budget_alerts"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:  # optional module: nothing to reset
+            continue
+        reset = getattr(module, "reset", None)
+        if callable(reset):
+            resetters.append(reset)
+
+    for reset in resetters:
+        reset()
+    yield
+    for reset in resetters:
+        reset()

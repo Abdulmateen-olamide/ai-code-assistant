@@ -8,11 +8,37 @@
   var messagesEl = document.getElementById("chat-messages");
   var inputEl = document.getElementById("chat-input");
   var sendBtn = document.getElementById("send-message");
+  var composerErrorEl = document.getElementById("composer-error");
+  var usageEl = document.getElementById("conversation-usage");
+  var conversationUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   var listEl = document.getElementById("conversation-list");
   var searchEl = document.getElementById("conversation-search");
+  var workspaceSelectEl = document.getElementById("workspace-select");
+  var newWorkspaceBtn = document.getElementById("new-workspace");
   var actionsEl = document.getElementById("conversation-actions");
   var currentId = null;
   var streaming = false;
+  var currentController = null;
+  var cancelRequested = false;
+  var onboardingEl = document.getElementById("provider-onboarding");
+  var imageInput = document.getElementById("chat-image-input");
+  var attachBtn = document.getElementById("chat-attach-image");
+  var previewEl = document.getElementById("chat-image-preview");
+  var pendingAttachments = [];
+  var MAX_ATTACHMENTS = 4;
+  var providerEl = document.getElementById("chat-provider");
+  var modelEl = document.getElementById("chat-model");
+  var tempEl = document.getElementById("chat-temperature");
+  var tempValueEl = document.getElementById("chat-temperature-value");
+  var systemEl = document.getElementById("chat-system-prompt");
+  var providerOptions = [];
+  var defaults = { provider: "", model: "", temperature: 0.7, system_prompt: "" };
+
+  // Streaming scroll safety (issue #9): auto-follow new tokens only while the
+  // user is already pinned to the bottom, so scrolling up mid-stream is never
+  // yanked back down.
+  var stickToBottom = true;
+  var SCROLL_STICK_THRESHOLD_PX = 40;
 
   var CSRF_TOKEN = null;
 
@@ -34,90 +60,91 @@
     return div.innerHTML;
   }
 
-  // Minimal markdown renderer: code blocks, inline code, headings, bold,
-  // italics, links, and unordered lists.
-  function renderMarkdown(text) {
-    var lines = String(text).split("\n");
-    var html = "";
-    var inCode = false;
-    var codeLang = "";
-    var codeLines = [];
-    var listOpen = false;
-
-    function flushList() {
-      if (listOpen) {
-        html += "</ul>\n";
-        listOpen = false;
+  function formatRelativeTime(iso) {
+    if (!iso) return "";
+    var then = new Date(iso);
+    if (isNaN(then.getTime())) return "";
+    var seconds = Math.round((then.getTime() - Date.now()) / 1000);
+    var relative = typeof Intl !== "undefined" && Intl.RelativeTimeFormat
+      ? new Intl.RelativeTimeFormat(undefined, { numeric: "auto" })
+      : null;
+    var units = [
+      ["year", 31536000], ["month", 2592000], ["week", 604800],
+      ["day", 86400], ["hour", 3600], ["minute", 60],
+    ];
+    for (var i = 0; i < units.length; i++) {
+      var unit = units[i][0];
+      var secs = units[i][1];
+      if (Math.abs(seconds) >= secs || unit === "minute") {
+        var value = Math.round(seconds / secs);
+        if (relative) return relative.format(value, unit);
+        return Math.abs(value) + " " + unit + (Math.abs(value) === 1 ? "" : "s") + " ago";
       }
     }
+    return relative ? relative.format(seconds, "second") : "just now";
+  }
 
-    lines.forEach(function (line) {
-      var codeMatch = line.match(/^```(\w*)/);
-      if (codeMatch) {
-        flushList();
-        if (inCode) {
-          html +=
-            '<pre class="code-block"><code class="language-' +
-            escapeHtml(codeLang) +
-            '">' +
-            escapeHtml(codeLines.join("\n")) +
-            "</code></pre>\n";
-          inCode = false;
-          codeLines = [];
-        } else {
-          inCode = true;
-          codeLang = codeMatch[1] || "";
-        }
-        return;
-      }
-      if (inCode) {
-        codeLines.push(line);
-        return;
-      }
-
-      if (/^\s*-\s+/.test(line) || /^\s*\*\s+/.test(line)) {
-        if (!listOpen) {
-          html += "<ul>\n";
-          listOpen = true;
-        }
-        html += "<li>" + renderInline(line.replace(/^\s*[-*]\s+/, "")) + "</li>\n";
-        return;
-      }
-      flushList();
-
-      if (/^#{1,4}\s/.test(line)) {
-        var level = line.match(/^(#{1,4})\s/)[1].length;
-        html +=
-          "<h" + level + ">" + renderInline(line.replace(/^#{1,4}\s/, "")) + "</h" + level + ">\n";
-      } else if (/^\s*$/.test(line)) {
-        html += "<br>\n";
-      } else {
-        html += "<p>" + renderInline(line) + "</p>\n";
-      }
+  function updateTimestamps(root) {
+    (root || document).querySelectorAll(".conversation-time").forEach(function (el) {
+      var iso = el.getAttribute("datetime");
+      if (iso) el.textContent = formatRelativeTime(iso);
     });
+  }
 
-    flushList();
-    if (inCode) {
-      html +=
-        '<pre class="code-block"><code class="language-' +
-        escapeHtml(codeLang) +
-        '">' +
-        escapeHtml(codeLines.join("\n")) +
-        "</code></pre>\n";
+  // Markdown rendering lives in chat_markdown.js, which escapes all text and
+  // sanitizes the generated HTML before it can be inserted into the DOM. If
+  // that module failed to load we fall back to a plain escaped rendering.
+  function renderMarkdown(text) {
+    if (window.AICAMarkdown && window.AICAMarkdown.renderMarkdown) {
+      return window.AICAMarkdown.renderMarkdown(text);
     }
-    return html;
+    return escapeHtml(text).replace(/\n/g, "<br>\n");
   }
 
-  function renderInline(text) {
-    var escaped = escapeHtml(text);
-    return escaped
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-      .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  function renderAttachments(attachments) {
+    if (!attachments || !attachments.length) return "";
+    return attachments
+      .map(function (attachment) {
+        return (
+          '<img class="chat-attachment-image" src="' +
+          escapeHtml(attachment.url) +
+          '" alt="' +
+          escapeHtml(attachment.filename || "attachment") +
+          '" loading="lazy">'
+        );
+      })
+      .join("");
   }
 
-  function addMessage(role, content) {
+  // Render the running conversation total (issue #13).
+  function renderUsage() {
+    if (!usageEl) return;
+    var total = conversationUsage && conversationUsage.total_tokens;
+    usageEl.textContent = total
+      ? "This conversation: " +
+        total.toLocaleString() +
+        " tokens (" +
+        (conversationUsage.prompt_tokens || 0).toLocaleString() +
+        " prompt / " +
+        (conversationUsage.completion_tokens || 0).toLocaleString() +
+        " completion)"
+      : "";
+  }
+
+  function usageLine(usage) {
+    if (!usage || !usage.total_tokens) return "";
+    return (
+      '<div class="message-usage">' +
+      usage.total_tokens.toLocaleString() +
+      " tokens (" +
+      (usage.prompt_tokens || 0).toLocaleString() +
+      " + " +
+      (usage.completion_tokens || 0).toLocaleString() +
+      ")</div>"
+    );
+  }
+
+  function addMessage(role, content, attachments, usage) {
     var el = document.createElement("div");
     el.className = "chat-message chat-" + role;
     var label = role === "user" ? "You" : "Assistant";
@@ -126,9 +153,12 @@
       escapeHtml(label) +
       '</div><div class="message-body">' +
       (role === "user" ? escapeHtml(content) : renderMarkdown(content)) +
-      "</div>";
+      "</div>" +
+      renderAttachments(attachments) +
+      (role === "user" ? "" : usageLine(usage));
     el.innerHTML = body;
     messagesEl.appendChild(el);
+    if (role !== "user") enhanceCode(el);
     scrollToBottom();
     return el;
   }
@@ -142,20 +172,153 @@
     return el;
   }
 
+  // Blinking cursor appended to the in-progress assistant bubble while tokens
+  // stream in, so the user sees the reply is still being generated.
+  function addStreamingCursor(container) {
+    if (!container) return null;
+    var cursor = document.createElement("span");
+    cursor.className = "streaming-cursor";
+    cursor.setAttribute("aria-hidden", "true");
+    cursor.textContent = "\u258c";
+    container.appendChild(cursor);
+    return cursor;
+  }
+
+  function removeStreamingCursor(container) {
+    if (!container) return;
+    var cursor = container.querySelector(".streaming-cursor");
+    if (cursor && cursor.parentNode) cursor.parentNode.removeChild(cursor);
+  }
+
+  // Mark the sidebar entry for the active conversation with a subtle status
+  // while its reply is streaming, and clear it when generation ends.
+  function setConversationStatus(id, status) {
+    if (!listEl || id === null || id === undefined) return;
+    var item = listEl.querySelector('.conversation-item[data-id="' + id + '"]');
+    if (!item) return;
+    var meta = item.querySelector(".conversation-meta");
+    if (!meta) return;
+    var badge = meta.querySelector(".conversation-status");
+    if (status) {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "conversation-status";
+        badge.setAttribute("aria-label", "Generating response");
+        meta.appendChild(badge);
+      }
+      badge.textContent = "\u2026";
+    } else if (badge && badge.parentNode) {
+      badge.parentNode.removeChild(badge);
+    }
+  }
+
+  function isNearBottom() {
+    if (!messagesEl) return true;
+    return (
+      messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <
+      SCROLL_STICK_THRESHOLD_PX
+    );
+  }
+
+  // Force-follow to the newest content. Used when the user sends a message or
+  // opens a conversation, where jumping to the bottom is the expected behavior.
   function scrollToBottom() {
+    stickToBottom = true;
     messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  // Follow new content only while the user is already pinned to the bottom, so
+  // a streaming token update never resets their scroll position (issue #9).
+  function maybeScrollToBottom() {
+    if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  if (messagesEl) {
+    messagesEl.addEventListener("scroll", function () {
+      stickToBottom = isNearBottom();
+    });
+  }
+
+  // Copy-to-clipboard helpers for code blocks (issue #9).
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () {
+          flashInfo("Copied to clipboard.");
+        },
+        function () {
+          fallbackCopyText(text);
+        }
+      );
+      return;
+    }
+    fallbackCopyText(text);
+  }
+
+  function fallbackCopyText(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "absolute";
+    area.style.left = "-9999px";
+    document.body.appendChild(area);
+    area.select();
+    try {
+      document.execCommand("copy");
+      flashInfo("Copied to clipboard.");
+    } catch (error) {
+      flashError("Copy failed.");
+    }
+    document.body.removeChild(area);
+  }
+
+  // Add a copy button to every rendered code block, skipping ones that already
+  // have one so repeated calls during streaming stay cheap.
+  function addCodeCopyButtons(container) {
+    if (!container || !container.querySelectorAll) return;
+    var blocks = container.querySelectorAll("pre.code-block");
+    Array.prototype.forEach.call(blocks, function (pre) {
+      if (pre.getElementsByClassName("code-copy-btn").length) return;
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "code-copy-btn";
+      button.textContent = "Copy";
+      button.setAttribute("aria-label", "Copy code to clipboard");
+      pre.appendChild(button);
+    });
+  }
+
+  function enhanceCode(container) {
+    highlightCode(container);
+    addCodeCopyButtons(container);
+  }
+
+  if (messagesEl) {
+    messagesEl.addEventListener("click", function (event) {
+      var target = event.target;
+      var button = target && target.closest ? target.closest(".code-copy-btn") : null;
+      if (!button) return;
+      var pre = button.closest("pre");
+      var code = pre ? pre.querySelector("code") : null;
+      if (!code) return;
+      copyTextToClipboard(code.innerText || code.textContent || "");
+    });
   }
 
   function setActiveItem(id) {
     var items = listEl.querySelectorAll(".conversation-item");
     items.forEach(function (item) {
-      item.classList.toggle("active", Number(item.dataset.id) === Number(id));
+      var active = Number(item.dataset.id) === Number(id);
+      item.classList.toggle("active", active);
+      if (active) item.setAttribute("aria-current", "true");
+      else item.removeAttribute("aria-current");
     });
   }
 
   function updateTitle(item, title) {
     item.querySelector(".conversation-title").textContent = title;
     item.dataset.title = title;
+    item.setAttribute("aria-label", "Open conversation: " + title);
   }
 
   async function api(url, options) {
@@ -182,51 +345,233 @@
     setActiveItem(id);
     messagesEl.innerHTML = "";
     actionsEl.hidden = false;
+    loadShareLinks(id);
     return api("/chat/conversations/" + id)
       .then(function (data) {
         data.messages.forEach(function (message) {
-          addMessage(message.role, message.content);
+          addMessage(message.role, message.content, message.attachments, message.token_usage);
         });
+        conversationUsage =
+          data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+        renderUsage();
         if (data.messages.length === 0) {
           messagesEl.innerHTML =
             '<div class="chat-placeholder"><p>Ask the AI assistant for help with your code.</p></div>';
         }
+        applySettingsToPanel(data);
+        syncWorkspaceSelect(data.workspace_id);
+        clearComposerError();
+        autoGrowComposer();
+        inputEl.focus();
       })
       .catch(function (error) {
         flashError(error.message);
       });
   }
 
+  function loadShareLinks(id) {
+    var container = document.getElementById("share-links-list");
+    if (!container) return;
+    container.innerHTML = "";
+    api("/chat/conversations/" + id + "/share-links").then(function (links) {
+      links.forEach(function (link) {
+        var row = document.createElement("p");
+        var expiry = document.createElement("span");
+        expiry.textContent = "Read-only link expires " + new Date(link.expires_at).toLocaleString() + " ";
+        var revoke = document.createElement("button");
+        revoke.type = "button";
+        revoke.className = "btn btn-ghost btn-sm";
+        revoke.textContent = "Revoke";
+        revoke.dataset.revokeShareLinkId = link.id;
+        row.appendChild(expiry);
+        row.appendChild(revoke);
+        container.appendChild(row);
+      });
+    }).catch(function (error) { flashError(error.message); });
+  }
+
   function newConversation() {
     currentId = null;
     messagesEl.innerHTML = '<div class="chat-placeholder"><p>Start a new conversation.</p></div>';
     actionsEl.hidden = true;
+    conversationUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    renderUsage();
+    clearComposerError();
+    autoGrowComposer();
     inputEl.focus();
   }
 
-  async function startStream() {
-    var content = inputEl.value.trim();
-    if (!content || streaming) return;
-    if (currentId === null) {
+  // Grow the textarea with its content, up to a cap, then scroll internally.
+  function autoGrowComposer() {
+    if (!inputEl) return;
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+  }
+
+  function showComposerError(message) {
+    if (!composerErrorEl) return;
+    composerErrorEl.textContent = message;
+    composerErrorEl.hidden = false;
+    inputEl.setAttribute("aria-invalid", "true");
+  }
+
+  function clearComposerError() {
+    if (!composerErrorEl || composerErrorEl.hidden) return;
+    composerErrorEl.textContent = "";
+    composerErrorEl.hidden = true;
+    inputEl.removeAttribute("aria-invalid");
+  }
+
+  // Toggle the composer button between Send (idle) and Stop (while streaming).
+  function setComposerState(state) {
+    if (state === "streaming") {
+      sendBtn.textContent = "Stop";
+      sendBtn.classList.add("btn-danger");
+      sendBtn.classList.remove("btn-primary");
+      sendBtn.disabled = false;
+      sendBtn.setAttribute("aria-label", "Stop generating");
+    } else if (state === "stopping") {
+      sendBtn.textContent = "Stopping...";
+      sendBtn.disabled = true;
+      sendBtn.setAttribute("aria-label", "Stopping generation");
+    } else {
+      sendBtn.textContent = "Send";
+      sendBtn.classList.remove("btn-danger");
+      sendBtn.classList.add("btn-primary");
+      sendBtn.disabled = false;
+      sendBtn.setAttribute("aria-label", "Send message");
+    }
+  }
+
+  // Disable composer controls while a reply is being generated so a second
+  // submission cannot start a duplicate stream.
+  function setControlsDisabled(disabled) {
+    if (inputEl) inputEl.disabled = disabled;
+    if (attachBtn) attachBtn.disabled = disabled;
+    if (providerEl) providerEl.disabled = disabled;
+    if (modelEl) modelEl.disabled = disabled;
+    if (tempEl) tempEl.disabled = disabled;
+    if (systemEl) systemEl.disabled = disabled;
+  }
+
+  function stopStream() {
+    if (!streaming || !currentController) return;
+    // Stay in-flight until the abort resolves so a fast double-click cannot
+    // open a second stream (double-submit protection during the cancel window).
+    cancelRequested = true;
+    setComposerState("stopping");
+    currentController.abort();
+  }
+
+  async function ensureConversation() {
+    if (currentId !== null) return currentId;
+    var payload = collectSettings();
+    // File the new conversation under the workspace currently selected in the
+    // sidebar. "all" means no workspace, which the server stores as NULL.
+    payload.workspace_id = selectedWorkspaceId();
+    var created = await api("/chat/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    addListItem(created);
+    currentId = created.id;
+    actionsEl.hidden = false;
+    return currentId;
+  }
+
+  function renderPendingAttachments() {
+    if (!previewEl) return;
+    previewEl.innerHTML = "";
+    pendingAttachments.forEach(function (attachment, index) {
+      var chip = document.createElement("span");
+      chip.className = "chat-image-chip";
+      var img = document.createElement("img");
+      img.src = attachment.url;
+      img.alt = attachment.filename || "attachment";
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chat-image-remove";
+      remove.setAttribute("aria-label", "Remove attached image");
+      remove.textContent = "\u00d7";
+      remove.addEventListener("click", function () {
+        pendingAttachments.splice(index, 1);
+        renderPendingAttachments();
+      });
+      chip.appendChild(img);
+      chip.appendChild(remove);
+      previewEl.appendChild(chip);
+    });
+  }
+
+  async function uploadImage(file) {
+    if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+      flashError("At most " + MAX_ATTACHMENTS + " images can be attached.");
+      return;
+    }
+    try {
+      var id = await ensureConversation();
+      var form = new FormData();
+      form.append("image", file);
+      var response = await fetch("/chat/conversations/" + id + "/attachments", {
+        method: "POST",
+        headers: { "X-CSRFToken": getCsrf() },
+        body: form,
+      });
+      var data = null;
       try {
-        var created = await api("/chat/conversations", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        });
-        addListItem(created);
-        currentId = created.id;
-        actionsEl.hidden = false;
-      } catch (error) {
-        flashError(error.message);
-        return;
+        data = await response.json();
+      } catch (e) {
+        data = null;
       }
+      if (!response.ok) {
+        throw new Error(
+          data && data.error ? data.error : "Upload failed (" + response.status + ")."
+        );
+      }
+      pendingAttachments.push(data);
+      renderPendingAttachments();
+    } catch (error) {
+      flashError(error.message);
+    }
+  }
+
+  async function startStream() {
+    if (streaming) return;
+    var content = inputEl.value.trim();
+    if (!content && pendingAttachments.length === 0) {
+      showComposerError("Please enter a message before sending.");
+      inputEl.focus();
+      return;
+    }
+    clearComposerError();
+    if (onboardingEl && !onboardingEl.hidden) {
+      flashError("Add a provider API key before sending a message.");
+      onboardingEl.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    try {
+      await ensureConversation();
+    } catch (error) {
+      flashError(error.message);
+      return;
     }
 
+    var attachments = pendingAttachments.slice();
+    var attachmentIds = attachments.map(function (attachment) {
+      return attachment.id;
+    });
     inputEl.value = "";
-    sendBtn.disabled = true;
+    pendingAttachments = [];
+    renderPendingAttachments();
+    autoGrowComposer();
     streaming = true;
-    addMessage("user", content);
+    cancelRequested = false;
+    currentController = new AbortController();
+    setComposerState("streaming");
+    setControlsDisabled(true);
+    setConversationStatus(currentId, true);
+    addMessage("user", content || "(image attached)", attachments);
 
     var typing = addTypingIndicator();
     var bodyEl = typing.querySelector(".typing-indicator");
@@ -238,7 +583,8 @@
           "Content-Type": "application/json",
           "X-CSRFToken": getCsrf(),
         },
-        body: JSON.stringify({ content: content }),
+        body: JSON.stringify({ content: content, attachment_ids: attachmentIds }),
+        signal: currentController.signal,
       });
 
       if (!response.ok) {
@@ -247,6 +593,14 @@
           errData = await response.json();
         } catch (e) {
           errData = null;
+        }
+        if (errData && errData.code === "provider_not_configured") {
+          showOnboarding(errData);
+          return;
+        }
+        if (errData && errData.code === "github_not_connected") {
+          showGitHubConnectPrompt(errData);
+          return;
         }
         throw new Error(errData && errData.error ? errData.error : "Stream failed (" + response.status + ").");
       }
@@ -257,6 +611,7 @@
       streamBody.className = "message-body";
       typing.appendChild(streamBody);
       streamBody.textContent = "";
+      var streamingCursor = addStreamingCursor(streamBody);
 
       var reader = response.body.getReader();
       var decoder = new TextDecoder();
@@ -281,25 +636,146 @@
           if (payload.type === "token") {
             fullText += payload.content;
             streamBody.innerHTML = renderMarkdown(fullText);
-            scrollToBottom();
+            addStreamingCursor(streamBody);
+            maybeScrollToBottom();
           } else if (payload.type === "error") {
             flashError(payload.error);
           } else if (payload.type === "done") {
-            streamBody.innerHTML = renderMarkdown(payload.message.content);
-            scrollToBottom();
+            if (payload.message) {
+              streamBody.innerHTML =
+                renderMarkdown(payload.message.content) +
+                renderAttachments(payload.message.attachments);
+              enhanceCode(streamBody);
+              var usage = payload.message.token_usage;
+              if (usage) {
+                var usageRow = document.createElement("div");
+                usageRow.className = "message-usage";
+                usageRow.textContent =
+                  usage.total_tokens.toLocaleString() +
+                  " tokens (" +
+                  (usage.prompt_tokens || 0).toLocaleString() +
+                  " + " +
+                  (usage.completion_tokens || 0).toLocaleString() +
+                  ")";
+                typing.appendChild(usageRow);
+                conversationUsage.prompt_tokens += usage.prompt_tokens || 0;
+                conversationUsage.completion_tokens += usage.completion_tokens || 0;
+                conversationUsage.total_tokens += usage.total_tokens || 0;
+                renderUsage();
+              }
+            }
+            maybeScrollToBottom();
           }
         });
       }
     } catch (error) {
-      flashError(error.message);
+      if (error && error.name === "AbortError") {
+        // The user pressed Stop: keep the partial reply already on screen.
+        flashInfo(cancelRequested ? "Generation stopped." : "Stream aborted.");
+      } else {
+        flashError(error.message);
+        showStreamRetry(error);
+      }
     } finally {
+      removeStreamingCursor(typing);
       typing.classList.remove("typing", "streaming");
-      if (!typing.querySelector(".message-body") || !typing.querySelector(".message-body").textContent) {
+      var finalBody = typing.querySelector(".message-body");
+      if (finalBody && finalBody.textContent) {
+        // Covers partial output too (e.g. stream cancelled before "done").
+        enhanceCode(finalBody);
+      }
+      if (!finalBody || !finalBody.textContent) {
         typing.remove();
       }
-      sendBtn.disabled = false;
+      currentController = null;
+      cancelRequested = false;
       streaming = false;
+      setComposerState("idle");
+      setControlsDisabled(false);
+      setConversationStatus(currentId, false);
+      sendBtn.disabled = !!(onboardingEl && !onboardingEl.hidden);
+      inputEl.focus();
     }
+  }
+
+  // Visible retry affordance when the SSE stream drops, so the user is not
+  // left with a silently truncated reply.
+  function showStreamRetry(error) {
+    var el = document.createElement("div");
+    el.className = "flash flash-error stream-retry";
+    el.appendChild(
+      document.createTextNode(
+        (error && error.message) || "The response stream was interrupted."
+      )
+    );
+    el.appendChild(document.createTextNode(" "));
+    var retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn btn-ghost btn-sm";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", function () {
+      if (el.parentNode) el.parentNode.removeChild(el);
+      startStream();
+    });
+    el.appendChild(retry);
+    messagesEl.prepend(el);
+  }
+
+  // "all" is the sentinel meaning "no workspace"; it is also what the server
+  // expects for an unscoped request.
+  function selectedWorkspaceId() {
+    return workspaceSelectEl && workspaceSelectEl.value ? workspaceSelectEl.value : "all";
+  }
+
+  // Point the selector at the workspace an opened conversation is filed under.
+  // An unknown id (a shared-in conversation belonging to somebody else's
+  // workspace) leaves the current selection untouched rather than blanking it.
+  function syncWorkspaceSelect(workspaceId) {
+    if (!workspaceSelectEl) return;
+    if (workspaceId === null || workspaceId === undefined) {
+      workspaceSelectEl.value = "all";
+      return;
+    }
+    var match = Array.prototype.some.call(workspaceSelectEl.options, function (option) {
+      return option.value === String(workspaceId);
+    });
+    if (match) workspaceSelectEl.value = String(workspaceId);
+  }
+
+  function appendWorkspaceOption(workspace) {
+    if (!workspaceSelectEl) return;
+    var option = document.createElement("option");
+    option.value = String(workspace.id);
+    option.textContent = workspace.name;
+    workspaceSelectEl.appendChild(option);
+  }
+
+  // Create a workspace inline and scope the sidebar to it. The name is trimmed
+  // and the server enforces the 200-character column limit, so a blank or
+  // oversized name is rejected before anything is stored.
+  async function createWorkspace() {
+    var name = window.prompt("Workspace name");
+    if (name === null) return;
+    name = name.trim();
+    if (!name) {
+      flashError("A workspace name is required.");
+      return;
+    }
+    var created;
+    try {
+      created = await api("/workspaces/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name }),
+      });
+    } catch (error) {
+      flashError(error.message);
+      return;
+    }
+    appendWorkspaceOption(created);
+    if (workspaceSelectEl) workspaceSelectEl.value = String(created.id);
+    newConversation();
+    refreshList();
   }
 
   function addListItem(conversation) {
@@ -307,26 +783,94 @@
     li.className = "conversation-item";
     li.dataset.id = conversation.id;
     li.dataset.title = conversation.title;
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.setAttribute("aria-label", "Open conversation: " + conversation.title);
     li.innerHTML =
       '<span class="conversation-title">' +
       escapeHtml(conversation.title) +
-      '</span><span class="conversation-meta">0 messages</span>';
+      '</span><span class="conversation-meta">0 messages ' +
+      '<time class="conversation-time" datetime="' +
+      (conversation.updated_at || "") +
+      '"></time></span>';
+    listEl.appendChild(li);
+    updateTimestamps(li);
+  }
+
+  function addHighlightedSnippet(parent, match) {
+    var snippet = match.snippet || {};
+    var item = document.createElement("div");
+    item.className = "conversation-search-match";
+    item.dataset.messageId = match.message_id;
+
+    var role = document.createElement("span");
+    role.className = "conversation-search-role";
+    role.textContent = match.role === "assistant" ? "Assistant" : "You";
+    item.appendChild(role);
+
+    item.appendChild(document.createTextNode(snippet.before || ""));
+    var highlighted = document.createElement("mark");
+    highlighted.textContent = snippet.match || "";
+    item.appendChild(highlighted);
+    item.appendChild(document.createTextNode(snippet.after || ""));
+    parent.appendChild(item);
+  }
+
+  function addSearchResult(result) {
+    var li = document.createElement("li");
+    li.className = "conversation-item conversation-search-result";
+    li.dataset.id = result.conversation_id;
+    li.dataset.title = result.title || "Untitled conversation";
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.setAttribute("aria-label", "Open conversation: " + li.dataset.title);
+
+    var title = document.createElement("span");
+    title.className = "conversation-title";
+    title.textContent = li.dataset.title;
+    li.appendChild(title);
+
+    var matches = document.createElement("div");
+    matches.className = "conversation-search-matches";
+    (result.matches || []).forEach(function (match) {
+      addHighlightedSnippet(matches, match);
+    });
+    if (!result.matches || result.matches.length === 0) {
+      var titleMatch = document.createElement("span");
+      titleMatch.className = "conversation-search-title-match";
+      titleMatch.textContent = "Title match";
+      matches.appendChild(titleMatch);
+    }
+    li.appendChild(matches);
     listEl.appendChild(li);
   }
 
   function refreshList() {
     var query = searchEl ? searchEl.value.trim() : "";
-    api("/chat/conversations" + (query ? "?q=" + encodeURIComponent(query) : ""))
+    var params = new URLSearchParams();
+    if (query) params.set("q", query);
+    // Scope the sidebar to the selected workspace. "all" is the default and is
+    // sent explicitly so the server treats it as "no filter" too.
+    params.set("workspace_id", selectedWorkspaceId());
+    api("/chat/conversations?" + params.toString())
       .then(function (items) {
         listEl.innerHTML = "";
         items.forEach(addListItem);
         if (items.length === 0) {
           listEl.innerHTML = '<p class="sidebar-empty">No conversations match your search.</p>';
         }
+        updateTimestamps(listEl);
       })
       .catch(function (error) {
         flashError(error.message);
       });
+  }
+
+  // Apply syntax highlighting once markdown has been rendered (issue #44).
+  // A no-op when highlight.js is unavailable, and unknown languages are left
+  // untouched, so the streaming flow is never interrupted.
+  function highlightCode(container) {
+    if (window.AICASyntaxHighlight) window.AICASyntaxHighlight.apply(container);
   }
 
   function flashError(message) {
@@ -336,13 +880,239 @@
     messagesEl.prepend(el);
   }
 
+  function flashInfo(message) {
+    var el = document.createElement("div");
+    el.className = "flash flash-info";
+    el.textContent = message;
+    messagesEl.prepend(el);
+  }
+
+  function flashSuccess(message) {
+    var el = document.createElement("div");
+    el.className = "flash flash-success";
+    el.textContent = message;
+    messagesEl.prepend(el);
+  }
+
+  // Connection prompt shown when a message references GitHub content (#issue,
+  // #pr, or owner/repo) but no GitHub account is linked (issue #74).
+  function showGitHubConnectPrompt(payload) {
+    var url = (payload && payload.connect_url) || "/github/connect";
+    var el = document.createElement("div");
+    el.className = "flash flash-error";
+    el.appendChild(
+      document.createTextNode(
+        (payload && payload.error) ||
+          "Connect your GitHub account to reference issues, pull requests, or repositories in chat."
+      )
+    );
+    el.appendChild(document.createTextNode(" "));
+    var link = document.createElement("a");
+    link.href = url;
+    link.textContent = "Connect GitHub";
+    el.appendChild(link);
+    messagesEl.prepend(el);
+  }
+
+  function showOnboarding(payload) {
+    if (!onboardingEl) {
+      if (payload && payload.error) flashError(payload.error);
+      return;
+    }
+    onboardingEl.hidden = false;
+    if (payload && payload.provider) onboardingEl.dataset.provider = payload.provider;
+    var note = document.getElementById("provider-onboarding-note");
+    if (note) note.textContent = (payload && payload.error) || "";
+    sendBtn.disabled = true;
+    onboardingEl.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function hideOnboarding() {
+    if (onboardingEl) onboardingEl.hidden = true;
+    sendBtn.disabled = false;
+  }
+
+  // Re-check the server's provider status so a key added on another page
+  // unlocks the composer without a full reload (issue #25).
+  function checkProviderStatus(options) {
+    return api("/chat/api/provider-status")
+      .then(function (status) {
+        if (status && status.configured) {
+          var wasVisible = !!(onboardingEl && !onboardingEl.hidden);
+          hideOnboarding();
+          if (wasVisible && options && options.notify) {
+            flashSuccess("Provider key detected — you can send messages now.");
+          }
+        } else if (onboardingEl) {
+          onboardingEl.hidden = false;
+          sendBtn.disabled = true;
+        }
+        return status;
+      })
+      .catch(function () {
+        return null;
+      });
+  }
+
+  // -- Model & generation settings (issue #12) ----------------------------
+
+  function loadProviderOptions() {
+    return api("/chat/api/options")
+      .then(function (data) {
+        providerOptions = data.providers || [];
+        defaults.default_provider = data.default_provider || "";
+        defaults.temperature = data.default_temperature != null ? data.default_temperature : 0.7;
+      })
+      .catch(function (error) {
+        flashError(error.message);
+      });
+  }
+
+  function renderProviderSelect(selected) {
+    if (!providerEl) return;
+    providerEl.innerHTML = "";
+    providerOptions.forEach(function (provider) {
+      var option = document.createElement("option");
+      option.value = provider.name;
+      option.textContent = provider.name + (provider.available ? "" : " (no API key)");
+      option.disabled = !provider.available;
+      if (!provider.available) {
+        option.title = "Add a " + provider.name + " API key on the Keys page to enable it.";
+      }
+      if (selected === provider.name) option.selected = true;
+      providerEl.appendChild(option);
+    });
+  }
+
+  function renderModelSelect(selected) {
+    if (!modelEl) return;
+    var provider = providerOptions.filter(function (item) {
+      return item.name === providerEl.value;
+    })[0];
+    var models = provider ? provider.models.slice() : [];
+    if (selected && models.indexOf(selected) === -1) models.unshift(selected);
+    modelEl.innerHTML = "";
+    var automatic = document.createElement("option");
+    automatic.value = "";
+    automatic.textContent = "Provider default";
+    modelEl.appendChild(automatic);
+    models.forEach(function (model) {
+      var option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      if (selected === model) option.selected = true;
+      modelEl.appendChild(option);
+    });
+  }
+
+  function setTemperature(value) {
+    if (!tempEl) return;
+    var numeric = isNaN(parseFloat(value)) ? defaults.temperature : parseFloat(value);
+    tempEl.value = numeric;
+    if (tempValueEl) tempValueEl.textContent = numeric.toFixed(1);
+  }
+
+  function firstAvailableProvider() {
+    var available = providerOptions.filter(function (item) { return item.available; });
+    return available.length ? available[0].name : "";
+  }
+
+  function applySettingsToPanel(settings) {
+    settings = settings || {};
+    var provider = settings.provider || defaults.default_provider || firstAvailableProvider();
+    renderProviderSelect(provider);
+    if (!providerEl.value || providerEl.selectedOptions[0].disabled) {
+      renderProviderSelect(firstAvailableProvider());
+    }
+    renderModelSelect(settings.model || "");
+    setTemperature(settings.temperature != null ? settings.temperature : defaults.temperature);
+    if (systemEl) systemEl.value = settings.system_prompt || "";
+  }
+
+  function collectSettings() {
+    return {
+      provider: providerEl ? providerEl.value : "",
+      model: modelEl ? modelEl.value : "",
+      temperature: tempEl ? parseFloat(tempEl.value) : defaults.temperature,
+      system_prompt: systemEl ? systemEl.value.trim() : "",
+    };
+  }
+
+  function persistSettings() {
+    if (currentId === null) return;
+    api("/chat/conversations/" + currentId + "/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectSettings()),
+    }).catch(function (error) {
+      flashError(error.message);
+    });
+  }
+
+  var persistTimer = null;
+  function persistSettingsDebounced() {
+    window.clearTimeout(persistTimer);
+    persistTimer = window.setTimeout(persistSettings, 400);
+  }
+
+
   document.addEventListener("DOMContentLoaded", function () {
+    updateTimestamps();
+    autoGrowComposer();
+    inputEl.focus();
+
     listEl.addEventListener("click", function (event) {
       var item = event.target.closest(".conversation-item");
       if (item && !streaming) loadConversation(item.dataset.id);
     });
 
-    sendBtn.addEventListener("click", startStream);
+    if (onboardingEl && !onboardingEl.hidden) {
+      sendBtn.disabled = true;
+      var recheck = document.getElementById("provider-recheck");
+      if (recheck) {
+        recheck.addEventListener("click", function () {
+          checkProviderStatus({ notify: true });
+        });
+      }
+      window.addEventListener("focus", function () {
+        checkProviderStatus({});
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (!document.hidden) checkProviderStatus({});
+      });
+    }
+
+    sendBtn.addEventListener("click", function () {
+      if (streaming) {
+        stopStream();
+      } else {
+        startStream();
+      }
+    });
+
+    if (attachBtn && imageInput) {
+      attachBtn.addEventListener("click", function () {
+        imageInput.click();
+      });
+      imageInput.addEventListener("change", function () {
+        Array.prototype.slice.call(imageInput.files || []).forEach(uploadImage);
+        imageInput.value = "";
+      });
+    }
+
+    // Keyboard activation for the conversation list (Enter/Space).
+    listEl.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      var item = event.target.closest(".conversation-item");
+      if (item && !streaming) {
+        event.preventDefault();
+        loadConversation(item.dataset.id);
+      }
+    });
+    inputEl.addEventListener("input", function () {
+      autoGrowComposer();
+      clearComposerError();
+    });
     inputEl.addEventListener("keydown", function (event) {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -351,6 +1121,46 @@
     });
 
     document.getElementById("new-conversation").addEventListener("click", newConversation);
+
+    if (workspaceSelectEl) {
+      // Changing the workspace re-scopes the sidebar to that project folder.
+      workspaceSelectEl.addEventListener("change", function () {
+        newConversation();
+        refreshList();
+      });
+    }
+    if (newWorkspaceBtn) {
+      newWorkspaceBtn.addEventListener("click", createWorkspace);
+    }
+
+    if (providerEl) {
+      providerEl.addEventListener("change", function () {
+        renderModelSelect("");
+        persistSettings();
+      });
+    }
+    if (modelEl) {
+      modelEl.addEventListener("change", persistSettings);
+    }
+    if (tempEl) {
+      tempEl.addEventListener("input", function () {
+        if (tempValueEl) tempValueEl.textContent = parseFloat(tempEl.value).toFixed(1);
+      });
+      tempEl.addEventListener("change", persistSettings);
+    }
+    if (systemEl) {
+      systemEl.addEventListener("input", persistSettingsDebounced);
+    }
+
+    loadProviderOptions().then(function () {
+      var params = new URLSearchParams(window.location.search);
+      var openId = params.get("conversation");
+      if (openId) {
+        loadConversation(openId);
+      } else {
+        applySettingsToPanel({});
+      }
+    });
 
     if (searchEl) {
       searchEl.addEventListener("input", function () {
@@ -362,6 +1172,29 @@
       var id = currentId;
       var button = event.target.closest("button");
       if (!button || id === null) return;
+      if (button.dataset.revokeShareLinkId) {
+        api("/chat/conversations/" + id + "/share-links/" + button.dataset.revokeShareLinkId, {
+          method: "DELETE",
+        }).then(function () { loadShareLinks(id); }).catch(function (error) { flashError(error.message); });
+        return;
+      }
+      if (button.id === "create-share-link") {
+        api("/chat/conversations/" + id + "/share-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }).then(function (share) {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(share.url).catch(function () {
+              window.prompt("Copy this read-only link:", share.url);
+            });
+          } else {
+            window.prompt("Copy this read-only link:", share.url);
+          }
+          loadShareLinks(id);
+        }).catch(function (error) { flashError(error.message); });
+        return;
+      }
       if (button.id === "rename-conversation") {
         var title = prompt("Rename conversation:", "");
         if (title === null) return;
@@ -385,6 +1218,21 @@
         }).catch(function (error) {
           flashError(error.message);
         });
+      } else if (button.id === "share-conversation") {
+        var username = prompt("Share this conversation with username:", "");
+        if (username === null) return;
+        api("/chat/conversations/" + id + "/shares", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username.trim() }),
+        }).then(function () {
+          var note = document.createElement("div");
+          note.className = "flash flash-success";
+          note.textContent = "Conversation shared.";
+          messagesEl.prepend(note);
+        }).catch(function (error) {
+          flashError(error.message);
+        });
       } else if (button.id === "export-conversation") {
         window.location.href = "/chat/conversations/" + id + "/export";
       } else if (button.id === "delete-conversation") {
@@ -398,4 +1246,15 @@
       }
     });
   });
+
+  // Test seam: expose the pure client helpers so the frontend unit tests can
+  // exercise them under jsdom without a browser. This is deliberately small and
+  // additive - it does not change any runtime behaviour.
+  window.AICA = {
+    escapeHtml: escapeHtml,
+    formatRelativeTime: formatRelativeTime,
+    renderMarkdown: renderMarkdown,
+    isNearBottom: isNearBottom,
+    getCsrf: getCsrf,
+  };
 })();

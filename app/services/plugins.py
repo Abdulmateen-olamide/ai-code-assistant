@@ -7,31 +7,166 @@ This module provides:
 - Custom exceptions for plugin system
 """
 
-import base64
-import binascii
 import importlib
 import json
 import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
 from app.services.plugin_compat import is_valid_compatibility
+from app.services.plugin_deps import PluginRef
+from app.services.plugin_execution import run_with_timeout
+from app.services.plugin_signatures import (
+    TRUSTED,
+    UNVERIFIED,
+    VERIFY_IF_PRESENT,
+    VERIFY_REQUIRED,
+    PublisherTrust,
+    evaluate_signature,
+    validate_signature_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
-TRUSTED = "Trusted"
-UNVERIFIED = "Unverified"
-INVALID = "Invalid"
-VERIFY_IF_PRESENT = "if-present"
-VERIFY_REQUIRED = "required"
+#: The declared plugin manifest contract. Runtime validation below is driven by
+#: this schema (see :func:`load_manifest_schema`) so the two cannot silently
+#: drift apart.
+MANIFEST_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "plugins" / "plugin.schema.json"
+
+#: Manifest keys that are produced by the runtime rather than declared in the
+#: schema. They are tolerated on input so a manifest serialized by
+#: :meth:`PluginManifest.to_dict` can be re-validated.
+_RUNTIME_MANAGED_FIELDS = frozenset({"trust_state", "trust_publisher"})
+
+
+@lru_cache(maxsize=1)
+def load_manifest_schema() -> dict[str, Any]:
+    """Load the published plugin manifest JSON Schema.
+
+    The schema is the single declared contract for ``manifest.json`` files; the
+    runtime validator derives its field rules from it. The result is cached for
+    the lifetime of the process.
+    """
+    with MANIFEST_SCHEMA_PATH.open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _manifest_property(field: str) -> dict[str, Any]:
+    """Return the schema rules declared for a single manifest field."""
+    return load_manifest_schema()["properties"][field]
+
+
+def _matches_schema_pattern(field: str, value: str) -> bool:
+    """Return ``True`` when ``value`` matches the schema's ``pattern`` for ``field``."""
+    pattern = _manifest_property(field).get("pattern")
+    return pattern is None or re.match(pattern, value) is not None
+
+
+def _validate_string_field(field: str, value: Any) -> list[str]:
+    """Validate an optional string field against the schema's length bounds."""
+    rules = _manifest_property(field)
+    if not isinstance(value, str):
+        return [f"Invalid {field}: must be a string"]
+    errors: list[str] = []
+    min_length = rules.get("minLength", 0)
+    max_length = rules.get("maxLength")
+    if len(value) < min_length:
+        errors.append(f"Invalid {field}: must be a non-empty string")
+    if max_length is not None and len(value) > max_length:
+        errors.append(f"Invalid {field}: must be at most {max_length} characters")
+    return errors
+
+
+def _validate_string_list(field: str, value: Any) -> list[str]:
+    """Validate an optional string-array field declared in the schema."""
+    rules = _manifest_property(field)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        return [f"Invalid {field}: must be a list of strings"]
+    if rules.get("uniqueItems") and len(set(value)) != len(value):
+        return [f"Invalid {field}: must not contain duplicates"]
+    return []
+
+
+def _validate_manifest_contract(data: dict[str, Any]) -> list[str]:
+    """Validate ``data`` against the declared manifest schema.
+
+    Returns a list of human-readable errors (empty when valid). Rules and their
+    bounds (patterns, enum, lengths, uniqueness) are read from
+    ``plugins/plugin.schema.json`` so the schema stays the single source of
+    truth for the manifest contract.
+    """
+    schema = load_manifest_schema()
+    properties = schema["properties"]
+
+    # Required fields are validated first: later checks assume they exist.
+    errors = [
+        f"Missing required field: {field}" for field in schema["required"] if field not in data
+    ]
+    if errors:
+        return errors
+
+    # The schema sets ``additionalProperties: false``; runtime-managed trust
+    # fields are tolerated so ``to_dict()`` output round-trips.
+    if schema.get("additionalProperties") is False:
+        errors.extend(
+            f"Unknown manifest field: {field}"
+            for field in data
+            if field not in properties and field not in _RUNTIME_MANAGED_FIELDS
+        )
+
+    plugin_id = data["id"]
+    if not isinstance(plugin_id, str) or not _matches_schema_pattern("id", plugin_id):
+        errors.append(
+            "Invalid id format: must start with lowercase letter, "
+            "contain only lowercase letters, numbers, hyphens, underscores"
+        )
+    else:
+        max_length = _manifest_property("id").get("maxLength")
+        if max_length is not None and len(plugin_id) > max_length:
+            errors.append(f"Invalid id format: must be at most {max_length} characters")
+
+    version = data["version"]
+    if not _is_valid_semver(version):
+        errors.append("Invalid version format: must be semantic version (e.g., 0.1.0)")
+
+    entry_point = data["entry_point"]
+    if not isinstance(entry_point, str) or not _matches_schema_pattern("entry_point", entry_point):
+        errors.append("Invalid entry_point format: must be 'module.path:ClassName'")
+
+    for field in ("name", "description", "author"):
+        errors.extend(_validate_string_field(field, data[field]))
+
+    capabilities = data["capabilities"]
+    cap_rules = properties["capabilities"]
+    allowed_capabilities = cap_rules["items"]["enum"]
+    if not isinstance(capabilities, list) or len(capabilities) < cap_rules.get("minItems", 1):
+        errors.append("Capabilities must be a non-empty list")
+    else:
+        seen: set[str] = set()
+        for cap in capabilities:
+            if not isinstance(cap, str) or cap not in allowed_capabilities:
+                errors.append(f"Unknown capability: {cap}")
+                continue
+            if cap in seen:
+                errors.append(f"Duplicate capability: {cap}")
+            seen.add(cap)
+
+    for field in ("permissions", "dependencies"):
+        value = data.get(field)
+        if value is not None:
+            errors.extend(_validate_string_list(field, value))
+
+    configuration = data.get("configuration")
+    if configuration is not None and not isinstance(configuration, dict):
+        errors.append("Invalid configuration: must be an object")
+
+    return errors
 
 
 class PluginError(Exception):
@@ -48,6 +183,12 @@ class ManifestValidationError(PluginError):
 
 class PluginRegistrationError(PluginError):
     """Plugin registration failed."""
+
+    pass
+
+
+class PluginDependencyResolutionError(PluginError):
+    """Plugin enable refused because a required dependency is unsatisfied."""
 
     pass
 
@@ -115,61 +256,15 @@ class PluginManifest:
         Raises:
             ManifestValidationError: If manifest is invalid
         """
-        errors = []
+        if not isinstance(data, dict):
+            raise ManifestValidationError("Plugin manifest must be a JSON object")
 
-        # Validate required fields
-        required = ["id", "name", "version", "description", "author", "entry_point", "capabilities"]
-        for field in required:
-            if field not in data:
-                errors.append(f"Missing required field: {field}")
-
-        if errors:
-            raise ManifestValidationError("; ".join(errors))
-
-        # Validate id format
-        if not re.match(r"^[a-z][a-z0-9_-]*$", data.get("id", "")):
-            errors.append(
-                "Invalid id format: must start with lowercase letter, "
-                "contain only lowercase letters, numbers, hyphens, underscores"
-            )
-
-        # Validate version format (semantic versioning)
-        if not _is_valid_semver(data.get("version", "")):
-            errors.append("Invalid version format: must be semantic version (e.g., 0.1.0)")
-
-        # Validate entry_point format
-        entry_point = data.get("entry_point", "")
-        if not re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_.:]*:[a-zA-Z_][a-zA-Z0-9_]*$", entry_point):
-            errors.append("Invalid entry_point format: must be 'module.path:ClassName'")
-
-        # Validate capabilities
-        capabilities = data.get("capabilities", [])
-        valid_capabilities = {
-            "PROJECT_READ",
-            "PROJECT_WRITE",
-            "PROJECT_DELETE",
-            "WORKSPACE_READ",
-            "WORKSPACE_WRITE",
-            "GITHUB_READ",
-            "GITHUB_WRITE",
-            "AI_ACCESS",
-            "AI_ANALYSIS",
-            "NOTIFICATION_CREATE",
-            "STELLAR_READ",
-            "STELLAR_WRITE",
-            "STELLAR_ANALYSIS",
-            "REVIEW_READ",
-            "REVIEW_CREATE",
-        }
-        if not isinstance(capabilities, list) or not capabilities:
-            errors.append("Capabilities must be a non-empty list")
-        else:
-            for cap in capabilities:
-                if cap not in valid_capabilities:
-                    errors.append(f"Unknown capability: {cap}")
+        errors = _validate_manifest_contract(data)
 
         # Validate the PEP 440 compatibility specifier (e.g. ">=0.8.0"). The
         # field is optional; when omitted the plugin supports any app version.
+        # PEP 440 cannot be expressed in the JSON Schema, so this runtime check
+        # is intentionally stricter than the declared `compatibility` string.
         compatibility = data.get("compatibility")
         if compatibility is not None and not is_valid_compatibility(compatibility):
             errors.append(f"Invalid compatibility specifier: {compatibility}")
@@ -178,9 +273,7 @@ class PluginManifest:
             raise ManifestValidationError("; ".join(errors))
 
         signature = data.get("signature")
-        signature_error = _validate_signature_metadata(signature)
-        if signature_error:
-            errors.append(signature_error)
+        signature_error = validate_signature_metadata(signature)
 
         if trust_policy not in (VERIFY_IF_PRESENT, VERIFY_REQUIRED):
             raise ManifestValidationError(f"Invalid plugin trust policy: {trust_policy}")
@@ -193,8 +286,8 @@ class PluginManifest:
             raise ManifestValidationError(
                 f"Plugin manifest trust verification failed: {trust_state}"
             )
-        if errors:
-            raise ManifestValidationError("; ".join(errors))
+        if signature_error:
+            raise ManifestValidationError(signature_error)
 
         return cls(
             id=data["id"],
@@ -269,62 +362,14 @@ class PluginManifest:
         }
 
 
-def _validate_signature_metadata(signature: Any) -> str | None:
-    """Validate the shape of optional signature metadata."""
-    if signature is None:
-        return None
-    if not isinstance(signature, dict):
-        return "Invalid signature: must be an object"
-    if set(signature) != {"publisher", "algorithm", "value"}:
-        return "Invalid signature: expected publisher, algorithm, and value"
-    if not all(isinstance(signature.get(key), str) and signature[key] for key in signature):
-        return "Invalid signature: publisher, algorithm, and value must be non-empty strings"
-    if signature["algorithm"] != "ed25519":
-        return "Invalid signature: algorithm must be ed25519"
-    return None
-
-
-def _canonical_manifest_body(data: dict[str, Any]) -> bytes:
-    """Return the stable JSON representation signed by plugin publishers."""
-    body = {key: value for key, value in data.items() if key != "signature"}
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-
-
-def _decode_public_key(value: str | bytes) -> bytes:
-    if isinstance(value, bytes):
-        return value
-    if value.startswith("-----BEGIN"):
-        from cryptography.hazmat.primitives import serialization
-
-        return serialization.load_pem_public_key(value.encode()).public_bytes(
-            serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw,
-        )
-    return base64.b64decode(value, validate=True)
-
-
 def _verify_signature(
     data: dict[str, Any],
     signature: Any,
     trusted_publishers: dict[str, str | bytes],
 ) -> tuple[str, str | None]:
-    if signature is None:
-        return UNVERIFIED, None
-    if _validate_signature_metadata(signature):
-        return INVALID, signature.get("publisher") if isinstance(signature, dict) else None
-    publisher = signature["publisher"]
-    key_value = trusted_publishers.get(publisher)
-    if key_value is None:
-        return INVALID, publisher
-    try:
-        public_key = Ed25519PublicKey.from_public_bytes(_decode_public_key(key_value))
-        public_key.verify(
-            base64.b64decode(signature["value"], validate=True),
-            _canonical_manifest_body(data),
-        )
-    except (ValueError, TypeError, binascii.Error, InvalidSignature):
-        return INVALID, publisher
-    return TRUSTED, publisher
+    """Return the ``(trust_state, publisher)`` facts for an embedded signature."""
+    trust: PublisherTrust = evaluate_signature(data, signature, trusted_publishers)
+    return trust.state, trust.publisher
 
 
 class Plugin:
@@ -355,7 +400,7 @@ class Plugin:
             self.module = importlib.import_module(module_path)
             if not hasattr(self.module, class_name):
                 raise PluginLoadError(f"Class {class_name} not found in module {module_path}")
-            self.loaded_at = datetime.utcnow()
+            self.loaded_at = datetime.now(UTC)
             logger.info(f"Loaded plugin: {self.manifest.id}")
         except ImportError as e:
             raise PluginLoadError(f"Cannot import plugin module: {e}") from e
@@ -404,7 +449,7 @@ class Plugin:
         if not callable(method):
             return {"hook": hook, "called": False, "ok": True, "error": None}
         try:
-            method()
+            run_with_timeout(method, operation=f"hook:{hook}")
         except Exception as exc:
             logger.error(
                 "Plugin %s hook %s failed: %s",
@@ -530,20 +575,57 @@ class PluginRegistry:
     def enable(self, plugin_id: str) -> None:
         """Enable plugin and run its optional ``on_enable`` hook.
 
+        All declared dependencies (PEP 508 requirement strings) are resolved
+        before the plugin becomes enabled: registered plugin dependencies must
+        exist and be enabled, and Python package dependencies must be installed
+        at a satisfying version. A failure refuses the enable and leaves the
+        plugin disabled.
+
         Args:
             plugin_id: Plugin identifier
 
         Raises:
             PluginRegistrationError: If plugin not found
+            PluginDependencyResolutionError: If required dependencies cannot
+                be satisfied
         """
         plugin = self.get(plugin_id)
         if not plugin:
             raise PluginRegistrationError(f"Plugin not found: {plugin_id}")
         if plugin.enabled:
             return
+
+        from app.services.plugin_deps import (
+            DependencyResolver,
+            PluginDependencyError,
+        )
+
+        resolver = DependencyResolver(self._plugin_ref)
+        try:
+            resolver.resolve(self._to_ref(plugin))
+        except PluginDependencyError as exc:
+            raise PluginDependencyResolutionError(
+                f"Cannot enable plugin {plugin_id}: {exc.message}"
+            ) from exc
+
         plugin.enabled = True
         self._run_hook(plugin, "on_enable")
         logger.info(f"Enabled plugin: {plugin_id}")
+
+    @staticmethod
+    def _to_ref(plugin: "Plugin") -> "PluginRef":
+        """Adapt a registry :class:`Plugin` to the resolver's :class:`PluginRef`."""
+        return PluginRef(
+            id=plugin.manifest.id,
+            version=plugin.manifest.version,
+            enabled=plugin.enabled,
+            dependencies=tuple(plugin.manifest.dependencies or ()),
+        )
+
+    def _plugin_ref(self, plugin_id: str) -> "PluginRef | None":
+        """Look up a registered plugin as a :class:`PluginRef` (for resolution)."""
+        plugin = self.get(plugin_id)
+        return None if plugin is None else self._to_ref(plugin)
 
     def disable(self, plugin_id: str) -> None:
         """Disable plugin and run its optional ``on_disable`` hook.
@@ -671,16 +753,13 @@ class PluginRegistry:
 def _is_valid_semver(version: str) -> bool:
     """Check if version string is valid semantic version.
 
+    The accepted pattern is read from the manifest schema's ``version``
+    constraint so the runtime check cannot drift from the declared contract.
+
     Args:
         version: Version string to check
 
     Returns:
         True if valid semver
     """
-    pattern = (
-        r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d?)"
-        r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)"
-        r"(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
-        r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
-    )
-    return bool(re.match(pattern, version))
+    return isinstance(version, str) and _matches_schema_pattern("version", version)

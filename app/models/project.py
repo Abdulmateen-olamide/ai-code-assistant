@@ -41,8 +41,15 @@ class Project(db.Model):
     name = db.Column(db.String(200), nullable=False)
     source = db.Column(db.String(20), nullable=False, default=SOURCE_ARCHIVE)
     source_url = db.Column(db.String(500), nullable=True)
+    # Duplicate-import detection: a SHA-256 hex digest of an archive import, or
+    # the GitHub repository's default branch. Both are nullable because they are
+    # only meaningful for their respective source.
+    content_hash = db.Column(db.String(64), nullable=True, index=True)
+    default_branch = db.Column(db.String(255), nullable=True)
     status = db.Column(db.String(20), nullable=False, default=STATUS_INDEXING)
     error_message = db.Column(db.Text, nullable=True)
+    # Indexing progress percentage (0-100); 100 once ``status`` is ready.
+    progress = db.Column(db.Integer, nullable=False, default=0)
     file_count = db.Column(db.Integer, nullable=False, default=0)
     total_size_bytes = db.Column(db.BigInteger, nullable=False, default=0)
     indexed_at = db.Column(db.DateTime(timezone=True), nullable=True)
@@ -68,6 +75,12 @@ class Project(db.Model):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="ProjectMessage.created_at",
+    )
+    chat_sessions = db.relationship(
+        "ProjectChatSession",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectChatSession.updated_at.desc()",
     )
     reviews = db.relationship(
         "Review",
@@ -98,6 +111,7 @@ class Project(db.Model):
             "source_url": self.source_url,
             "status": self.status,
             "error_message": self.error_message,
+            "progress": int(self.progress or 0),
             "file_count": self.file_count,
             "total_size_bytes": self.total_size_bytes,
             "indexed_at": self.indexed_at.isoformat() if self.indexed_at else None,
