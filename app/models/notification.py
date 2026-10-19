@@ -1,12 +1,12 @@
 """Notification model and notification-type catalog.
 
-A persisted per-user notification produced through the single ``notify()``
+A persisted per-user notification produced through the single `notify()`
 service. Notification types are shared with the notification wiring (149) and
 the preference model (150) so opt-outs map 1:1 to the types the app produces.
 
-Security: ``payload`` must never contain secrets, invitation tokens, or another
+Security: `payload` must never contain secrets, invitation tokens, or another
 user's data. Users can only ever read their own notifications (enforced by the
-notification API which always filters on ``current_user.id``).
+notification API which always filters on `current_user.id`).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ NOTIF_MEMBERSHIP = "membership"
 NOTIF_ROLE_CHANGE = "role_change"
 NOTIF_AI_EVENT = "ai_event"
 NOTIF_SHARE = "share"
+NOTIF_BUDGET_ALERT = "budget_alert"
 
 # Notification types that are always delivered: users cannot disable security-
 # critical system notifications about their own access.
@@ -31,6 +32,7 @@ NOTIF_TYPES = (
     NOTIF_ROLE_CHANGE,
     NOTIF_AI_EVENT,
     NOTIF_SHARE,
+    NOTIF_BUDGET_ALERT,
 )
 
 

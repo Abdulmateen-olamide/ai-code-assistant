@@ -1,6 +1,7 @@
 """Tests for the chat JSON API (``/api/conversations``, issue #5)."""
 
-from app.models import Conversation
+from app.models import Conversation, Message, User
+from app.services import usage_ledger
 
 
 def _register(client, username="apiuser", email="apiuser@example.com"):
@@ -109,6 +110,54 @@ class TestConversationEndpoints:
         assert delete.status_code == 404
         assert db.session.get(Conversation, created["id"]) is not None
 
+    def test_search_finds_message_content_and_returns_highlighted_snippet(self, client, db):
+        _register(client)
+        created = _create_conversation(client, title="Release notes").get_json()
+        db.session.add(
+            Message(
+                conversation_id=created["id"],
+                role="assistant",
+                content="The deployment uses PostgreSQL full-text search.",
+            )
+        )
+        db.session.commit()
+
+        response = client.get("/chat/search?q=postgresql")
+
+        assert response.status_code == 200
+        result = response.get_json()[0]
+        assert result["conversation_id"] == created["id"]
+        assert result["title"] == "Release notes"
+        assert result["matches"][0]["snippet"]["match"] == "PostgreSQL"
+
+    def test_search_is_scoped_to_the_authenticated_user(self, client, db):
+        _register(client, username="owner", email="owner@example.com")
+        owner_conversation = _create_conversation(client, title="Owner").get_json()
+        db.session.add(
+            Message(
+                conversation_id=owner_conversation["id"],
+                role="user",
+                content="private project phrase",
+            )
+        )
+        db.session.commit()
+
+        client.post("/auth/logout")
+        _register(client, username="other", email="other@example.com")
+        other_conversation = _create_conversation(client, title="Other").get_json()
+        db.session.add(
+            Message(
+                conversation_id=other_conversation["id"],
+                role="user",
+                content="private project phrase",
+            )
+        )
+        db.session.commit()
+
+        results = client.get("/chat/search?q=private%20project").get_json()
+
+        assert [result["conversation_id"] for result in results] == [other_conversation["id"]]
+
 
 class TestMessageEndpoint:
     def test_send_message_returns_reply(self, client, db):
@@ -148,6 +197,20 @@ class TestMessageEndpoint:
         assert response.status_code == 400
         _problem(response)
 
+    def test_send_message_can_stream_an_sse_reply(self, client, db):
+        _register(client)
+        created = _create_conversation(client).get_json()
+        response = client.post(
+            f"/api/conversations/{created['id']}/messages",
+            json={"content": "Stream this reply"},
+            headers={"X-CSRFToken": "ignored", "Accept": "text/event-stream"},
+        )
+        assert response.status_code == 200
+        assert response.mimetype == "text/event-stream"
+        body = response.get_data(as_text=True)
+        assert "event: message_start" in body
+        assert "event: message_end" in body
+
     def test_send_message_is_owner_scoped(self, client, db):
         _register(client, username="owner", email="owner@example.com")
         created = _create_conversation(client).get_json()
@@ -160,6 +223,67 @@ class TestMessageEndpoint:
         )
         assert response.status_code == 404
         _problem(response)
+
+
+class TestUsageBreakdown:
+    def test_requires_authentication(self, client):
+        response = client.get("/api/usage/breakdown")
+        assert response.status_code == 401
+        _problem(response)
+
+    def test_returns_ledger_breakdown_and_usage_summary(self, client, db):
+        _register(client)
+        user = User.query.filter_by(email="apiuser@example.com").one()
+        usage_ledger.record_usage(
+            source="chat",
+            user=user,
+            provider="mock",
+            model="mock-1",
+            prompt_tokens=10,
+        )
+        usage_ledger.record_usage(
+            source="analysis",
+            user=user,
+            provider="mock",
+            model="mock-1",
+            prompt_tokens=20,
+            completion_tokens=5,
+        )
+        usage_ledger.record_usage(source="legacy-source", user=user, prompt_tokens=1)
+
+        response = client.get("/api/usage/breakdown")
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["by_source"]["chat"]["count"] == 1
+        assert payload["by_source"]["analysis"]["total_tokens"] == 25
+        assert payload["by_source"]["unknown"]["count"] == 1
+        assert payload["totals"]["count"] == 3
+        assert payload["currency"]["code"] == "USD"
+        assert payload["cost_is_estimate"] is True
+
+        conversation = Conversation(user_id=user.id, title="Usage")
+        db.session.add(conversation)
+        db.session.commit()
+        db.session.add(
+            Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content="reply",
+                prompt_tokens=4,
+                completion_tokens=6,
+                total_tokens=10,
+            )
+        )
+        db.session.commit()
+
+        summary = client.get("/api/usage")
+        assert summary.status_code == 200
+        assert summary.get_json() == {
+            "prompt_tokens": 4,
+            "completion_tokens": 6,
+            "total_tokens": 10,
+        }
 
 
 class TestRateLimit:

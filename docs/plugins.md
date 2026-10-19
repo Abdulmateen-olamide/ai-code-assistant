@@ -4,11 +4,14 @@ The AI Code Assistant ships an extensible plugin architecture so that Stellar,
 Soroban, GitHub, AI-provider, and developer-tooling features can be added
 without modifying the core application.
 
-> **Status:** Phase 8. Manifest validation, the registry, the capability model,
-> the event system with fail-closed dispatch-time capability enforcement, and a
-> workspace-scoped plugin management API + UI are implemented and tested.
-> Dependency resolution, compatibility/versioning, signing/trust, and a
-> marketplace are **not** implemented yet — see [Contributing](#contributing).
+> **Status:** Phase 8 + Phase 9 security foundations. Manifest validation, the
+> registry, the capability model, the event system with fail-closed
+> dispatch-time capability enforcement, a workspace-scoped plugin management API
+> + UI, publisher trust (trusted keys, embedded and detached Ed25519
+> signatures), catalog-pinned remote installation, and the plugin lock-entry
+> model are implemented and tested. A browsable marketplace, artifact
+> download/verification, and remote update/rollback are **not** implemented yet
+> — see [Contributing](#contributing).
 
 ## Concepts
 
@@ -74,6 +77,9 @@ separated ranges). Enforcement lives in
 - **Invalid** specifier → the manifest is rejected during validation.
 - **Incompatible** range → installation is refused with a clear message naming
   the required range and the current app version.
+- **Updates are gated too**: `POST .../plugins/<plugin_id>/update` refuses a
+  manifest whose range excludes the running version *before* writing anything,
+  so an incompatible release can never replace a working installation.
 - Compatible plugins register normally, and the management API exposes a
   compatibility badge in plugin metadata (`compatibility`,
   `compatible_with_app`, and `app_version`).
@@ -185,6 +191,23 @@ Per-workspace lifecycle is also observable through the dispatcher events
 enable/disable and an owner-only `uninstall` action that revokes every
 workspace capability grant and removes the workspace installation.
 
+### Execution timeout (#408)
+
+Plugin event handlers and lifecycle hooks run with a bounded execution budget
+(`app/services/plugin_execution.py`). The budget is
+`PLUGIN_EXECUTION_TIMEOUT` seconds (default `5`; `0` or negative disables it):
+
+- the callback runs in a short-lived daemon thread while the request waits;
+- if it overruns, the dispatcher **stops waiting**, records one bounded error
+  report (`plugin_error_reports`, operation `dispatch:<event>` or
+  `hook:<hook>`), and continues with the next handler or lifecycle step;
+- state changes still land: enabling/disabling always completes, and dispatch
+  keeps running the remaining subscribers.
+
+Python cannot interrupt a thread, so an over-budget callback is **abandoned**
+rather than killed. It may still finish in the background, which is why plugin
+code must be idempotent and must not depend on being stopped.
+
 ## Plugin management (API + UI)
 
 ### Operator CLI
@@ -200,6 +223,7 @@ flask plugins inspect <plugin_id>       # full manifest metadata + state
 flask plugins enable <plugin_id>        # enable (operator scope)
 flask plugins disable <plugin_id>       # disable (operator scope)
 flask plugins install <local-path>      # register from a local manifest dir
+flask plugins publishers                # list trusted publisher ids (never keys)
 ```
 
 Every command supports `--json` for stable, parseable output. Exit codes
@@ -226,7 +250,10 @@ management operations.
 | `GET`  | `/plugins/api/workspaces` | Workspaces the user can access | any member |
 | `GET`  | `/plugins/api/workspaces/<id>/plugins` | List plugins + installation state | any member |
 | `GET`  | `/plugins/api/workspaces/<id>/plugins/<plugin_id>` | Inspect one plugin | any member |
+| `GET`  | `/plugins/api/trusted-publishers` | List configured trusted publisher ids (never keys) and the active policy | authenticated |
 | `POST` | `/plugins/api/workspaces/<id>/plugins/install` | Install a trusted/local manifest | owner |
+| `POST` | `/plugins/api/workspaces/<id>/plugins/install-from-catalog` | Install a catalog-pinned plugin (trust policy enforced) | owner |
+| `POST` | `/plugins/api/workspaces/<id>/plugins/<plugin_id>/update` | Update a registered plugin from a manifest (compatibility-gated) | owner |
 | `POST` | `/plugins/api/workspaces/<id>/plugins/<plugin_id>/enable` | Enable the workspace installation | owner |
 | `POST` | `/plugins/api/workspaces/<id>/plugins/<plugin_id>/disable` | Disable the workspace installation | owner |
 | `POST` | `/plugins/api/workspaces/<id>/plugins/<plugin_id>/capabilities` | Explicitly grant/revoke capabilities (`{"grant": [...], "revoke": [...]}`) | owner |
@@ -248,6 +275,154 @@ validated manifest — a client cannot override it (identity binding). Installin
 Capabilities granted through the API must be declared in the plugin's manifest
 (declared vs granted are kept distinct). The `manage_plugins` role gate is the
 only way to grant/revoke through the UI; grants are never implicit.
+
+### Publisher trust: keys and detached signatures (#385, #386)
+
+Operators list trusted publishers in `PLUGIN_TRUSTED_KEYS`, a JSON object that
+maps a publisher id (lowercase `[a-z0-9._-]`, at most 64 characters) to an
+Ed25519 public key. Keys may be base64-encoded raw 32-byte keys or PEM
+`SubjectPublicKeyInfo` text:
+
+```bash
+export PLUGIN_TRUSTED_KEYS='{"acme-labs": "<base64 or PEM Ed25519 public key>"}'
+export PLUGIN_TRUST_POLICY=required   # or if-present (default)
+```
+
+Key material is validated when the application starts
+(`app.services.plugin_trust.validate_trust_config`): a malformed key, a
+non-canonical publisher id, or an unknown policy aborts startup with a clear
+message instead of silently treating every signature as invalid. Keys are
+never returned by the API or the CLI — inspect the configured ids with:
+
+```bash
+flask plugins publishers             # human-readable ids + policy
+flask plugins publishers --json      # {"publishers": [...], "count": N, "policy": ...}
+```
+
+`GET /plugins/api/trusted-publishers` exposes the same read-only view (any
+authenticated user): publisher ids, a count, and the active policy, never key
+bytes or fingerprints.
+
+A publisher signs the **canonical manifest body**: compact, key-sorted JSON with
+`signature`, `trust_state`, and `trust_publisher` removed. The signature is a
+base64 Ed25519 signature over those bytes and may be:
+
+- **embedded** in the manifest (`"signature": {"publisher", "algorithm":
+  "ed25519", "value"}`), or
+- **detached**, delivered next to the manifest (a `.sig` file or the catalog
+  entry's `signature` field).
+
+`app/services/plugin_signatures.py` is the single verification path for both
+forms. Policy handling is deliberately strict:
+
+| Situation | `if-present` | `required` |
+| --------- | ------------ | ---------- |
+| Valid signature from a configured publisher | accepted (`Trusted`) | accepted (`Trusted`) |
+| No signature | accepted (`Unverified`) | refused |
+| Forged/malformed signature, or unknown publisher | **refused** | **refused** |
+
+Tolerating absence must never mean tolerating forgeries, so an invalid
+signature fails even in `if-present` mode. Local-path installs keep working
+under the default policy; set `required` to demand signatures everywhere.
+
+### Remote install from the validated catalog (#389)
+
+`POST /plugins/api/workspaces/<id>/plugins/install-from-catalog` installs a
+plugin that an operator has already published in the catalog. The request only
+names the entry — a client can never supply a manifest, an artifact URL, or a
+key:
+
+```bash
+curl -X POST https://<host>/plugins/api/workspaces/7/plugins/install-from-catalog \
+  -H "Content-Type: application/json" \
+  -d '{"plugin_id": "hello-world", "version": "0.1.0"}'
+```
+
+`version` is optional; without it the newest catalogued version wins (PEP 440
+ordering). `PLUGIN_CATALOG_FILE` points at the catalog JSON (abridged below;
+`manifest` is a complete, schema-valid manifest):
+
+```json
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "hello-world",
+      "version": "0.1.0",
+      "source": "https://plugins.example.com/hello-world-0.1.0.zip",
+      "integrity": "sha256:<64 lowercase hex characters>",
+      "signature": {
+        "publisher": "acme-labs",
+        "algorithm": "ed25519",
+        "value": "<base64 signature over the manifest>"
+      },
+      "manifest": { "id": "hello-world", "...": "see plugins/plugin.schema.json" }
+    }
+  ]
+}
+```
+
+The endpoint is owner-only (`manage_plugins`) and fails closed:
+
+| Failure | Status |
+| ------- | ------ |
+| Missing/invalid `plugin_id` or `version` | `400` |
+| No catalog configured, or unknown id/version | `404` |
+| Invalid manifest or incompatible `compatibility` range | `400` |
+| Trust refusal (unsigned under `required`, forged, unknown publisher) | `403` |
+| Already installed, or entry point conflicts with a registered plugin | `409` |
+| Non-member of the workspace | `404` |
+| Member who is not the owner | `403` |
+
+On success it registers metadata only: the global `Plugin` row and the
+workspace `PluginInstallation`. The response also reports the catalog `source`
+and `integrity` so the resolved pin is visible. It does **not** download the
+artifact, execute plugin code, or create capability grants, and trust refusals
+are appended to the workspace audit trail.
+
+### Plugin lock entries (#394)
+
+`PluginLockEntry` (`plugin_lock_entries`) persists the resolved plugin set for
+reproducible installs: plugin id, pinned version, source, sha256 integrity
+hash, declared dependencies, the workspace, and its owner. A row is unique per
+`(workspace_id, plugin_id)`, and lock entries never imply capability grants.
+
+Rows serialize through the existing canonical lockfile builder, so
+`dumps_lockfile([*rows])` produces the same byte-stable document as any other
+resolved entry and omits volatile audit fields (`resolved_at`, row/workspace
+ids):
+
+```python
+from app.models import PluginLockEntry
+from app.services.plugin_lockfile import dumps_lockfile
+
+rows = PluginLockEntry.query.filter_by(workspace_id=workspace_id).all()
+print(dumps_lockfile(rows))
+```
+
+The Alembic migration for the table is tracked by the Phase 9 lockfile
+migration issue; the model and its serialization are covered by
+`tests/test_plugin_lock_entries.py`.
+
+### Updating a plugin
+
+`POST .../plugins/<plugin_id>/update` accepts the same `{"manifest": {...}}`
+shape as install, but applies it to an already-registered plugin. The manifest
+is validated and identity-bound:
+
+- `id` must equal the plugin being updated;
+- `entry_point` must not change (`409`), so an update can never point an
+  installed plugin at different code;
+- the declared PEP 440 `compatibility` range is enforced against the running
+  application version **before** anything is written. An incompatible range is
+  refused with `400` and a message naming both the range and the current
+  version; the registered plugin and its workspace installations are left
+  untouched.
+
+Updates change the plugin's metadata (version, description, capabilities,
+dependencies, configuration defaults, trust fields) but never capability grants
+or per-workspace configuration, which stay explicit and workspace-scoped. The
+plugin must be installed in the authorizing workspace (`404` otherwise).
 
 ### Enable / disable
 
@@ -280,11 +455,49 @@ plugin id, the operation (`dispatch:<event_type>`, `hook:<hook>`, …), the
 exception type, and a length-bounded message. **No stack traces, event
 payloads, or secrets are stored by default.**
 
-Recording happens automatically when a plugin dispatch handler raises and when
-a lifecycle hook fails inside an app context; it is best-effort and never
-changes the existing failure-isolation behavior. Reports are read back
-owner-scoped via `GET /plugins/api/workspaces/<ws>/plugin-errors` (owner only,
+Recording happens automatically when a plugin dispatch handler raises (including
+when it exceeds `PLUGIN_EXECUTION_TIMEOUT`) and when a lifecycle hook fails or
+times out inside an app context; it is best-effort and never changes the
+existing failure-isolation behavior. Reports are read back owner-scoped via
+`GET /plugins/api/workspaces/<ws>/plugin-errors` (owner only,
 workspace-isolated) and operator-wide via `flask plugins errors [--json]`.
+
+## Configuration reference
+
+Marketplace and plugin settings are environment variables. The defaults are
+deliberately fail-closed: catalog installation is disabled, no publisher is
+trusted, and plugin outbound traffic is denied until an operator opts in.
+
+| Variable | Safe default | Purpose |
+| -------- | ------------ | ------- |
+| `PLUGIN_CATALOG_FILE` | empty | Path to the validated JSON catalog used by `POST .../plugins/install-from-catalog`. Empty disables catalog installation. |
+| `PLUGIN_DISCOVERY_DIR` | `plugins` | Read-only directory scanned for `manifest.json` files by `GET /plugins/discover`. Nothing is installed or executed. |
+| `PLUGIN_TRUST_POLICY` | `if-present` | `if-present` accepts unsigned manifests but always refuses forged or untrusted signatures; `required` also refuses unsigned manifests. Use `required` for a hosted marketplace. |
+| `PLUGIN_TRUSTED_KEYS` | `{}` | JSON object of canonical publisher ids to Ed25519 public keys (base64 raw 32 bytes or PEM). Invalid key material aborts startup. |
+| `PLUGIN_NETWORK_ALLOWLIST` | empty | Comma-separated outbound hosts. Empty denies every plugin request; `*` allows any public host and `*.example.com` allows subdomains. |
+| `PLUGIN_NETWORK_HTTPS_ONLY` | `1` | Rejects non-HTTPS plugin requests. Keep enabled outside isolated development. |
+| `PLUGIN_NETWORK_ALLOW_PRIVATE` | `0` | Allows private/loopback/link-local targets. Keep disabled in production. |
+| `PLUGIN_NETWORK_TIMEOUT` | `15` | Outbound request timeout in seconds. |
+| `PLUGIN_NETWORK_MAX_BYTES` | `2097152` | Maximum response body accepted from a plugin request (2 MiB). |
+| `PLUGIN_NETWORK_STRICT_DNS` | `0` | When enabled, an unresolvable host is rejected instead of tolerated. |
+| `PLUGIN_EXECUTION_TIMEOUT` | `5` | Seconds a plugin event handler or lifecycle hook may run before it is abandoned and recorded as a bounded error. `0` or negative disables the bound. |
+
+**Catalog cache:** there is no active cache TTL setting yet. The catalog file is
+validated and re-read for each install request, so an operator's catalog edit is
+visible immediately. A TTL cache and its `PLUGIN_MARKETPLACE_CACHE_TTL` setting
+are tracked separately in #377.
+
+Example production posture:
+
+```bash
+export PLUGIN_CATALOG_FILE=/etc/ai-code-assistant/catalog.json
+export PLUGIN_TRUST_POLICY=required
+export PLUGIN_TRUSTED_KEYS='{"acme-labs": "<base64 or PEM Ed25519 public key>"}'
+export PLUGIN_NETWORK_ALLOWLIST=plugins.example.com
+export PLUGIN_NETWORK_HTTPS_ONLY=1
+export PLUGIN_NETWORK_ALLOW_PRIVATE=0
+export PLUGIN_EXECUTION_TIMEOUT=5
+```
 
 ## Audit trail (capabilities & state)
 
@@ -364,6 +577,21 @@ only when the host dispatches a live event (see [Security](#security)). The
 manifest schema and the load/register flow are covered by
 `tests/test_hello_plugin_example.py`.
 
+### Stellar notifier example (#415)
+
+[`examples/plugins/stellar_notifier/`](../examples/plugins/stellar_notifier)
+shows an event-driven, read-only integration for Stellar analysis:
+
+- declares `STELLAR_READ` and subscribes to `stellar.analysis.completed`;
+- formats a one-line summary (`Project 7 — Stellar detected, confidence 0.98`)
+  that is capped at `MAX_SUMMARY_CHARS`, with each field truncated and the
+  in-memory history bounded to `MAX_RECENT_SUMMARIES`;
+- copies the payload instead of mutating it and makes **no network or database
+  calls**, so it runs offline under the mock network;
+- is validated end-to-end by
+  `tests/test_stellar_notifier_example.py` (schema, load/register, event path,
+  bounding, read-only behaviour, and an offline socket guard).
+
 ## Security
 
 See [security.md](security.md) for the full security model. In short:
@@ -372,6 +600,15 @@ See [security.md](security.md) for the full security model. In short:
 - Plugin handler failures are isolated from the request lifecycle.
 - Manifests are validated (no arbitrary code identifiers, no unknown
   capabilities).
+- Publisher signatures are Ed25519 over the canonical manifest body; forged or
+  untrusted signatures are always refused, and `required` also refuses
+  unsigned entries.
+- Trusted publisher keys are validated at startup and never exposed by the API
+  or CLI (only publisher ids are listed).
+- Catalog installs are owner-only, resolve server-side, register metadata only,
+  and never download code or grant capabilities.
+- Event data carries workspace/user context so plugins can scope work; the
+  Stellar analysis path reuses the Phase 7 content-access gate and fails closed.
 - Event data carries workspace/user context so plugins can scope work; the
   Stellar analysis path reuses the Phase 7 content-access gate and fails closed.
 
@@ -399,6 +636,18 @@ is reset between tests):
 - `tests/test_plugins_api.py` — the workspace-scoped plugin management API
   (install/enable/disable/grant) with authorization fail-closed and workspace
   isolation.
+- `tests/test_plugin_trust.py` — trusted publisher key loading (base64/PEM),
+  startup rejection of bad configuration, and the secret-free listing surfaces.
+- `tests/test_plugin_signatures.py` — canonical payloads, detached signatures,
+  forged/unsigned handling, and the embedded-signature regression path.
+- `tests/test_plugin_catalog_install.py` — catalog parsing/validation and the
+  remote-install endpoint: authorization, trust policy, 4xx failure paths, and
+  no implicit grants or code execution.
+- `tests/test_marketplace_e2e.py` — offline catalog-to-dispatch coverage:
+  install, explicit enable, dependency ordering, trust refusal, rollback, and
+  no implicit grants.
+- `tests/test_plugin_lock_entries.py` — the `PluginLockEntry` model, scoping,
+  unique constraint, and canonical lockfile serialization.
 - `tests/test_plugin_audit.py` — the capability/state audit trail.
 - `tests/test_event_authorization.py` — dispatch-time capability enforcement.
 - `tests/test_event_wiring.py` — real routes emit events to authorized

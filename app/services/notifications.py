@@ -1,8 +1,8 @@
 """Notification service.
 
-The single path every notification goes through: ``notify()`` creates a
-persisted ``Notification`` for a user, honoring their notification preferences
-(150). Payloads never contain secrets, invitation tokens, or another user's
+The single path every notification goes through: `notify()` creates a
+persisted `Notification` for a user, holoring their notification preferences
+(150). Payloads always contain secrets, invitation tokens, or another user's
 data — at most small, safe facts plus a route link.
 
 Notification types (shared with the model and preferences):
@@ -42,10 +42,10 @@ def notify(
     payload: dict | None = None,
     link: str | None = None,
 ) -> Notification | None:
-    """Create a notification for ``user`` unless they opted out of the type.
+    """Create a notification for `user` unless they opted out of the type.
 
-    Returns the created ``Notification`` or ``None`` when skipped. Runs in the
-    caller's transaction. ``workspace``/``project`` may be ORM objects or ids.
+    Returns the created `Notification` or `None` when skipped. Runs in the
+    caller's transaction. `workspace`/`project` may be ORM objects or ids.
     """
     if user is None:
         return None

@@ -7,8 +7,6 @@ This module provides:
 - Custom exceptions for plugin system
 """
 
-import base64
-import binascii
 import importlib
 import json
 import logging
@@ -21,19 +19,20 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
 from app.services.plugin_compat import is_valid_compatibility
 from app.services.plugin_deps import PluginRef
+from app.services.plugin_execution import run_with_timeout
+from app.services.plugin_signatures import (
+    TRUSTED,
+    UNVERIFIED,
+    VERIFY_IF_PRESENT,
+    VERIFY_REQUIRED,
+    PublisherTrust,
+    evaluate_signature,
+    validate_signature_metadata,
+)
 
 logger = logging.getLogger(__name__)
-
-TRUSTED = "Trusted"
-UNVERIFIED = "Unverified"
-INVALID = "Invalid"
-VERIFY_IF_PRESENT = "if-present"
-VERIFY_REQUIRED = "required"
 
 #: The declared plugin manifest contract. Runtime validation below is driven by
 #: this schema (see :func:`load_manifest_schema`) so the two cannot silently
@@ -274,7 +273,7 @@ class PluginManifest:
             raise ManifestValidationError("; ".join(errors))
 
         signature = data.get("signature")
-        signature_error = _validate_signature_metadata(signature)
+        signature_error = validate_signature_metadata(signature)
 
         if trust_policy not in (VERIFY_IF_PRESENT, VERIFY_REQUIRED):
             raise ManifestValidationError(f"Invalid plugin trust policy: {trust_policy}")
@@ -363,62 +362,14 @@ class PluginManifest:
         }
 
 
-def _validate_signature_metadata(signature: Any) -> str | None:
-    """Validate the shape of optional signature metadata."""
-    if signature is None:
-        return None
-    if not isinstance(signature, dict):
-        return "Invalid signature: must be an object"
-    if set(signature) != {"publisher", "algorithm", "value"}:
-        return "Invalid signature: expected publisher, algorithm, and value"
-    if not all(isinstance(signature.get(key), str) and signature[key] for key in signature):
-        return "Invalid signature: publisher, algorithm, and value must be non-empty strings"
-    if signature["algorithm"] != "ed25519":
-        return "Invalid signature: algorithm must be ed25519"
-    return None
-
-
-def _canonical_manifest_body(data: dict[str, Any]) -> bytes:
-    """Return the stable JSON representation signed by plugin publishers."""
-    body = {key: value for key, value in data.items() if key != "signature"}
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-
-
-def _decode_public_key(value: str | bytes) -> bytes:
-    if isinstance(value, bytes):
-        return value
-    if value.startswith("-----BEGIN"):
-        from cryptography.hazmat.primitives import serialization
-
-        return serialization.load_pem_public_key(value.encode()).public_bytes(
-            serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw,
-        )
-    return base64.b64decode(value, validate=True)
-
-
 def _verify_signature(
     data: dict[str, Any],
     signature: Any,
     trusted_publishers: dict[str, str | bytes],
 ) -> tuple[str, str | None]:
-    if signature is None:
-        return UNVERIFIED, None
-    if _validate_signature_metadata(signature):
-        return INVALID, signature.get("publisher") if isinstance(signature, dict) else None
-    publisher = signature["publisher"]
-    key_value = trusted_publishers.get(publisher)
-    if key_value is None:
-        return INVALID, publisher
-    try:
-        public_key = Ed25519PublicKey.from_public_bytes(_decode_public_key(key_value))
-        public_key.verify(
-            base64.b64decode(signature["value"], validate=True),
-            _canonical_manifest_body(data),
-        )
-    except (ValueError, TypeError, binascii.Error, InvalidSignature):
-        return INVALID, publisher
-    return TRUSTED, publisher
+    """Return the ``(trust_state, publisher)`` facts for an embedded signature."""
+    trust: PublisherTrust = evaluate_signature(data, signature, trusted_publishers)
+    return trust.state, trust.publisher
 
 
 class Plugin:
@@ -498,7 +449,7 @@ class Plugin:
         if not callable(method):
             return {"hook": hook, "called": False, "ok": True, "error": None}
         try:
-            method()
+            run_with_timeout(method, operation=f"hook:{hook}")
         except Exception as exc:
             logger.error(
                 "Plugin %s hook %s failed: %s",

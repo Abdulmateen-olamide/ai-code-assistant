@@ -56,6 +56,25 @@ Findings use a normalized vocabulary (see `app/models/review_finding.py`):
 
 A finding carries a file path and line only — never raw repository content.
 
+### Output validation (reject, never coerce)
+
+Parsed model output that cannot be validated is rejected, never coerced:
+
+- Unknown severity, category, or confidence values are dropped (no defaulting
+  to `medium`/`other`/`suggestion`).
+- Findings need a string explanation; non-integer, boolean, zero, negative,
+  or oversized lines are dropped.
+- File paths must be syntactically valid (no traversal, backslashes, or
+  control characters) and, when the review context supplies a known-file
+  allow-list, must name a file from that context — invented paths and
+  `files_affected` entries are dropped.
+- Coverage percentages and coverage-with-a-number claims are dropped from
+  summaries, findings, and recommendations: the service has no coverage
+  runner and never reports measured percentages. Metrics are computed only
+  from persisted `Review`/`ReviewFinding` rows, never from model text.
+- Non-object payloads, non-list `findings`, non-dict `summary`, and non-string
+  summary items are dropped; findings are capped at `REVIEW_MAX_FINDINGS`.
+
 ## Environment settings
 
 All review behaviour is environment-driven and documented in
@@ -85,21 +104,31 @@ returned.
 #### List reviews
 
 `GET /reviews/api/reviews` — optional query params `source` (`github_pr` /
-`project`), `kind`, `status`, and `project_id`. Returns the user's reviews,
-newest first.
+`project`), `kind`, `status`, and `project_id`. Results are paginated with
+`page` (default 1) and `per_page` (default 20, capped at 100), and ordered
+newest first with `id` breaking `created_at` ties so paging is stable. The
+response is a page envelope, not a bare array.
 
 ```json
-[
-  {
-    "id": 12,
-    "source": "project",
-    "kind": "security",
-    "status": "completed",
-    "findings_count": 3,
-    "summary": {"overview": "..."},
-    "created_at": "2026-01-01T00:00:00+00:00"
-  }
-]
+{
+  "items": [
+    {
+      "id": 12,
+      "source": "project",
+      "kind": "security",
+      "status": "completed",
+      "findings_count": 3,
+      "summary": {"overview": "..."},
+      "created_at": "2026-01-01T00:00:00+00:00"
+    }
+  ],
+  "total": 42,
+  "page": 1,
+  "per_page": 20,
+  "total_pages": 3,
+  "has_next": true,
+  "has_prev": false
+}
 ```
 
 #### Run a review

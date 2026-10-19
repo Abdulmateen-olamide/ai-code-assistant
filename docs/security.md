@@ -55,6 +55,10 @@ kept in sync as the plugin system grows.
 | Lifecycle hooks + uninstall     | Optional hooks run isolated/non-fatal on registry enable/disable/uninstall; the workspace uninstall endpoint revokes every capability grant for that workspace before removing the installation. | Implemented |
 | Plugin events                   | `plugin.enabled`/`plugin.disabled`/`plugin.uninstalled` are workspace-scoped events mapped to `WORKSPACE_READ` (dispatch-time enforcement applies). | Implemented |
 | Plugin CLI                      | `flask plugins …` acts as the operator on persisted rows; installs are local-path only (URLs refused) and never grant capabilities or load code. | Implemented |
+| Publisher signatures (detached) | Ed25519 signatures are verified over the canonical manifest body (compact sorted JSON excluding `signature`/trust fields), whether embedded in the manifest or detached in a `.sig`/catalog field. Forged, malformed, and unknown-publisher signatures are refused under **every** policy; unsigned entries are refused when `PLUGIN_TRUST_POLICY=required`. Verification never echoes key material. | Implemented |
+| Trusted publisher key management | `PLUGIN_TRUSTED_KEYS` must be a JSON object of canonical publisher ids to valid 32-byte Ed25519 keys (base64 raw or PEM); malformed keys/policies abort startup with a clear message. The API (`GET /plugins/api/trusted-publishers`) and CLI (`flask plugins publishers`) expose publisher ids and the policy only — never key bytes or fingerprints. | Implemented |
+| Catalog-pinned remote install   | `POST .../plugins/install-from-catalog` is owner-only and resolves `(plugin_id, version)` server-side against `PLUGIN_CATALOG_FILE`; clients cannot supply a manifest, artifact URL, or key. Entries are validated (canonical id/version, https source, sha256 integrity, manifest id/version match) and the trust policy is enforced before any write. It registers metadata only: no download, no code execution, no implicit capability grants; refusals are audited with no artifact contents. | Implemented |
+| Plugin lock entries             | `PluginLockEntry` rows are scoped to `(workspace_id, owner_id)` with a unique `(workspace_id, plugin_id)` constraint, store only resolved metadata (id, version, source, sha256 integrity, dependencies), and imply no capability grant. Canonical serialization omits volatile timestamps for reproducible diffs. | Implemented |
 | Stellar security findings       | `stellar_security` findings are evidence-labelled rows owned by a single project; reads are owner-scoped (404 for non-owners, no existence oracle). | Implemented |
 | XDR decoding                    | Transaction/envelope + contract-data decoding is bounded and read-only; decoded values are never guessed, malformed/unsupported XDR is explicit, and no signing/submission/keys exist. | Implemented |
 
@@ -139,6 +143,16 @@ configuration (see "Known limitations / planned hardening").
 - `tests/test_plugin_lifecycle.py` — lifecycle hooks and plugin events.
 - `tests/test_plugins_cli.py` — CLI commands, `--json`, exit codes, URL
   refusal, and no implicit grants.
+- `tests/test_plugin_trust.py` — trusted publisher key decoding/validation,
+  startup rejection of malformed keys or policies, and secret-free listing.
+- `tests/test_plugin_signatures.py` — canonical signing payload, detached
+  signature verification, forged/unsigned refusal, and embedded-signature
+  compatibility.
+- `tests/test_plugin_catalog_install.py` — catalog validation plus the
+  owner-only remote-install endpoint (trust policy, failure codes, audit of
+  refusals, no code execution, no implicit grants).
+- `tests/test_plugin_lock_entries.py` — lock-entry scoping, uniqueness, and
+  canonical lockfile serialization.
 
 ## Known limitations / planned hardening
 
@@ -149,6 +163,10 @@ configuration (see "Known limitations / planned hardening").
   points, subscribing their handlers) is intentionally not wired to any
   install flow yet — plugins are subscribed in-process by code, and a future
   runtime must keep capability enforcement and review in front of execution.
+- Catalog installs register **metadata only**: the catalog's `integrity` hash
+  is validated as a sha256 digest and returned/recorded, but the artifact is
+  not downloaded yet. A future download step (bounded transport + hash
+  verification) must re-verify the digest before any artifact is used.
 - Plugins have **no outbound network capability wired up yet**. The guard in
   `app/services/plugin_network.py` (and its allowlist policy) is the required
   path for any future plugin-triggered request; plugin code must call

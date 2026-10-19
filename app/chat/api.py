@@ -7,6 +7,8 @@ Machine-facing REST surface for the chat feature:
     GET    /api/conversations/<id>                 conversation with its messages
     POST   /api/conversations/<id>/messages        send a message (LLM reply)
     DELETE /api/conversations/<id>                 delete (cascade)
+    GET    /api/usage                              per-user token usage summary
+    GET    /api/usage/breakdown                    usage and cost by source
 
 All routes require authentication and are owner-scoped. Errors use RFC 7807
 (``application/problem+json``) documents so API clients never receive HTML error
@@ -17,6 +19,7 @@ the same model/service layer.
 from __future__ import annotations
 
 import functools
+import json
 
 from flask import Blueprint, current_app, jsonify, request
 from flask_login import current_user
@@ -24,7 +27,8 @@ from flask_login import current_user
 from app.chat import routes as chat_routes
 from app.extensions import db
 from app.models import Conversation, Message
-from app.services import ratelimit
+from app.services import ratelimit, streaming, usage_ledger
+from app.services.currency import get_currency_config
 from app.services.llm import LLMProviderError, provider_status
 from app.services.provider_config import ProviderSettingsError, apply_settings, build_provider
 from app.services.providers.retry import RetryingProvider
@@ -42,6 +46,27 @@ def _problem(status: int, title: str, detail: str | None = None, **extra):
     response.status_code = status
     response.mimetype = "application/problem+json"
     return response
+
+
+def _sse_event(event: str, data: dict) -> str:
+    """Encode a single Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _stream_reply(conversation: Conversation, reply: str):
+    """Yield SSE frames for an assistant reply, ending with ``message_end``.
+
+    The stream is chunked so the client can render a streaming cursor while
+    the assistant is generating. A terminal ``message_end`` event always
+    carries the persisted message so a dropped connection can be recovered.
+    """
+    yield _sse_event("message_start", {"conversation_id": conversation.id})
+    for chunk in streaming.chunk_text(reply):
+        yield _sse_event("message_delta", {"delta": chunk})
+    yield _sse_event(
+        "message_end",
+        {"assistant_message": conversation.messages[-1].to_dict()},
+    )
 
 
 def _login_required(view):
@@ -83,6 +108,22 @@ def _rate_limit(bucket: str):
 def _owned_conversation(conversation_id: int) -> Conversation | None:
     """Return the conversation only when it belongs to the current user."""
     return Conversation.query.filter_by(id=conversation_id, user_id=current_user.id).first()
+
+
+def _usage_totals(conversation: Conversation) -> dict:
+    """Sum token usage across the conversation's assistant messages."""
+    prompt = completion = total = 0
+    for message in conversation.messages:
+        if message.total_tokens is None:
+            continue
+        prompt += message.prompt_tokens or 0
+        completion += message.completion_tokens or 0
+        total += message.total_tokens or 0
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
 
 
 def _json_object() -> dict | None:
@@ -140,6 +181,7 @@ def get_conversation(conversation_id: int):
         return _problem(404, "Conversation not found.", "No such conversation exists.")
     payload = conversation.to_dict()
     payload["messages"] = [message.to_dict() for message in conversation.messages]
+    payload["usage"] = _usage_totals(conversation)
     return jsonify(payload)
 
 
@@ -158,6 +200,7 @@ def delete_conversation(conversation_id: int):
 
 @bp.route("/conversations/<int:conversation_id>/messages", methods=["POST"])
 @_login_required
+@ratelimit.ai_limit
 @_rate_limit("message")
 def send_message(conversation_id: int):
     """Persist the user message and return the assistant's reply."""
@@ -206,13 +249,73 @@ def send_message(conversation_id: int):
     messages = chat_routes._conversation_messages(conversation, context_messages)
     try:
         provider = RetryingProvider(build_provider(current_user, conversation.provider))
-        reply = provider.chat(messages, **chat_routes._generation_kwargs(conversation)).content
+        completion = provider.chat(messages, **chat_routes._generation_kwargs(conversation))
     except LLMProviderError as exc:
         db.session.rollback()
         return _problem(502, "Provider error.", str(exc))
 
-    conversation.messages.append(Message(role="assistant", content=reply))
+    assistant_message = Message(role="assistant", content=completion.content)
+    usage = getattr(completion, "usage", None)
+    if usage is not None and usage.has_usage:
+        assistant_message.prompt_tokens = usage.prompt_tokens or 0
+        assistant_message.completion_tokens = usage.completion_tokens or 0
+        assistant_message.total_tokens = usage.total_tokens or 0
+    conversation.messages.append(assistant_message)
     if conversation.title == "New conversation":
         conversation.title = content.strip()[:60] or "New conversation"
     db.session.commit()
-    return jsonify({"assistant_message": conversation.messages[-1].to_dict()}), 201
+    if request.accept_mimetypes.best == "text/event-stream":
+        response = current_app.response_class(
+            _stream_reply(conversation, completion.content),
+            mimetype="text/event-stream",
+        )
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
+    payload = {"assistant_message": conversation.messages[-1].to_dict()}
+    payload["usage"] = _usage_totals(conversation)
+    return jsonify(payload), 201
+
+
+@bp.route("/usage", methods=["GET"])
+@_login_required
+@_rate_limit("usage")
+def usage_summary():
+    """Return the current user's total token consumption."""
+    conversations = Conversation.query.filter_by(user_id=current_user.id).all()
+    prompt = completion = total = 0
+    for conversation in conversations:
+        totals = _usage_totals(conversation)
+        prompt += totals["prompt_tokens"]
+        completion += totals["completion_tokens"]
+        total += totals["total_tokens"]
+    return jsonify(
+        {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+    )
+
+
+@bp.route("/usage/breakdown", methods=["GET"])
+@_login_required
+@_rate_limit("usage")
+def usage_breakdown():
+    """Return usage counts and estimated cost grouped by ledger source.
+
+    The authenticated user's records are always the outer scope, so an optional
+    ``workspace_id`` or ``project_id`` filter can never expose another account's
+    usage. Unknown historical sources are grouped under ``unknown`` rather than
+    dropped or causing a 500.
+    """
+    workspace_id = request.args.get("workspace_id", type=int)
+    project_id = request.args.get("project_id", type=int)
+    payload = usage_ledger.breakdown_payload(
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        project_id=project_id,
+    )
+    payload["currency"] = get_currency_config()
+    payload["cost_is_estimate"] = True
+    return jsonify(payload)

@@ -7,6 +7,8 @@ Usage (inside the Flask app context):
     flask plugins enable <plugin_id>
     flask plugins disable <plugin_id>
     flask plugins install <local-path> [--json]
+    flask plugins publishers [--json]
+    flask plugins errors [--json]
 
 The CLI acts as the **operator**, not as an end user: it reads/writes the
 persisted ``Plugin`` rows and never performs per-user workspace authorization.
@@ -24,7 +26,7 @@ from __future__ import annotations
 import json
 
 import click
-from flask import Flask
+from flask import Flask, current_app
 
 #: Exit codes (success / not found / validation-or-other error).
 EXIT_OK = 0
@@ -169,6 +171,32 @@ def register_plugins_cli(app: Flask) -> None:
             _write_json(plugin.to_dict())
         else:
             click.echo(f"Installed plugin: {plugin.id} v{plugin.version}")
+        return EXIT_OK
+
+    @plugins_group.command("publishers")
+    @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+    def list_publishers(as_json: bool) -> int:
+        """List configured trusted publisher ids (never key material)."""
+        from app.services.plugin_signatures import VERIFY_IF_PRESENT
+        from app.services.plugin_trust import trusted_publisher_ids
+
+        publishers = trusted_publisher_ids(current_app.config.get("PLUGIN_TRUSTED_KEYS") or {})
+        policy = current_app.config.get("PLUGIN_TRUST_POLICY", VERIFY_IF_PRESENT)
+        if as_json:
+            _write_json(
+                {
+                    "publishers": publishers,
+                    "count": len(publishers),
+                    "policy": policy,
+                }
+            )
+            return EXIT_OK
+        if not publishers:
+            click.echo("No trusted publishers configured.")
+            return EXIT_OK
+        for publisher in publishers:
+            click.echo(publisher)
+        click.echo(f"{len(publishers)} trusted publisher(s) configured (policy: {policy}).")
         return EXIT_OK
 
     @plugins_group.command("errors")

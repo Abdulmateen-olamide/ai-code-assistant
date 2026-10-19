@@ -38,6 +38,7 @@ from app.models.review import (
 )
 from app.models.review_finding import CATEGORIES_BY_KIND, SEVERITIES
 from app.reviews import bp
+from app.services import chat_audit, usage_ledger
 from app.services import metrics as metrics_service
 from app.services import reviews as reviews_service
 from app.services.events import emit_event
@@ -61,6 +62,35 @@ def _get_review(review_id: int) -> Review:
 
 def _get_project(project_id: int) -> Project:
     return Project.query.filter_by(id=project_id, user_id=current_user.id).first_or_404()
+
+
+# --------------------------------------------------------------------------
+# Review history pagination
+# --------------------------------------------------------------------------
+
+#: Review history used to be returned in full, so a long history meant one
+#: unbounded query plus one huge response. These bound the page size the same
+#: way the workspace dashboard does (issue #85).
+REVIEWS_PER_PAGE_DEFAULT = 20
+REVIEWS_PER_PAGE_MAX = 100
+
+
+def _reviews_page() -> int:
+    """Return the requested 1-based page number."""
+    return max(request.args.get("page", type=int) or 1, 1)
+
+
+def _reviews_per_page() -> int:
+    """Return the requested page size, clamped to the configured maximum.
+
+    Non-numeric, zero, and negative values fall back to the default; larger
+    values are capped at the maximum so a single request cannot ask for an
+    unbounded page.
+    """
+    value = request.args.get("per_page", type=int)
+    if value is None or value < 1:
+        return REVIEWS_PER_PAGE_DEFAULT
+    return min(value, REVIEWS_PER_PAGE_MAX)
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +227,12 @@ def project_config_page(project_id: int):
 @bp.route("/api/reviews", methods=["GET"])
 @login_required
 def api_list_reviews():
+    """Return one page of the current user's review history.
+
+    Filters (``source``/``kind``/``status``/``project_id``) combine with
+    ``page``/``per_page`` pagination and return the standard list envelope used
+    by the workspace and collaboration lists.
+    """
     query = Review.query.filter_by(user_id=current_user.id)
     source = request.args.get("source")
     kind = request.args.get("kind")
@@ -210,8 +246,28 @@ def api_list_reviews():
         query = query.filter_by(status=status)
     if project_id:
         query = query.filter_by(project_id=project_id)
-    reviews = query.order_by(Review.created_at.desc()).all()
-    return jsonify([r.to_dict() for r in reviews])
+    page = _reviews_page()
+    per_page = _reviews_per_page()
+    total = query.count()
+    # ``id`` breaks created_at ties so the ordering is total: without it, rows
+    # sharing a timestamp can repeat or vanish across page boundaries.
+    reviews = (
+        query.order_by(Review.created_at.desc(), Review.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return jsonify(
+        {
+            "items": [r.to_dict() for r in reviews],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": max(1, (total + per_page - 1) // per_page),
+            "has_next": page * per_page < total,
+            "has_prev": page > 1,
+        }
+    )
 
 
 @bp.route("/api/reviews", methods=["POST"])
@@ -321,14 +377,39 @@ def _run_project_review(data: dict):
 
 
 def _save_result(review: Review, result: dict, config: dict) -> None:
-    """Persist a completed (or failed) review together with its findings."""
-    review.summary = json.dumps(result.get("summary") or {})
-    review.config = json.dumps(config)
-    findings = [
-        ReviewFinding(review_id=review.id, **finding) for finding in result.get("findings") or []
-    ]
-    review.findings_count = len(findings)
-    db.session.add_all(findings)
+    """Persist a completed (or failed) review together with its findings.
+
+    Defense in depth: ``result`` is re-validated before anything is written,
+    so even a caller-supplied dict cannot invent files, findings, coverage
+    numbers, or metrics. Unvalidated entries are rejected, not coerced.
+    """
+    if not isinstance(result, dict):
+        result = {}
+    summary = result.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    cap = None
+    if isinstance(config, dict):
+        cap = config.get("max_findings")
+    validated = reviews_service.validate_review_result(
+        {
+            "summary": summary,
+            "findings": result.get("findings"),
+            "known_files": result.get("known_files"),
+        },
+        kind=review.kind,
+        known_files=result.get("known_files"),
+        max_findings=cap,
+    )
+    findings = validated["findings"]
+    review.summary = json.dumps(validated["summary"])
+    try:
+        review.config = json.dumps(config)
+    except (TypeError, ValueError):
+        review.config = "{}"
+    rows = [ReviewFinding(review_id=review.id, **finding) for finding in findings]
+    review.findings_count = len(rows)
+    db.session.add_all(rows)
     error = result.get("error")
     if error:
         review.status = STATUS_FAILED
@@ -336,6 +417,30 @@ def _save_result(review: Review, result: dict, config: dict) -> None:
     else:
         review.status = STATUS_COMPLETED
         review.error_message = None
+
+    # One ledger row per review run (success or failure), carrying the project
+    # scope, token counts, provider/model, request id, latency and outcome
+    # (issue #430, extended by #428).
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    project = db.session.get(Project, review.project_id) if review.project_id else None
+    usage_ledger.record_usage(
+        source=usage_ledger.SOURCE_REVIEW,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens"),
+        tokens_estimated=usage.get("tokens_estimated", True),
+        provider=usage.get("provider"),
+        model=usage.get("model"),
+        user_id=review.user_id,
+        project=project,
+        workspace_id=project.workspace_id if project else None,
+        request_id=chat_audit.current_request_id() or f"review:{review.id}",
+        latency_ms=usage.get("latency_ms"),
+        status=usage_ledger.STATUS_ERROR if error else usage_ledger.STATUS_SUCCESS,
+        commit=False,
+    )
     db.session.commit()
 
 

@@ -9,7 +9,7 @@ Pages (HTML)
 
 API (JSON, all scoped to the current user)
     /workspaces/api/workspaces                       list / create
-    /workspaces/api/workspaces/<id>                  rename / delete
+    /workspaces/api/workspaces/<id>                  get / rename / delete
     /workspaces/api/workspaces/<id>/projects         list / import
     /workspaces/api/projects/<pid>                   delete
     /workspaces/api/projects/<pid>/export            download zip snapshot (owner)
@@ -73,13 +73,14 @@ from app.models.project import (
     STATUS_INDEXING,
     STATUS_READY,
 )
+from app.models.workspace import generate_slug
 from app.models.workspace_member import (
     MEMBER_ROLES,
     ROLE_OWNER,
     ROLE_VIEWER,
     STATUS_ACTIVE,
 )
-from app.services import project_analysis
+from app.services import project_analysis, usage_ledger
 from app.services.activity import record_activity
 from app.services.events import emit_event
 from app.services.exporting import export_filename, iter_export_zip
@@ -284,14 +285,47 @@ def api_create_workspace():
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "A workspace name is required."}), 400
+    slug = generate_slug(name[:200])
+    if not slug:
+        return (
+            jsonify(
+                {"error": "The workspace name must contain at least one alphanumeric character."}
+            ),
+            400,
+        )
+    existing = Workspace.query.filter_by(user_id=current_user.id, slug=slug).first()
+    if existing is not None:
+        return (
+            jsonify(
+                {
+                    "error": f'A workspace with the slug "{slug}" already exists. '
+                    "Choose a different name.",
+                    "slug": slug,
+                    "existing_workspace_id": existing.id,
+                }
+            ),
+            400,
+        )
     workspace = Workspace(
         user_id=current_user.id,
         name=name[:200],
+        slug=slug,
         description=((data.get("description") or "").strip()[:2000] or None),
     )
     db.session.add(workspace)
     db.session.commit()
     return jsonify(workspace.to_dict()), 201
+
+
+@bp.route("/api/workspaces/<int:workspace_id>", methods=["GET"])
+@login_required
+def api_get_workspace(workspace_id: int):
+    """Return a single workspace.
+
+    Owner-scoped via ``_get_workspace``: anyone else receives a 404 so the route
+    is not an existence oracle for workspace ids.
+    """
+    return jsonify(_get_workspace(workspace_id).to_dict())
 
 
 @bp.route("/api/workspaces/<int:workspace_id>", methods=["PATCH"])
@@ -303,6 +337,33 @@ def api_update_workspace(workspace_id: int):
         name = (data.get("name") or "").strip()
         if not name:
             return jsonify({"error": "A workspace name is required."}), 400
+        new_slug = generate_slug(name[:200])
+        if not new_slug:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "The workspace name must contain at least one alphanumeric character."
+                        )
+                    }
+                ),
+                400,
+            )
+        if new_slug != workspace.slug:
+            existing = Workspace.query.filter_by(user_id=current_user.id, slug=new_slug).first()
+            if existing is not None:
+                return (
+                    jsonify(
+                        {
+                            "error": f'A workspace with the slug "{new_slug}" already exists. '
+                            "Choose a different name.",
+                            "slug": new_slug,
+                            "existing_workspace_id": existing.id,
+                        }
+                    ),
+                    400,
+                )
+            workspace.slug = new_slug
         workspace.name = name[:200]
     if "description" in data:
         workspace.description = (data.get("description") or "").strip()[:2000] or None
@@ -1223,6 +1284,20 @@ def api_project_chat(project_id: int):
     )
     session.updated_at = datetime.now(UTC)
     db.session.add(message)
+    usage = result.get("usage") or {}
+    usage_ledger.record_usage(
+        source=usage_ledger.SOURCE_PROJECT_CHAT,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens"),
+        tokens_estimated=usage.get("tokens_estimated", True),
+        provider=usage.get("provider"),
+        model=usage.get("model"),
+        user=current_user,
+        project=project,
+        workspace_id=project.workspace_id,
+        commit=False,
+    )
     db.session.commit()
     return (
         jsonify(
@@ -1267,6 +1342,7 @@ def api_project_chat_stream(project_id: int):
     session.updated_at = datetime.now(UTC)
     db.session.commit()
     messages = project_analysis.build_messages(project, content, history, attachments=attachments)
+    provider_name, provider_model = usage_ledger.current_provider_metadata(user=current_user)
 
     def generate():
         try:
@@ -1278,17 +1354,32 @@ def api_project_chat_stream(project_id: int):
             return
 
         try:
-            reply = project_analysis.chat_with_project(
+            result = project_analysis.chat_with_project(
                 project, content, attachments, history=history
-            )["analysis"]
+            )
         except LLMProviderError as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             return
 
+        reply = result["analysis"]
+        usage = result.get("usage") or {}
         message = ProjectMessage(
             project_id=project.id, session=session, role="assistant", content=reply
         )
         db.session.add(message)
+        usage_ledger.record_usage(
+            source=usage_ledger.SOURCE_PROJECT_CHAT,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens"),
+            tokens_estimated=usage.get("tokens_estimated", True),
+            provider=usage.get("provider") or provider_name,
+            model=usage.get("model") or provider_model,
+            user=current_user,
+            project=project,
+            workspace_id=project.workspace_id,
+            commit=False,
+        )
         db.session.commit()
         yield f"data: {json.dumps({'type': 'done', 'message': message.to_dict()})}\n\n"
 
@@ -1354,6 +1445,21 @@ def api_project_analyze(project_id: int):
     if kind not in project_analysis.ANALYSIS_KINDS:
         return jsonify({"error": "Unsupported analysis kind."}), 400
     result = project_analysis.analyze_project(project, kind)
+    usage = result.get("usage") or {}
+    provider_name, provider_model = usage_ledger.current_provider_metadata(user=current_user)
+    usage_ledger.record_usage(
+        source=usage_ledger.SOURCE_ANALYSIS,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens"),
+        tokens_estimated=usage.get("tokens_estimated", True),
+        provider=usage.get("provider") or provider_name,
+        model=usage.get("model") or provider_model,
+        user=current_user,
+        project=project,
+        workspace_id=project.workspace_id,
+        commit=False,
+    )
     record_activity(
         project.workspace_id,
         EVENT_AI_ANALYSIS_RUN,

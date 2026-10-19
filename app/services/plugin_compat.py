@@ -28,6 +28,8 @@ from pathlib import Path
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
+from app.services.plugin_versions import InvalidPluginVersionError, parse_version
+
 logger = logging.getLogger(__name__)
 
 #: Value used when the application version cannot be determined. Kept as a
@@ -38,6 +40,10 @@ _FALLBACK_APP_VERSION = "0.0.0"
 
 class InvalidCompatibilityError(ValueError):
     """Raised when a compatibility field is not a valid PEP 440 specifier."""
+
+
+class IncompatibleCompatibilityError(ValueError):
+    """Raised when a valid compatibility range excludes the running app."""
 
 
 @lru_cache(maxsize=1)
@@ -101,11 +107,11 @@ def plugin_compatible(compatibility: str | None, version: str | None = None) -> 
     """
     try:
         specifier = parse_compatibility(compatibility)
-        target = (version or "").strip() or app_version()
+        target = parse_version((version or "").strip() or app_version())
         return specifier.contains(target, prereleases=True)
-    except InvalidCompatibilityError:
+    except (InvalidCompatibilityError, InvalidPluginVersionError):
         return False
-    except ValueError:  # unparseable application version -> not compatible
+    except ValueError:  # additional defensive fallback -> not compatible
         return False
 
 
@@ -123,3 +129,39 @@ def compatibility_status(compatibility: str | None) -> dict[str, object]:
         "valid": valid,
         "compatible": plugin_compatible(compatibility) if valid else False,
     }
+
+
+def enforce_compatible(compatibility: str | None, *, subject: str = "Plugin") -> None:
+    """Refuse a plugin whose declared range excludes the running app version.
+
+    ``subject`` names the thing being checked (for example
+    ``"Plugin stellar-tools v1.2.0"``) and appears verbatim in the error, which
+    always reports both the declared range and the running version so the
+    operator can act on it. An omitted/empty range is unrestricted and never
+    raises.
+
+    Raises:
+        InvalidCompatibilityError: If ``compatibility`` is not valid PEP 440.
+        IncompatibleCompatibilityError: If the range excludes this app version.
+    """
+    status = compatibility_status(compatibility)
+    if not status["valid"]:
+        raise InvalidCompatibilityError(f"Invalid compatibility specifier: {compatibility!r}")
+    if status["compatible"]:
+        return
+    raise IncompatibleCompatibilityError(
+        f"{subject} requires application {status['compatibility']}, "
+        f"but this app is {status['app_version']}."
+    )
+
+
+__all__ = [
+    "IncompatibleCompatibilityError",
+    "InvalidCompatibilityError",
+    "app_version",
+    "compatibility_status",
+    "enforce_compatible",
+    "is_valid_compatibility",
+    "parse_compatibility",
+    "plugin_compatible",
+]

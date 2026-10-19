@@ -24,6 +24,7 @@ from flask import current_app
 
 from app.extensions import db
 from app.models import Plugin
+from app.services.plugin_compat import enforce_compatible
 from app.services.plugins import (
     ManifestValidationError,
     PluginError,
@@ -39,6 +40,14 @@ _REMOTE_HINT_RE = re.compile(r"^(?:[^/@\s]+@)?[^/\s:@]+:[/~]")
 
 class PluginNotFoundError(ValueError):
     """Raised when a plugin id does not exist in the database."""
+
+
+class PluginUpdateError(ValueError):
+    """Raised when a manifest cannot be applied to a registered plugin."""
+
+
+class PluginEntryPointMismatchError(PluginUpdateError):
+    """Raised when an update would retarget a registered plugin's entry point."""
 
 
 class PluginDependencyResolutionError(ValueError):
@@ -194,16 +203,68 @@ def install_from_local_dir(path: str) -> Plugin:
     return plugin
 
 
+def update_plugin(plugin_id: str, manifest: PluginManifest) -> Plugin:
+    """Apply a validated manifest to an already-registered plugin.
+
+    Updates are identity-bound like installs: the manifest id must equal
+    ``plugin_id`` and the entry point must not change, so an update can never
+    retarget an installed plugin at different code.
+
+    The declared PEP 440 ``compatibility`` range is enforced against the
+    running application *before* anything is written. An update whose range
+    excludes this app version raises
+    :class:`~app.services.plugin_compat.IncompatibleCompatibilityError` naming
+    both the range and the current version, and leaves the registered plugin
+    untouched. Invalid specifiers raise
+    :class:`~app.services.plugin_compat.InvalidCompatibilityError`.
+
+    Capability grants are intentionally not modified: they stay explicit and
+    per-workspace, and are managed only through the capability endpoints.
+    """
+    plugin = get_plugin(plugin_id)
+
+    if manifest.id != plugin_id:
+        raise PluginUpdateError(
+            f"Manifest id {manifest.id!r} does not match the plugin being updated "
+            f"({plugin_id!r})."
+        )
+    if manifest.entry_point != plugin.entry_point:
+        raise PluginEntryPointMismatchError(
+            f"Manifest entry_point does not match the registered plugin {plugin_id}."
+        )
+
+    enforce_compatible(
+        manifest.compatibility,
+        subject=f"Plugin {plugin_id} {manifest.version}",
+    )
+
+    plugin.name = manifest.name
+    plugin.version = manifest.version
+    plugin.description = manifest.description
+    plugin.author = manifest.author
+    plugin.capabilities = list(manifest.capabilities)
+    plugin.permissions = list(manifest.permissions or [])
+    plugin.dependencies = list(manifest.dependencies or [])
+    plugin.compatibility = manifest.compatibility
+    plugin.configuration = dict(manifest.configuration or {})
+    plugin.trust_state = manifest.trust_state
+    plugin.trust_publisher = manifest.trust_publisher
+    db.session.commit()
+    return plugin
+
+
 __all__ = [
     "ManifestValidationError",
     "PluginDependencyResolutionError",
     "PluginError",
     "PluginManifest",
     "PluginNotFoundError",
+    "PluginUpdateError",
     "discover_plugins",
     "get_plugin",
     "install_from_local_dir",
     "list_plugins",
     "resolve_plugin_dependencies",
     "set_plugin_enabled",
+    "update_plugin",
 ]
