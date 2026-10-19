@@ -9,35 +9,119 @@
       <h2>Conversations</h2>
       <button id="new-conversation" class="btn btn-primary btn-sm" type="button">+ New</button>
     </div>
+    <div class="workspace-picker">
+      <label class="visually-hidden" for="workspace-select">Workspace</label>
+      <select id="workspace-select" class="workspace-select" aria-label="Filter conversations by workspace">
+        <option value="all"{% if selected_workspace == 'all' %} selected{% endif %}>All workspaces</option>
+        {% for workspace in workspaces %}
+          <option value="{{ workspace.id }}"{% if selected_workspace|int == workspace.id %} selected{% endif %}>{{ workspace.name }}</option>
+        {% endfor %}
+      </select>
+      <button id="new-workspace" class="btn btn-ghost btn-sm" type="button" aria-label="Create workspace">+</button>
+    </div>
     <input id="conversation-search" class="sidebar-search" type="search" placeholder="Search conversations...">
-    <ul id="conversation-list" class="conversation-list">
+    <ul id="conversation-list" class="conversation-list" aria-label="Conversations">
       {% for conversation in conversations %}
         <li class="conversation-item{% if loop.first %} active{% endif %}"
             data-id="{{ conversation.id }}"
-            data-title="{{ conversation.title }}">
+            data-title="{{ conversation.title }}"
+            tabindex="0"
+            role="button"
+            aria-label="Open conversation: {{ conversation.title }}"
+            {% if loop.first %}aria-current="true"{% endif %}>
           <span class="conversation-title">{{ conversation.title }}</span>
-          <span class="conversation-meta">{{ conversation.message_count }} messages</span>
+          <span class="conversation-meta">{{ conversation.message_count }} messages <time class="conversation-time" datetime="{{ conversation.updated_at.isoformat() if conversation.updated_at else '' }}"></time></span>
+          <span class="conversation-status" hidden aria-hidden="true"></span>
         </li>
       {% endfor %}
     </ul>
     {% if not conversations %}
       <p class="sidebar-empty">No conversations yet. Start chatting below!</p>
     {% endif %}
+
+    <section class="file-tree-panel">
+      <div class="sidebar-header">
+        <h2>Project files</h2>
+      </div>
+      <div id="project-file-tree" class="file-tree">
+        <p class="sidebar-empty">Loading files...</p>
+      </div>
+      <div id="project-file-viewer" class="file-viewer" hidden>
+        <div class="file-viewer-header">
+          <button id="project-file-back" class="btn btn-ghost btn-sm" type="button">&larr; Back</button>
+          <button id="project-file-ask" class="btn btn-primary btn-sm" type="button">Ask about this file</button>
+        </div>
+        <p id="project-file-meta" class="file-viewer-meta"></p>
+        <pre id="project-file-content" class="file-viewer-content"></pre>
+      </div>
+    </section>
   </aside>
 
   <section class="chat-main">
-    <div id="chat-messages" class="chat-messages" aria-live="polite">
+    <div id="chat-messages" class="chat-messages" role="log" aria-live="polite" aria-label="Conversation messages">
       <div class="chat-placeholder">
         <p>Start a conversation with the AI assistant.</p>
       </div>
     </div>
 
-    <div class="chat-composer">
-      <textarea id="chat-input" rows="3" placeholder="Ask for code, explanations, or help..."></textarea>
-      <div class="composer-actions">
-        <button id="send-message" class="btn btn-primary" type="button">Send</button>
+    {% if not provider_status.configured %}
+    <div id="provider-onboarding" class="onboarding-panel" role="region"
+         aria-label="Provider setup"
+         data-provider="{{ provider_status.provider }}"
+         data-reason="{{ provider_status.reason }}">
+      <h3>Add a provider API key to start chatting</h3>
+      <p>
+        This assistant uses the <strong>{{ provider_status.provider }}</strong> provider,
+        which needs an API key before it can reply. You can still create and browse
+        conversations in the meantime.
+      </p>
+      <ol>
+        <li>Open the <a href="{{ url_for('keys.index') }}">API keys</a> page.</li>
+        <li>Add a key for <code>{{ provider_status.provider }}</code>.</li>
+        <li>Return here and press <em>Check again</em> — no reload needed.</li>
+      </ol>
+      <div class="onboarding-actions">
+        <a class="btn btn-primary" href="{{ url_for('keys.index') }}">Manage API keys</a>
+        <button id="provider-recheck" class="btn btn-ghost" type="button">Check again</button>
       </div>
-      <p class="chat-hint">The assistant streams its reply. Markdown and code blocks are supported.</p>
+      <p id="provider-onboarding-note" class="chat-hint"></p>
+    </div>
+    {% endif %}
+
+    <details id="chat-settings" class="chat-settings">
+      <summary>Model &amp; generation settings</summary>
+      <div class="chat-settings-body">
+        <div class="settings-field">
+          <label class="field-hint" for="chat-provider">Provider</label>
+          <select id="chat-provider" class="field-input"></select>
+        </div>
+        <div class="settings-field">
+          <label class="field-hint" for="chat-model">Model</label>
+          <select id="chat-model" class="field-input"></select>
+        </div>
+        <div class="settings-field">
+          <label class="field-hint" for="chat-temperature">Temperature: <span id="chat-temperature-value">0.7</span></label>
+          <input id="chat-temperature" type="range" min="0" max="2" step="0.1" value="0.7">
+        </div>
+        <div class="settings-field">
+          <label class="field-hint" for="chat-system-prompt">System prompt override (optional)</label>
+          <textarea id="chat-system-prompt" class="field-input" rows="2" maxlength="4000" placeholder="For example: answer with concise TypeScript examples."></textarea>
+        </div>
+        <p class="chat-hint" id="chat-settings-hint">Providers without a key are disabled. <a href="{{ url_for('keys.index') }}">Manage API keys</a>.</p>
+      </div>
+    </details>
+
+    <div class="chat-composer">
+      <div id="chat-image-preview" class="chat-image-preview" aria-live="polite"></div>
+      <textarea id="chat-input" rows="3" aria-label="Message" aria-describedby="composer-error chat-composer-hint" placeholder="Ask for code, explanations, or help..."></textarea>
+      <input id="chat-image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+      <div class="composer-actions">
+        <button id="chat-attach-image" class="btn btn-ghost btn-sm" type="button">+ Image</button>
+        <button id="send-message" class="btn btn-primary" type="button" aria-label="Send message">Send</button>
+      </div>
+      <p id="composer-error" class="composer-error" role="alert" hidden></p>
+      <p id="conversation-usage" class="chat-hint" aria-live="polite"></p>
+      <p id="chat-composer-hint" class="chat-hint">Press Enter to send, Shift+Enter for a new line. The assistant streams its reply. Markdown and code blocks are supported. Attach up to 4 png/jpeg/webp images.</p>
     </div>
   </section>
 </div>
@@ -45,11 +129,16 @@
 <div id="conversation-actions" class="conversation-actions" hidden>
   <button id="rename-conversation" class="btn btn-ghost btn-sm" type="button">Rename</button>
   <button id="pin-conversation" class="btn btn-ghost btn-sm" type="button">Pin</button>
+  <button id="share-conversation" class="btn btn-ghost btn-sm" type="button">Share</button>
+  <button id="create-share-link" class="btn btn-ghost btn-sm" type="button">Create read-only link</button>
   <button id="export-conversation" class="btn btn-ghost btn-sm" type="button">Export</button>
   <button id="delete-conversation" class="btn btn-ghost btn-sm btn-danger" type="button">Delete</button>
+  <div id="share-links-list" aria-live="polite"></div>
 </div>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/chat_markdown.js') }}"></script>
 <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+<script src="{{ url_for('static', filename='js/chat_files.js') }}"></script>
 {% endblock %}

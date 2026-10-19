@@ -11,6 +11,7 @@ Pages (HTML)
 API (JSON, all scoped to the current user)
     /reviews/api/reviews                         list / run a review
     /reviews/api/reviews/<id>                    detail / delete
+    /reviews/api/reviews/<id>/export             export as JSON or Markdown
     /reviews/api/reviews/<id>/findings           findings list
     /reviews/api/reviews/findings/<id>           update a finding (addressed)
     /reviews/api/projects/<pid>/config           get / update project config
@@ -21,11 +22,11 @@ from __future__ import annotations
 
 import json
 
-from flask import jsonify, render_template, request
+from flask import Response, jsonify, render_template, request
 from flask_login import current_user, login_required
 
 from app.extensions import db
-from app.models import Project, Review, ReviewConfig, ReviewFinding
+from app.models import Project, Review, ReviewConfig, ReviewFinding, Workspace
 from app.models.project import STATUS_READY
 from app.models.review import (
     PROJECT_REVIEW_KINDS,
@@ -35,14 +36,17 @@ from app.models.review import (
     STATUS_FAILED,
     STATUS_RUNNING,
 )
-from app.models.review_finding import SEVERITIES
+from app.models.review_finding import CATEGORIES_BY_KIND, SEVERITIES
 from app.reviews import bp
+from app.services import chat_audit, usage_ledger
 from app.services import metrics as metrics_service
 from app.services import reviews as reviews_service
+from app.services.events import emit_event
 from app.services.github import (
     GitHubError,
     GitHubInvalidError,
     get_github_client,
+    github_error_payload,
     pull_request_payload,
     validate_full_name,
 )
@@ -58,6 +62,35 @@ def _get_review(review_id: int) -> Review:
 
 def _get_project(project_id: int) -> Project:
     return Project.query.filter_by(id=project_id, user_id=current_user.id).first_or_404()
+
+
+# --------------------------------------------------------------------------
+# Review history pagination
+# --------------------------------------------------------------------------
+
+#: Review history used to be returned in full, so a long history meant one
+#: unbounded query plus one huge response. These bound the page size the same
+#: way the workspace dashboard does (issue #85).
+REVIEWS_PER_PAGE_DEFAULT = 20
+REVIEWS_PER_PAGE_MAX = 100
+
+
+def _reviews_page() -> int:
+    """Return the requested 1-based page number."""
+    return max(request.args.get("page", type=int) or 1, 1)
+
+
+def _reviews_per_page() -> int:
+    """Return the requested page size, clamped to the configured maximum.
+
+    Non-numeric, zero, and negative values fall back to the default; larger
+    values are capped at the maximum so a single request cannot ask for an
+    unbounded page.
+    """
+    value = request.args.get("per_page", type=int)
+    if value is None or value < 1:
+        return REVIEWS_PER_PAGE_DEFAULT
+    return min(value, REVIEWS_PER_PAGE_MAX)
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +227,12 @@ def project_config_page(project_id: int):
 @bp.route("/api/reviews", methods=["GET"])
 @login_required
 def api_list_reviews():
+    """Return one page of the current user's review history.
+
+    Filters (``source``/``kind``/``status``/``project_id``) combine with
+    ``page``/``per_page`` pagination and return the standard list envelope used
+    by the workspace and collaboration lists.
+    """
     query = Review.query.filter_by(user_id=current_user.id)
     source = request.args.get("source")
     kind = request.args.get("kind")
@@ -207,8 +246,28 @@ def api_list_reviews():
         query = query.filter_by(status=status)
     if project_id:
         query = query.filter_by(project_id=project_id)
-    reviews = query.order_by(Review.created_at.desc()).all()
-    return jsonify([r.to_dict() for r in reviews])
+    page = _reviews_page()
+    per_page = _reviews_per_page()
+    total = query.count()
+    # ``id`` breaks created_at ties so the ordering is total: without it, rows
+    # sharing a timestamp can repeat or vanish across page boundaries.
+    reviews = (
+        query.order_by(Review.created_at.desc(), Review.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return jsonify(
+        {
+            "items": [r.to_dict() for r in reviews],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": max(1, (total + per_page - 1) // per_page),
+            "has_next": page * per_page < total,
+            "has_prev": page > 1,
+        }
+    )
 
 
 @bp.route("/api/reviews", methods=["POST"])
@@ -228,7 +287,7 @@ def _run_pr_review(data: dict):
     try:
         full_name = validate_full_name(data.get("repo") or "")
     except GitHubInvalidError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(github_error_payload(exc)), 400
     try:
         number = int(data.get("pr_number"))
     except (TypeError, ValueError):
@@ -240,13 +299,13 @@ def _run_pr_review(data: dict):
     try:
         client = get_github_client()
     except GitHubError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(github_error_payload(exc)), 400
 
     try:
         pr_raw = client.get_pull_request(full_name, number)
         files = client.list_pull_request_files(full_name, number)
     except GitHubError as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify(github_error_payload(exc)), 502
 
     pr = pull_request_payload(pr_raw)
     config = _effective_config(project) if project else _config_payload(None)
@@ -271,6 +330,12 @@ def _run_pr_review(data: dict):
     except Exception as exc:
         result = {"summary": {}, "findings": [], "raw": "", "error": str(exc)}
     _save_result(review, result, config)
+    emit_event(
+        "review.completed",
+        data={"review_id": review.id, "kind": review.kind, "status": review.status},
+        workspace_id=project.workspace_id if project else None,
+        user_id=current_user.id,
+    )
     return jsonify(review.to_dict()), 201
 
 
@@ -302,18 +367,49 @@ def _run_project_review(data: dict):
     except Exception as exc:
         result = {"summary": {}, "findings": [], "raw": "", "error": str(exc)}
     _save_result(review, result, config)
+    emit_event(
+        "review.completed",
+        data={"review_id": review.id, "kind": review.kind, "status": review.status},
+        workspace_id=project.workspace_id,
+        user_id=current_user.id,
+    )
     return jsonify(review.to_dict()), 201
 
 
 def _save_result(review: Review, result: dict, config: dict) -> None:
-    """Persist a completed (or failed) review together with its findings."""
-    review.summary = json.dumps(result.get("summary") or {})
-    review.config = json.dumps(config)
-    findings = [
-        ReviewFinding(review_id=review.id, **finding) for finding in result.get("findings") or []
-    ]
-    review.findings_count = len(findings)
-    db.session.add_all(findings)
+    """Persist a completed (or failed) review together with its findings.
+
+    Defense in depth: ``result`` is re-validated before anything is written,
+    so even a caller-supplied dict cannot invent files, findings, coverage
+    numbers, or metrics. Unvalidated entries are rejected, not coerced.
+    """
+    if not isinstance(result, dict):
+        result = {}
+    summary = result.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    cap = None
+    if isinstance(config, dict):
+        cap = config.get("max_findings")
+    validated = reviews_service.validate_review_result(
+        {
+            "summary": summary,
+            "findings": result.get("findings"),
+            "known_files": result.get("known_files"),
+        },
+        kind=review.kind,
+        known_files=result.get("known_files"),
+        max_findings=cap,
+    )
+    findings = validated["findings"]
+    review.summary = json.dumps(validated["summary"])
+    try:
+        review.config = json.dumps(config)
+    except (TypeError, ValueError):
+        review.config = "{}"
+    rows = [ReviewFinding(review_id=review.id, **finding) for finding in findings]
+    review.findings_count = len(rows)
+    db.session.add_all(rows)
     error = result.get("error")
     if error:
         review.status = STATUS_FAILED
@@ -321,21 +417,191 @@ def _save_result(review: Review, result: dict, config: dict) -> None:
     else:
         review.status = STATUS_COMPLETED
         review.error_message = None
+
+    # One ledger row per review run (success or failure), carrying the project
+    # scope, token counts, provider/model, request id, latency and outcome
+    # (issue #430, extended by #428).
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    project = db.session.get(Project, review.project_id) if review.project_id else None
+    usage_ledger.record_usage(
+        source=usage_ledger.SOURCE_REVIEW,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens"),
+        tokens_estimated=usage.get("tokens_estimated", True),
+        provider=usage.get("provider"),
+        model=usage.get("model"),
+        user_id=review.user_id,
+        project=project,
+        workspace_id=project.workspace_id if project else None,
+        request_id=chat_audit.current_request_id() or f"review:{review.id}",
+        latency_ms=usage.get("latency_ms"),
+        status=usage_ledger.STATUS_ERROR if error else usage_ledger.STATUS_SUCCESS,
+        commit=False,
+    )
     db.session.commit()
+
+
+@bp.route("/api/reviews/<int:review_id>/retry", methods=["POST"])
+@login_required
+def api_retry_review(review_id: int):
+    """Retry a failed review run, reusing its stored configuration snapshot.
+
+    A retry creates a new review run of the same source/kind/target and passes
+    the ``config`` snapshot captured by the failed run (rather than the
+    project's current configuration), so a retry reproduces the original run.
+    Only failed reviews may be retried.
+    """
+    review = _get_review(review_id)
+    if review.status != STATUS_FAILED:
+        return jsonify({"error": "Only failed reviews can be retried."}), 409
+
+    config = _snapshot_config(review)
+    if review.source == SOURCE_GITHUB_PR:
+        return _retry_pr_review(review, config)
+    return _retry_project_review(review, config)
+
+
+def _snapshot_config(review: Review) -> dict:
+    """Return the review's stored config snapshot, falling back to defaults."""
+    if review.config:
+        try:
+            snapshot = json.loads(review.config)
+        except (ValueError, TypeError):
+            snapshot = None
+        if isinstance(snapshot, dict):
+            return snapshot
+    if review.project_id:
+        project = db.session.get(Project, review.project_id)
+        if project is not None:
+            return _effective_config(project)
+    return _config_payload(None)
+
+
+def _retry_project_review(previous: Review, config: dict):
+    project = db.session.get(Project, previous.project_id) if previous.project_id else None
+    if project is None:
+        return jsonify({"error": "The project for this review no longer exists."}), 404
+    if project.status != STATUS_READY:
+        return jsonify({"error": "This project has not finished indexing."}), 409
+
+    review = Review(
+        user_id=current_user.id,
+        project_id=project.id,
+        source=SOURCE_PROJECT,
+        kind=previous.kind,
+        status=STATUS_RUNNING,
+    )
+    db.session.add(review)
+    db.session.commit()
+    try:
+        result = reviews_service.review_project(project, previous.kind, config)
+    except Exception as exc:
+        result = {"summary": {}, "findings": [], "raw": "", "error": str(exc)}
+    _save_result(review, result, config)
+    emit_event(
+        "review.completed",
+        data={"review_id": review.id, "kind": review.kind, "status": review.status},
+        workspace_id=project.workspace_id,
+        user_id=current_user.id,
+    )
+    return jsonify(review.to_dict()), 201
+
+
+def _retry_pr_review(previous: Review, config: dict):
+    full_name = f"{previous.owner}/{previous.repo}"
+    try:
+        client = get_github_client()
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 400
+
+    try:
+        pr_raw = client.get_pull_request(full_name, previous.pr_number)
+        files = client.list_pull_request_files(full_name, previous.pr_number)
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 502
+
+    pr = pull_request_payload(pr_raw)
+    project = db.session.get(Project, previous.project_id) if previous.project_id else None
+    review = Review(
+        user_id=current_user.id,
+        project_id=project.id if project else None,
+        source=SOURCE_GITHUB_PR,
+        kind="pr",
+        status=STATUS_RUNNING,
+        owner=previous.owner,
+        repo=previous.repo,
+        pr_number=previous.pr_number,
+        pr_title=pr.get("title"),
+        base_ref=pr.get("base"),
+        head_ref=pr.get("head"),
+    )
+    db.session.add(review)
+    db.session.commit()
+    try:
+        result = reviews_service.review_pull_request(pr, files, config)
+    except Exception as exc:
+        result = {"summary": {}, "findings": [], "raw": "", "error": str(exc)}
+    _save_result(review, result, config)
+    emit_event(
+        "review.completed",
+        data={"review_id": review.id, "kind": review.kind, "status": review.status},
+        workspace_id=project.workspace_id if project else None,
+        user_id=current_user.id,
+    )
+    return jsonify(review.to_dict()), 201
 
 
 @bp.route("/api/reviews/<int:review_id>", methods=["GET"])
 @login_required
 def api_review_detail(review_id: int):
-    return jsonify(_get_review(review_id).to_dict())
+    review = _get_review(review_id)
+    payload = review.to_dict()
+    # Expose the category vocabulary for this review kind so the detail page can
+    # offer a category filter (#118).
+    payload["categories"] = list(CATEGORIES_BY_KIND.get(review.kind, ("other",)))
+    return jsonify(payload)
+
+
+@bp.route("/api/reviews/<int:review_id>/export", methods=["GET"])
+@login_required
+def api_export_review(review_id: int):
+    """Export a review (summary + findings) as JSON or Markdown.
+
+    ``format`` is ``json`` (default) or ``markdown`` (``md`` is accepted as an
+    alias). The response is a downloadable attachment scoped to the owner.
+    """
+    review = _get_review(review_id)
+    fmt = (request.args.get("format") or "json").strip().lower()
+    if fmt in ("md", "markdown"):
+        body = reviews_service.render_review_markdown(review)
+        filename = f"review-{review.id}.md"
+        mimetype = "text/markdown"
+    elif fmt == "json":
+        body = json.dumps(reviews_service.review_export_payload(review), indent=2)
+        filename = f"review-{review.id}.json"
+        mimetype = "application/json"
+    else:
+        return jsonify({"error": "Unsupported export format. Use 'json' or 'markdown'."}), 400
+    return Response(
+        body,
+        mimetype=mimetype,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @bp.route("/api/reviews/<int:review_id>", methods=["DELETE"])
 @login_required
 def api_delete_review(review_id: int):
+    """Delete a review and its findings (owner only; findings cascade)."""
     review = _get_review(review_id)
+    workspace_id = review.project.workspace_id if review.project_id else None
+    data = {"review_id": review.id, "kind": review.kind, "source": review.source}
     db.session.delete(review)
     db.session.commit()
+    emit_event("review.deleted", data=data, workspace_id=workspace_id, user_id=current_user.id)
     return jsonify({"ok": True})
 
 
@@ -413,6 +679,13 @@ def api_update_config(project_id: int):
 @bp.route("/api/metrics", methods=["GET"])
 @login_required
 def api_metrics():
+    """Aggregate quality metrics per workspace, project, or the current user."""
+    workspace_id = request.args.get("workspace_id", type=int)
+    if workspace_id:
+        workspace = Workspace.query.filter_by(
+            id=workspace_id, user_id=current_user.id
+        ).first_or_404()
+        return jsonify(metrics_service.workspace_metrics(workspace))
     project_id = request.args.get("project_id", type=int)
     if project_id:
         project = _get_project(project_id)

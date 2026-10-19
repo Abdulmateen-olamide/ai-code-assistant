@@ -13,25 +13,85 @@ them into user-facing responses without swallowing failures.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 import requests
+from flask import current_app
 
 from app.config import Config
+from app.extensions import db
 from app.models import GithubAccount
 from app.services.crypto import decrypt_secret
+from app.services.github_cache import (
+    CachedSession,
+    GitHubResponseCache,
+    auth_fingerprint,
+    get_cache,
+)
 
 logger = logging.getLogger(__name__)
 
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_REVOKE_URL = "https://api.github.com/applications/{client_id}/token"
 DEFAULT_API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
 
 # GitHub repository names / owners: letters, digits, dashes, dots, underscores.
 _FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+#: Default and maximum ``per_page`` for list endpoints (GitHub caps at 100).
+PAGE_SIZE_DEFAULT = 50
+PAGE_SIZE_MAX = 100
+
+#: Matches one ``<url>; rel="name"`` entry of a GitHub ``Link`` header.
+_LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel="([^"]+)"')
+
+
+@dataclass(frozen=True)
+class GitHubPage:
+    """A single page of a GitHub list endpoint plus its navigation metadata.
+
+    ``has_next`` / ``has_prev`` / ``total_pages`` are derived from the ``Link``
+    response header GitHub returns, so the caller never has to guess where the
+    next page is.
+    """
+
+    items: list[dict]
+    page: int
+    per_page: int
+    has_next: bool = False
+    has_prev: bool = False
+    total_pages: int | None = None
+
+
+def parse_link_header(header: str) -> dict[str, str]:
+    """Return ``{rel: url}`` parsed from a GitHub ``Link`` header."""
+    return {rel: url for url, rel in _LINK_RE.findall(header or "")}
+
+
+def _page_number_from_url(url: str | None) -> int | None:
+    """Extract the ``page`` query parameter from a GitHub paging URL."""
+    if not url:
+        return None
+    values = parse_qs(urlparse(url).query).get("page")
+    if not values:
+        return None
+    try:
+        return int(values[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _github_config(name: str):
+    """Read GitHub settings from the active app, with class-config fallback."""
+    return current_app.config.get(name, getattr(Config, name))
 
 
 class GitHubError(RuntimeError):
@@ -39,10 +99,13 @@ class GitHubError(RuntimeError):
 
     kind = "github_error"
 
-    def __init__(self, message: str, *, kind: str | None = None) -> None:
+    def __init__(self, message: str, *, kind: str | None = None, detail: str | None = None) -> None:
         super().__init__(message)
         if kind is not None:
             self.kind = kind
+        # Server-side-only detail (e.g. GitHub's raw response message). Never
+        # surfaced to the client; logged instead. See ``github_error_payload``.
+        self.detail = detail
 
 
 class GitHubNotConnectedError(GitHubError):
@@ -73,8 +136,53 @@ class GitHubInvalidError(GitHubError):
     kind = "validation"
 
 
+#: Stable, sanitized messages shown to end users, keyed by error ``kind``.
+#: GitHub's raw response bodies are never surfaced: they can contain URLs,
+#: headers, rate-limit data, or implementation details. Those are kept on
+#: ``GitHubError.detail`` for server-side logging only.
+ERROR_MESSAGES = {
+    "not_connected": "Connect your GitHub account to use this feature.",
+    "auth": "Your GitHub connection is no longer valid. Reconnect your account.",
+    "cancelled": "GitHub connection was cancelled. You can retry whenever you're ready.",
+    "permission": "GitHub denied access to this resource.",
+    "not_found": "The requested GitHub resource was not found.",
+    "rate_limit": "GitHub API rate limit reached. Please try again later.",
+    "network": "Could not reach the GitHub API. Please try again.",
+    "validation": "The GitHub request was invalid.",
+    "github_error": "The GitHub request failed. Please try again.",
+}
+
+
+def is_access_denied(error: str | None) -> bool:
+    """Return ``True`` when GitHub reports the user denied the OAuth consent.
+
+    GitHub sends ``error=access_denied`` on the callback when the user clicks
+    "Cancel" on the consent screen. That is a user cancellation, not a
+    failure, so callers should treat it as such (issue: OAuth denial page).
+    """
+    return (error or "").strip().lower() == "access_denied"
+
+
+class GitHubCancelledError(GitHubError):
+    kind = "cancelled"
+
+
+def github_error_message(exc: GitHubError) -> str:
+    """Return the stable user-facing message for ``exc``'s kind."""
+    return ERROR_MESSAGES.get(exc.kind, ERROR_MESSAGES["github_error"])
+
+
+def github_error_payload(exc: GitHubError) -> dict:
+    """Build a sanitized JSON error payload for a :class:`GitHubError`.
+
+    Route handlers must use this instead of ``str(exc)`` so no raw GitHub
+    message (or token/header material) is ever echoed to the client.
+    """
+    return {"error": github_error_message(exc), "kind": exc.kind}
+
+
 def _parse_error_body(response: requests.Response) -> str:
-    """Extract a short human-readable message from an error response."""
+    """Extract a short human-readable message for server-side logging only."""
     try:
         data = response.json()
     except ValueError:
@@ -86,12 +194,26 @@ def _parse_error_body(response: requests.Response) -> str:
     return f"HTTP {response.status_code}"
 
 
+def compare_refs(client: GitHubClient, full_name: str, base: str, head: str) -> dict:
+    """Compare two refs on GitHub and return the diff summary.
+
+    Convenience wrapper around :meth:`GitHubClient.compare_refs` so callers
+    that already hold a client instance can use either form. ``base`` and
+    ``head`` are plain refs (branch names, tags, or SHAs) and are joined as
+    ``base...head`` for the REST comparison endpoint.
+    """
+    return client.compare_refs(full_name, base, head)
+
+
 class GitHubClient:
     """Authenticated client for the GitHub REST API.
 
     Provides bounded retry behaviour: transient failures (network errors and
     HTTP 5xx) are retried with exponential backoff, and rate-limit responses
     (429 or 403 with exhausted quota) pause until the documented reset time.
+
+    ``GET`` responses are also revalidated with GitHub's ``ETag`` via a bounded
+    in-memory cache (issue #76); see :mod:`app.services.github_cache`.
     """
 
     def __init__(
@@ -101,10 +223,14 @@ class GitHubClient:
         api_url: str | None = None,
         timeout: int | None = None,
         max_retries: int = 3,
+        cache: GitHubResponseCache | None = None,
     ) -> None:
         self.api_url = (api_url or Config.GITHUB_API_URL).rstrip("/")
         self.timeout = timeout or Config.GITHUB_REQUEST_TIMEOUT
         self.max_retries = max_retries
+        #: Scopes GitHub reports as actually granted (``X-OAuth-Scopes``).
+        #: Display-only hint; never used to make an authorization decision.
+        self._granted_scopes: list[str] = []
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -113,6 +239,15 @@ class GitHubClient:
                 "X-GitHub-Api-Version": API_VERSION,
             }
         )
+        # Revalidate GETs with If-None-Match so listings, trees, and READMEs are
+        # not re-downloaded on every page load (issue #76). Keying on a
+        # fingerprint of this token keeps one account's cached responses from ever
+        # being replayed for another.
+        self.response_cache = cache if cache is not None else get_cache()
+        if self.response_cache.enabled:
+            self.session = CachedSession(
+                self.session, self.response_cache, auth_fingerprint(access_token)
+            )
 
     # -- Core request machinery --------------------------------------------
 
@@ -129,7 +264,11 @@ class GitHubClient:
                 if attempt < self.max_retries - 1:
                     time.sleep(2**attempt)
                     continue
-                raise GitHubNetworkError(f"Could not reach the GitHub API: {exc}") from exc
+                raise GitHubNetworkError(
+                    "Could not reach the GitHub API. Please try again.", detail=str(exc)
+                ) from exc
+
+            self._capture_scopes(response)
 
             if response.status_code == 404:
                 raise GitHubNotFoundError("The requested GitHub resource was not found.")
@@ -146,7 +285,9 @@ class GitHubClient:
                     raise GitHubRateLimitError(
                         f"GitHub API rate limit reached. Retry in about {wait} seconds."
                     )
-                raise GitHubPermissionError(f"GitHub denied access: {_parse_error_body(response)}")
+                detail = _parse_error_body(response)
+                logger.warning("GitHub permission error on %s: %s", path, detail)
+                raise GitHubPermissionError("GitHub denied access to this resource.", detail=detail)
 
             if response.status_code >= 500:
                 last_exc = GitHubError(f"GitHub API returned {response.status_code}.")
@@ -158,9 +299,11 @@ class GitHubClient:
                 ) from last_exc
 
             if response.status_code >= 400:
-                raise GitHubError(
-                    f"GitHub API error ({response.status_code}): {_parse_error_body(response)}"
+                detail = _parse_error_body(response)
+                logger.warning(
+                    "GitHub API error on %s (%s): %s", path, response.status_code, detail
                 )
+                raise GitHubError("The GitHub request failed. Please try again.", detail=detail)
 
             if response.status_code == 204 or not response.content:
                 return {}
@@ -170,7 +313,25 @@ class GitHubClient:
             except ValueError as exc:
                 raise GitHubError("GitHub API returned an unexpected response.") from exc
 
-        raise GitHubNetworkError(f"GitHub request failed after retries: {last_exc}")
+        raise GitHubNetworkError(
+            "Could not reach the GitHub API. Please try again.", detail=str(last_exc)
+        )
+
+    def _capture_scopes(self, response: requests.Response) -> None:
+        """Record the granted OAuth scopes GitHub reports (issue #57).
+
+        GitHub returns the scopes the token actually holds in the
+        ``X-OAuth-Scopes`` response header. The value is a display hint only;
+        it is never used to make an authorization decision.
+        """
+        header = response.headers.get("X-OAuth-Scopes")
+        if header is not None:
+            self._granted_scopes = [scope.strip() for scope in header.split(",") if scope.strip()]
+
+    @property
+    def granted_scopes(self) -> list[str]:
+        """Scopes GitHub actually granted, as reported by ``X-OAuth-Scopes``."""
+        return list(self._granted_scopes)
 
     def _get(self, path: str, *, params: dict | None = None) -> dict | list:
         return self._request("GET", path, params=params)
@@ -207,10 +368,106 @@ class GitHubClient:
 
         return items[:max_items]
 
+    def _get_page(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        page: int = 1,
+        per_page: int = PAGE_SIZE_DEFAULT,
+    ) -> GitHubPage:
+        """Fetch one page of a GitHub list endpoint.
+
+        ``page`` is 1-based and ``per_page`` is clamped to ``PAGE_SIZE_MAX``
+        (GitHub's own maximum) so a single response is always bounded. The
+        ``Link`` header GitHub sends back is parsed to report whether a
+        next/previous page exists and, when GitHub includes it, the last page
+        number.
+        """
+        page = max(1, int(page or 1))
+        per_page = max(1, min(int(per_page or PAGE_SIZE_DEFAULT), PAGE_SIZE_MAX))
+        request_params = dict(params or {})
+        request_params.update({"page": page, "per_page": per_page})
+
+        response = self.session.get(
+            f"{self.api_url}{path}", params=request_params, timeout=self.timeout
+        )
+        if response.status_code >= 400:
+            # Re-issue through _request so failures become the typed errors the
+            # rest of the app expects (auth, rate limit, not found, ...).
+            self._request("GET", path, params=params)
+
+        try:
+            items = response.json()
+        except ValueError:
+            items = []
+        if not isinstance(items, list):
+            items = []
+
+        links = parse_link_header(response.headers.get("Link", ""))
+        has_next = "next" in links
+        has_prev = "prev" in links
+        total_pages = _page_number_from_url(links.get("last")) or (page if not has_next else None)
+        return GitHubPage(
+            items=items[:per_page],
+            page=page,
+            per_page=per_page,
+            has_next=has_next,
+            has_prev=has_prev,
+            total_pages=total_pages,
+        )
+
     # -- GitHub account -----------------------------------------------------
 
     def get_user(self) -> dict:
         return self._get("/user")
+
+    def get_granted_scopes(self) -> list[str]:
+        """Return the OAuth scopes GitHub actually granted this token (issue #57).
+
+        GitHub reports the granted scopes in the ``X-OAuth-Scopes`` response
+        header of an authenticated request (the token exchange response also
+        carries them, but the header reflects the token's *current* grants).
+        The result is informational only: it is never used to make
+        authorization decisions, which always depend on the token itself.
+        """
+        response = self.session.get(f"{self.api_url}/user", timeout=self.timeout)
+        if response.status_code >= 400:
+            # Re-issue through _request so failures become the typed errors the
+            # rest of the app expects (auth, rate limit, not found, ...).
+            self._request("GET", "/user")
+        raw = response.headers.get("X-OAuth-Scopes", "")
+        return [scope.strip() for scope in raw.split(",") if scope.strip()]
+
+    def get_rate_limit(self) -> dict | None:
+        """Return the caller's core rate-limit budget, or ``None`` if unknown.
+
+        Uses GitHub's dedicated ``/rate_limit`` endpoint, which does not count
+        against the caller's quota. The result is normalized to
+        ``{"limit", "remaining", "reset", "used"}`` where ``reset`` is a Unix
+        timestamp. Only numeric fields are returned: no token, headers, or raw
+        GitHub response is ever surfaced (issue #77).
+        """
+        data = self._get("/rate_limit")
+        if not isinstance(data, dict):
+            return None
+        resources = data.get("resources")
+        core = (resources or {}).get("core") if isinstance(resources, dict) else None
+        if not isinstance(core, dict):
+            core = data.get("rate")
+        if not isinstance(core, dict):
+            return None
+        remaining = core.get("remaining")
+        reset = core.get("reset")
+        if remaining is None or reset is None:
+            return None
+        limit = core.get("limit")
+        return {
+            "limit": limit,
+            "remaining": remaining,
+            "reset": reset,
+            "used": core.get("used"),
+        }
 
     # -- Repositories -------------------------------------------------------
 
@@ -222,6 +479,23 @@ class GitHubClient:
 
     def get_repository(self, full_name: str) -> dict:
         return self._get(f"/repos/{full_name}")
+
+    def get_public_repository(self, full_name: str) -> dict:
+        """Fetch a repository by ``owner/name`` respecting GitHub permissions.
+
+        Works for any public repository and for private repositories the
+        authenticated user can access. GitHub returns 404 for repositories the
+        token cannot see (including private ones), which is translated into a
+        clear permission error so the caller can tell the user access was
+        denied rather than the repo not existing.
+        """
+        name = validate_full_name(full_name)
+        try:
+            return self._get(f"/repos/{name}")
+        except GitHubNotFoundError as exc:
+            raise GitHubPermissionError(
+                "GitHub denied access to this resource.", detail=str(exc)
+            ) from exc
 
     def list_branches(self, full_name: str) -> list[dict]:
         return self._get_paginated(f"/repos/{full_name}/branches")
@@ -328,8 +602,116 @@ class GitHubClient:
             params["path"] = path
         return self._get(f"/repos/{full_name}/commits", params=params)
 
+    def list_commits_page(
+        self,
+        full_name: str,
+        *,
+        ref: str | None = None,
+        path: str | None = None,
+        page: int = 1,
+        per_page: int = PAGE_SIZE_DEFAULT,
+    ) -> GitHubPage:
+        """Fetch one page of a repository's commit history (issue #66).
+
+        Uses the ``Link`` header GitHub returns so the caller can offer
+        "load more" without guessing where the next page is. ``ref`` and
+        ``path`` filter the history and are preserved across pages.
+        """
+        params: dict = {}
+        if ref:
+            params["sha"] = ref
+        if path:
+            params["path"] = path
+        return self._get_page(
+            f"/repos/{full_name}/commits",
+            params=params or None,
+            page=page,
+            per_page=per_page,
+        )
+
     def get_commit(self, full_name: str, sha: str) -> dict:
         return self._get(f"/repos/{full_name}/commits/{sha}")
+
+    def compare_refs(self, full_name: str, base: str, head: str) -> dict:
+        """Return GitHub's comparison of ``base`` against ``head``.
+
+        The GitHub compare endpoint returns an envelope containing ``status``,
+        ``ahead_by``/``behind_by``, ``commits``, and the changed ``files``
+        (each with ``additions``/``deletions``/``patch``).
+        """
+        return self._get(f"/repos/{full_name}/compare/{base}...{head}")
+
+    def _graphql(self, query: str, variables: dict) -> dict:
+        """Execute a GraphQL query against the GitHub GraphQL API."""
+        url = f"{self.api_url}/graphql"
+        try:
+            response = self.session.request(
+                "POST",
+                url,
+                json={"query": query, "variables": variables},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise GitHubNetworkError(
+                "Could not reach the GitHub API. Please try again.", detail=str(exc)
+            ) from exc
+        if response.status_code == 401:
+            raise GitHubAuthError(
+                "Your GitHub connection is no longer valid. Reconnect your account."
+            )
+        if response.status_code >= 400:
+            raise GitHubError(
+                "The GitHub request failed. Please try again.",
+                detail=_parse_error_body(response),
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise GitHubError("GitHub API returned an unexpected response.") from exc
+        if payload.get("errors"):
+            raise GitHubError("The GitHub request failed. Please try again.")
+        return payload.get("data") or {}
+
+    def get_last_commits(self, full_name: str, paths: list[str], ref: str) -> dict[str, dict]:
+        """Return the last commit touching each path in a single request.
+
+        GitHub's REST API can only answer "last commit for this path" one path
+        at a time. Batching the per-path history lookups into one GraphQL query
+        keeps this to a single API call regardless of how many files are shown.
+        Files whose history cannot be resolved are simply omitted from the
+        result.
+        """
+        if not paths:
+            return {}
+        owner, _, name = full_name.partition("/")
+        fields = []
+        for index, path in enumerate(paths):
+            literal = json.dumps(path)  # safe GraphQL string literal
+            fields.append(
+                f"f{index}: object(expression: $ref) {{ ... on Commit {{ "
+                f"history(first: 1, path: {literal}) {{ nodes {{ oid messageHeadline "
+                f"committedDate author {{ name }} }} }} }} }}"
+            )
+        query = (
+            "query($owner: String!, $name: String!, $ref: String!) { "
+            "repository(owner: $owner, name: $name) {" + "\n".join(fields) + "}}"
+        )
+        data = self._graphql(query, {"owner": owner, "name": name, "ref": ref})
+        repository = data.get("repository") or {}
+        commits: dict[str, dict] = {}
+        for index, path in enumerate(paths):
+            node = repository.get(f"f{index}") or {}
+            nodes = (node.get("history") or {}).get("nodes") or []
+            if not nodes:
+                continue
+            commit = nodes[0]
+            commits[path] = {
+                "sha": commit.get("oid"),
+                "message": commit.get("messageHeadline"),
+                "author": (commit.get("author") or {}).get("name"),
+                "date": commit.get("committedDate"),
+            }
+        return commits
 
     # -- Issues -------------------------------------------------------------
 
@@ -339,7 +721,46 @@ class GitHubClient:
             f"/repos/{full_name}/issues",
             params={"state": state, "per_page": per_page},
         )
-        return [item for item in data if "pull_request" not in item]
+        return issues_only(data)
+
+    def list_issues_page(
+        self,
+        full_name: str,
+        *,
+        state: str = "open",
+        labels: str | None = None,
+        assignee: str | None = None,
+        search: str | None = None,
+        page: int = 1,
+        per_page: int = PAGE_SIZE_DEFAULT,
+    ) -> GitHubPage:
+        """Return one page of issues (excluding pull requests).
+
+        GitHub's issues endpoint includes pull requests, so the payload is
+        filtered; the returned navigation metadata still reflects GitHub's own
+        paging links for the endpoint.
+        """
+        params: dict = {"state": state}
+        if labels:
+            params["labels"] = labels
+        if assignee:
+            params["assignee"] = assignee
+        if search:
+            params["q"] = search
+        result = self._get_page(
+            f"/repos/{full_name}/issues",
+            params=params,
+            page=page,
+            per_page=per_page,
+        )
+        return GitHubPage(
+            items=issues_only(result.items),
+            page=result.page,
+            per_page=result.per_page,
+            has_next=result.has_next,
+            has_prev=result.has_prev,
+            total_pages=result.total_pages,
+        )
 
     def get_issue(self, full_name: str, number: int) -> dict:
         return self._get(f"/repos/{full_name}/issues/{number}")
@@ -352,11 +773,35 @@ class GitHubClient:
             params={"state": state, "per_page": 50},
         )
 
+    def list_pull_requests_page(
+        self,
+        full_name: str,
+        *,
+        state: str = "open",
+        page: int = 1,
+        per_page: int = PAGE_SIZE_DEFAULT,
+    ) -> GitHubPage:
+        """Return one page of pull requests with Link-header navigation."""
+        return self._get_page(
+            f"/repos/{full_name}/pulls",
+            params={"state": state},
+            page=page,
+            per_page=per_page,
+        )
+
     def get_pull_request(self, full_name: str, number: int) -> dict:
         return self._get(f"/repos/{full_name}/pulls/{number}")
 
     def list_pull_request_files(self, full_name: str, number: int) -> list[dict]:
         return self._get(f"/repos/{full_name}/pulls/{number}/files", params={"per_page": 100})
+
+    def list_check_runs(self, full_name: str, ref: str) -> dict:
+        """Return check runs for a commit/ref."""
+        return self._get(f"/repos/{full_name}/commits/{ref}/check-runs", params={"per_page": 100})
+
+    def get_commit_status(self, full_name: str, ref: str) -> dict:
+        """Return combined commit status for a commit/ref."""
+        return self._get(f"/repos/{full_name}/commits/{ref}/status")
 
     def list_pull_request_reviews(self, full_name: str, number: int) -> list[dict]:
         return self._get(f"/repos/{full_name}/pulls/{number}/reviews")
@@ -388,6 +833,16 @@ class GitHubClient:
 # -- Payload normalization ---------------------------------------------------
 
 
+def _license_label(license_data: dict | None) -> str | None:
+    """Return a short license label, preferring the SPDX id."""
+    if not license_data:
+        return None
+    spdx = license_data.get("spdx_id")
+    if spdx and spdx != "NOASSERTION":
+        return spdx
+    return license_data.get("name")
+
+
 def repo_payload(repo: dict) -> dict:
     """Normalize a repository dict into the shape consumed by the UI."""
     return {
@@ -403,7 +858,18 @@ def repo_payload(repo: dict) -> dict:
         "html_url": repo.get("html_url"),
         "size": repo.get("size"),
         "fork": bool(repo.get("fork")),
+        "stars": repo.get("stargazers_count") or 0,
+        "forks": repo.get("forks_count") or 0,
+        "open_issues_count": repo.get("open_issues_count") or 0,
+        "license": _license_label(repo.get("license")),
+        "topics": repo.get("topics") or [],
+        "homepage": repo.get("homepage") or "",
     }
+
+
+def issues_only(items: list[dict]) -> list[dict]:
+    """Return only true issues from a GitHub issues payload (drop PRs)."""
+    return [item for item in items if "pull_request" not in item]
 
 
 def issue_payload(issue: dict) -> dict:
@@ -455,7 +921,9 @@ def pull_request_payload(pr: dict) -> dict:
         "updated_at": pr.get("updated_at"),
         "merged": bool(pr.get("merged")),
         "mergeable": pr.get("mergeable"),
+        "mergeable_state": pr.get("mergeable_state"),
         "head": (pr.get("head") or {}).get("ref"),
+        "head_sha": (pr.get("head") or {}).get("sha"),
         "base": (pr.get("base") or {}).get("ref"),
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
@@ -473,6 +941,25 @@ def validate_full_name(full_name: str) -> str:
     return name
 
 
+def lookup_repository(user, full_name: str) -> dict:
+    """Look up an arbitrary public repository by ``owner/name`` (issue #78).
+
+    Returns the normalized repository payload. Access is decided entirely by
+    GitHub's own permission model: the user's token is used for the request, so
+    private repositories the user cannot see come back as a permission error and
+    the token never grants access beyond what GitHub already allows.
+    """
+    name = validate_full_name(full_name)
+    client = get_github_client(user)
+    try:
+        repo = client.get_repository(name)
+    except GitHubNotFoundError as exc:
+        raise GitHubPermissionError(
+            "GitHub denied access to this resource.", detail=str(exc)
+        ) from exc
+    return repo_payload(repo)
+
+
 def validate_path(path: str) -> str:
     """Validate a repository-relative file path against path traversal.
 
@@ -485,6 +972,49 @@ def validate_path(path: str) -> str:
     if any(part in ("", ".", "..") for part in parts):
         raise GitHubInvalidError("Invalid path.")
     return "/".join(parts)
+
+
+def revoke_github_token(access_token: str) -> None:
+    """Best-effort revocation of a GitHub OAuth token."""
+    # Drop any responses cached under this token first, so a disconnected
+    # account's private repository data does not linger in process memory (#76).
+    # Done unconditionally: the local account is being disconnected regardless of
+    # whether the upstream DELETE succeeds.
+    get_cache().invalidate_auth(auth_fingerprint(access_token))
+    try:
+        response = requests.delete(
+            GITHUB_REVOKE_URL.format(client_id=_github_config("GITHUB_CLIENT_ID")),
+            auth=(_github_config("GITHUB_CLIENT_ID"), _github_config("GITHUB_CLIENT_SECRET")),
+            json={"access_token": access_token},
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=_github_config("GITHUB_REQUEST_TIMEOUT"),
+        )
+        if response.status_code >= 400:
+            logger.warning("GitHub token revocation failed with HTTP %s", response.status_code)
+    except requests.RequestException as exc:
+        logger.warning("GitHub token revocation failed: %s", exc)
+
+
+def _refresh_github_token(refresh_token: str) -> dict | None:
+    """Exchange a GitHub refresh token for a new token pair."""
+    try:
+        response = requests.post(
+            GITHUB_TOKEN_URL,
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": _github_config("GITHUB_CLIENT_ID"),
+                "client_secret": _github_config("GITHUB_CLIENT_SECRET"),
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout=_github_config("GITHUB_REQUEST_TIMEOUT"),
+        )
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if response.status_code >= 400 or "access_token" not in data:
+        return None
+    return data
 
 
 def get_github_client(user=None) -> GitHubClient:
@@ -502,6 +1032,207 @@ def get_github_client(user=None) -> GitHubClient:
         raise GitHubNotConnectedError("Connect your GitHub account to use this feature.")
     try:
         token = decrypt_secret(account.access_token_encrypted)
+        refresh_token = (
+            decrypt_secret(account.refresh_token_encrypted)
+            if account.refresh_token_encrypted
+            else None
+        )
     except ValueError as exc:
-        raise GitHubAuthError(str(exc)) from exc
+        raise GitHubAuthError(
+            "Your GitHub connection is no longer valid. Reconnect your account.",
+            detail=str(exc),
+        ) from exc
+    expires_at = account.token_expires_at
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at and expires_at <= datetime.now(UTC):
+        refreshed = _refresh_github_token(refresh_token) if refresh_token else None
+        if refreshed is None:
+            db.session.delete(account)
+            db.session.commit()
+            raise GitHubNotConnectedError("Connect your GitHub account to use this feature.")
+        account.set_access_token(refreshed["access_token"])
+        if "refresh_token" in refreshed:
+            account.set_refresh_token(refreshed["refresh_token"])
+        account.token_expires_at = (
+            datetime.now(UTC) + timedelta(seconds=int(refreshed["expires_in"]))
+            if refreshed.get("expires_in")
+            else None
+        )
+        db.session.commit()
+        token = refreshed["access_token"]
     return GitHubClient(token)
+
+
+# -- Chat context references (issue #74) -------------------------------------
+
+
+#: Matches ``owner/repo#123`` and a bare ``owner/repo``. The lookbehind stops a
+#: leading word character, ``@`` or ``/`` from being read as part of the name.
+CONTEXT_REFERENCE_RE = re.compile(
+    r"(?<![\w@/.-])([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(?:#(\d+))?"
+)
+#: Matches a bare ``#123``, which needs a repository to resolve against.
+CONTEXT_NUMBER_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+#: Appended to the assembled context when it had to be trimmed to the cap.
+CONTEXT_TRUNCATED_MARKER = "\n\n[GitHub context truncated]"
+
+
+def parse_context_references(text: str) -> list[dict]:
+    """Return the GitHub references found in ``text`` (issue #74).
+
+    Three forms are recognized: ``owner/repo#123`` (an issue or pull request),
+    ``owner/repo`` (a repository), and a bare ``#123`` when the same message also
+    names a repository to resolve it against. Order is preserved and duplicates
+    collapse, so mentioning the same target twice fetches it once. A bare
+    ``#123`` with no repository named is ignored rather than guessed at.
+    """
+    references: list[dict] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    repositories: list[str] = []
+
+    for match in CONTEXT_REFERENCE_RE.finditer(text or ""):
+        try:
+            full_name = validate_full_name(match.group(1))
+        except GitHubInvalidError:
+            continue
+        number = match.group(2)
+        if number:
+            key = ("thread", full_name, int(number))
+            if key not in seen:
+                seen.add(key)
+                references.append({"kind": "thread", "full_name": full_name, "number": int(number)})
+        else:
+            key = ("repo", full_name, None)
+            if key not in seen:
+                seen.add(key)
+                references.append({"kind": "repo", "full_name": full_name, "number": None})
+            repositories.append(full_name)
+
+    for match in CONTEXT_NUMBER_RE.finditer(text or ""):
+        number = int(match.group(1))
+        for full_name in repositories:
+            key = ("thread", full_name, number)
+            if key in seen:
+                continue
+            seen.add(key)
+            references.append({"kind": "thread", "full_name": full_name, "number": number})
+
+    return references
+
+
+def _repo_context_section(client: GitHubClient, full_name: str) -> str:
+    """Return the model-facing context block for a whole repository."""
+    repo = client.get_repository(full_name)
+    lines = [
+        f"### Repository {repo.get('full_name') or full_name}",
+        f"- Description: {repo.get('description') or '(none)'}",
+        f"- Primary language: {repo.get('language') or 'unknown'}",
+        f"- Default branch: {repo.get('default_branch') or 'main'}",
+        f"- URL: {repo.get('html_url') or 'https://github.com/' + full_name}",
+    ]
+    try:
+        readme = client.get_readme(full_name, repo.get("default_branch"))
+    except GitHubError:
+        readme = None
+    if readme:
+        lines.extend(["", "README:", readme])
+    return "\n".join(lines)
+
+
+def _pull_request_context_section(client: GitHubClient, full_name: str, number: int) -> str:
+    """Return the model-facing context block for a pull request."""
+    pull = client.get_pull_request(full_name, number)
+    state = pull.get("state") or "unknown"
+    if pull.get("merged_at"):
+        state = f"{state} (merged)"
+    lines = [
+        f"### Pull request {full_name}#{number}",
+        f"- Title: {pull.get('title') or '(no title)'}",
+        f"- State: {state}",
+        f"- Author: {(pull.get('user') or {}).get('login') or 'unknown'}",
+        f"- Branch: {(pull.get('head') or {}).get('ref')} -> {(pull.get('base') or {}).get('ref')}",
+        (
+            f"- Changed files: {pull.get('changed_files', 0)} "
+            f"(+{pull.get('additions', 0)} -{pull.get('deletions', 0)})"
+        ),
+        f"- URL: {pull.get('html_url') or ''}",
+    ]
+    if pull.get("body"):
+        lines.extend(["", "Body:", pull["body"]])
+    return "\n".join(lines)
+
+
+def _issue_context_section(client: GitHubClient, full_name: str, number: int) -> str:
+    """Return the model-facing context block for an issue."""
+    issue = client.get_issue(full_name, number)
+    labels = ", ".join(
+        label.get("name", "") for label in issue.get("labels") or [] if isinstance(label, dict)
+    )
+    lines = [
+        f"### Issue {full_name}#{number}",
+        f"- Title: {issue.get('title') or '(no title)'}",
+        f"- State: {issue.get('state') or 'unknown'}",
+        f"- Author: {(issue.get('user') or {}).get('login') or 'unknown'}",
+        f"- Labels: {labels or '(none)'}",
+        f"- URL: {issue.get('html_url') or ''}",
+    ]
+    if issue.get("body"):
+        lines.extend(["", "Body:", issue["body"]])
+    return "\n".join(lines)
+
+
+def _thread_context_section(client: GitHubClient, full_name: str, number: int) -> str:
+    """Return the context block for ``#number``, preferring a pull request.
+
+    GitHub's issues API also returns pull requests, so probing the pull request
+    endpoint first (and falling back to the issue endpoint on 404) resolves both
+    kinds without a second round trip when the reference is a pull request.
+    """
+    try:
+        return _pull_request_context_section(client, full_name, number)
+    except GitHubNotFoundError:
+        return _issue_context_section(client, full_name, number)
+
+
+def build_github_context(user, text: str) -> dict:
+    """Assemble model-facing context for the GitHub references in ``text`` (issue #74).
+
+    Returns ``{"context", "references", "notices"}``. ``context`` is the block
+    handed to the model and never exceeds ``Config.GITHUB_MAX_CONTEXT_CHARS``
+    characters, so one chat message cannot push an unbounded amount of repository
+    data into the prompt. A reference that cannot be read (missing, private, or
+    rate limited) becomes an entry in ``notices`` instead of failing the whole
+    message.
+
+    Raises :class:`GitHubNotConnectedError` when ``user`` has no GitHub
+    connection, so the caller can prompt them to connect first.
+    """
+    references = parse_context_references(text)
+    if not references:
+        return {"context": "", "references": [], "notices": []}
+
+    client = get_github_client(user)
+    budget = int(Config.GITHUB_MAX_CONTEXT_CHARS)
+    sections: list[str] = []
+    notices: list[str] = []
+
+    for reference in references:
+        full_name = reference["full_name"]
+        number = reference["number"]
+        label = f"{full_name}#{number}" if number else full_name
+        try:
+            if reference["kind"] == "repo":
+                sections.append(_repo_context_section(client, full_name))
+            else:
+                sections.append(_thread_context_section(client, full_name, number))
+        except GitHubNotFoundError:
+            notices.append(f"{label} was not found or is not visible to your GitHub account.")
+        except GitHubError as exc:
+            notices.append(f"{label}: {github_error_message(exc)}")
+
+    context = "\n\n".join(section for section in sections if section)
+    if len(context) > budget:
+        context = context[:budget] + CONTEXT_TRUNCATED_MARKER
+
+    return {"context": context, "references": references, "notices": notices}

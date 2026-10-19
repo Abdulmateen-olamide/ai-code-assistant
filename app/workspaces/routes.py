@@ -9,9 +9,10 @@ Pages (HTML)
 
 API (JSON, all scoped to the current user)
     /workspaces/api/workspaces                       list / create
-    /workspaces/api/workspaces/<id>                  rename / delete
+    /workspaces/api/workspaces/<id>                  get / rename / delete
     /workspaces/api/workspaces/<id>/projects         list / import
     /workspaces/api/projects/<pid>                   delete
+    /workspaces/api/projects/<pid>/export            download zip snapshot (owner)
     /workspaces/api/projects/<pid>/tree              lazy directory listing
     /workspaces/api/projects/<pid>/file              single file contents
     /workspaces/api/projects/<pid>/search            project search
@@ -38,19 +39,30 @@ API (JSON, all scoped to the current user)
     /workspaces/<id>/audit                           audit page
 """
 
+import io
 import json
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 
-from flask import Response, jsonify, render_template, request, stream_with_context, url_for
+from flask import (
+    Response,
+    current_app,
+    jsonify,
+    render_template,
+    request,
+    stream_with_context,
+    url_for,
+)
 from flask_login import current_user, login_required
 
 from app.extensions import db
-from app.models import Project, ProjectMessage, User, Workspace, WorkspaceMember
+from app.models import Project, ProjectChatSession, ProjectMessage, User, Workspace, WorkspaceMember
 from app.models.activity_event import (
     EVENT_AI_ANALYSIS_RUN,
     EVENT_MEMBER_ADDED,
     EVENT_MEMBER_REMOVED,
+    EVENT_PROJECT_EXPORTED,
     EVENT_PROJECT_IMPORTED,
     EVENT_ROLE_CHANGED,
 )
@@ -58,34 +70,55 @@ from app.models.project import (
     SOURCE_ARCHIVE,
     SOURCE_GITHUB,
     SOURCE_SCAFFOLD,
+    STATUS_INDEXING,
     STATUS_READY,
 )
+from app.models.workspace import generate_slug
 from app.models.workspace_member import (
     MEMBER_ROLES,
     ROLE_OWNER,
     ROLE_VIEWER,
     STATUS_ACTIVE,
 )
-from app.services import project_analysis
+from app.services import project_analysis, usage_ledger
 from app.services.activity import record_activity
 from app.services.events import emit_event
+from app.services.exporting import export_filename, iter_export_zip
 from app.services.github import (
     GitHubError,
     GitHubInvalidError,
     get_github_client,
+    github_error_payload,
     validate_full_name,
 )
-from app.services.importing import ProjectImportError, extract_archive, import_github_repo
+from app.services.health import coverage_estimate, detect_ci_files
+from app.services.import_jobs import submit_import_job
+from app.services.importing import (
+    ProjectImportError,
+    archive_hash,
+    build_manifest_rows,
+    extract_archive,
+    find_duplicate_archive,
+    find_duplicate_github,
+    import_github_repo,
+    store_project_files,
+)
 from app.services.invitations import cancel_pending_for_user
 from app.services.llm import LLMProviderError, get_provider
 from app.services.notifications import notify
-from app.services.permissions import resolve_workspace
+from app.services.permissions import require_workspace_capability
 from app.services.ratelimit import per_user_limit
-from app.services.search import search_project
+from app.services.search import SearchQueryError, search_project
 from app.services.stellar_detection import project_stellar_metadata
 from app.workspaces import bp
 
 MAX_TREE_ENTRIES = 1000
+
+# Workspace dashboard (issue #85): search and pagination keep the list bounded.
+# These mirror the collaboration list convention (``page``/``per_page`` with a
+# hard cap) so the API is consistent across the app.
+WORKSPACES_PER_PAGE_DEFAULT = 20
+WORKSPACES_PER_PAGE_MAX = 100
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +132,18 @@ def _get_workspace(workspace_id: int) -> Workspace:
 
 def _get_project(project_id: int) -> Project:
     return Project.query.filter_by(id=project_id, user_id=current_user.id).first_or_404()
+
+
+def _get_chat_session(project: Project, session_id: int | None = None) -> ProjectChatSession:
+    query = ProjectChatSession.query.filter_by(project_id=project.id)
+    if session_id is not None:
+        return query.filter_by(id=session_id).first_or_404()
+    session = query.order_by(ProjectChatSession.updated_at.desc()).first()
+    if session is None:
+        session = ProjectChatSession(project=project, title="General")
+        db.session.add(session)
+        db.session.flush()
+    return session
 
 
 def _member_role(workspace_id: int) -> str | None:
@@ -129,6 +174,36 @@ def _validate_project_path(path: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Workspace dashboard: search + pagination helpers (issue #85)
+# --------------------------------------------------------------------------
+
+
+def _workspace_search() -> str:
+    """Return the trimmed search term filtering workspaces by name/description."""
+    return (request.args.get("q") or "").strip()[:200]
+
+
+def _workspace_per_page() -> int:
+    """Return the requested page size, clamped to the configured maximum."""
+    value = request.args.get("per_page", type=int) or WORKSPACES_PER_PAGE_DEFAULT
+    return max(1, min(value, WORKSPACES_PER_PAGE_MAX))
+
+
+def _workspace_page() -> int:
+    """Return the requested 1-based page number."""
+    return max(request.args.get("page", type=int) or 1, 1)
+
+
+def _workspace_query(search: str):
+    """Build the ordered, owner-scoped workspace query for ``search``."""
+    query = Workspace.query.filter_by(user_id=current_user.id)
+    if search:
+        like = f"%{search}%"
+        query = query.filter(db.or_(Workspace.name.ilike(like), Workspace.description.ilike(like)))
+    return query.order_by(Workspace.is_pinned.desc(), Workspace.updated_at.desc())
+
+
+# --------------------------------------------------------------------------
 # Pages
 # --------------------------------------------------------------------------
 
@@ -136,11 +211,23 @@ def _validate_project_path(path: str) -> str:
 @bp.route("/")
 @login_required
 def index():
-    """Workspace list page."""
-    workspaces = Workspace.query.filter_by(user_id=current_user.id).order_by(
-        Workspace.updated_at.desc()
+    """Workspace list page (searchable and paginated, issue #85)."""
+    search = _workspace_search()
+    page = _workspace_page()
+    per_page = _workspace_per_page()
+    query = _workspace_query(search)
+    total = query.count()
+    workspaces = query.offset((page - 1) * per_page).limit(per_page).all()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    return render_template(
+        "workspaces/index.html",
+        workspaces=workspaces,
+        search=search,
+        page=page,
+        per_page=per_page,
+        total=total,
+        total_pages=total_pages,
     )
-    return render_template("workspaces/index.html", workspaces=workspaces)
 
 
 @bp.route("/<int:workspace_id>")
@@ -170,10 +257,25 @@ def project_explorer(workspace_id: int, project_id: int):
 @bp.route("/api/workspaces", methods=["GET"])
 @login_required
 def api_list_workspaces():
-    workspaces = Workspace.query.filter_by(user_id=current_user.id).order_by(
-        Workspace.updated_at.desc()
+    """Return a page of the current user's workspaces (issue #85).
+
+    Supports ``q`` (name/description search), ``page`` and ``per_page``. The
+    response is the standard list envelope ``{items, total, page, per_page}``.
+    """
+    search = _workspace_search()
+    page = _workspace_page()
+    per_page = _workspace_per_page()
+    query = _workspace_query(search)
+    total = query.count()
+    workspaces = query.offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify(
+        {
+            "items": [w.to_dict() for w in workspaces],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
     )
-    return jsonify([w.to_dict() for w in workspaces])
 
 
 @bp.route("/api/workspaces", methods=["POST"])
@@ -183,14 +285,47 @@ def api_create_workspace():
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "A workspace name is required."}), 400
+    slug = generate_slug(name[:200])
+    if not slug:
+        return (
+            jsonify(
+                {"error": "The workspace name must contain at least one alphanumeric character."}
+            ),
+            400,
+        )
+    existing = Workspace.query.filter_by(user_id=current_user.id, slug=slug).first()
+    if existing is not None:
+        return (
+            jsonify(
+                {
+                    "error": f'A workspace with the slug "{slug}" already exists. '
+                    "Choose a different name.",
+                    "slug": slug,
+                    "existing_workspace_id": existing.id,
+                }
+            ),
+            400,
+        )
     workspace = Workspace(
         user_id=current_user.id,
         name=name[:200],
+        slug=slug,
         description=((data.get("description") or "").strip()[:2000] or None),
     )
     db.session.add(workspace)
     db.session.commit()
     return jsonify(workspace.to_dict()), 201
+
+
+@bp.route("/api/workspaces/<int:workspace_id>", methods=["GET"])
+@login_required
+def api_get_workspace(workspace_id: int):
+    """Return a single workspace.
+
+    Owner-scoped via ``_get_workspace``: anyone else receives a 404 so the route
+    is not an existence oracle for workspace ids.
+    """
+    return jsonify(_get_workspace(workspace_id).to_dict())
 
 
 @bp.route("/api/workspaces/<int:workspace_id>", methods=["PATCH"])
@@ -202,9 +337,38 @@ def api_update_workspace(workspace_id: int):
         name = (data.get("name") or "").strip()
         if not name:
             return jsonify({"error": "A workspace name is required."}), 400
+        new_slug = generate_slug(name[:200])
+        if not new_slug:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "The workspace name must contain at least one alphanumeric character."
+                        )
+                    }
+                ),
+                400,
+            )
+        if new_slug != workspace.slug:
+            existing = Workspace.query.filter_by(user_id=current_user.id, slug=new_slug).first()
+            if existing is not None:
+                return (
+                    jsonify(
+                        {
+                            "error": f'A workspace with the slug "{new_slug}" already exists. '
+                            "Choose a different name.",
+                            "slug": new_slug,
+                            "existing_workspace_id": existing.id,
+                        }
+                    ),
+                    400,
+                )
+            workspace.slug = new_slug
         workspace.name = name[:200]
     if "description" in data:
         workspace.description = (data.get("description") or "").strip()[:2000] or None
+    if "is_pinned" in data:
+        workspace.is_pinned = bool(data["is_pinned"])
     db.session.commit()
     return jsonify(workspace.to_dict())
 
@@ -219,18 +383,28 @@ def api_delete_workspace(workspace_id: int):
 
 
 # --------------------------------------------------------------------------
-# API: workspace members
-# Listing is member-scoped (any member can see the team); add/update/remove
-# remain owner-only. Removal is a soft-delete that preserves history (135).
+# API: workspace members (#126)
+#
+# Every route delegates authorization to the shared capability matrix in
+# ``app/services/permissions.py`` so member management stays strictly
+# owner-only and membership is never leaked to non-owners:
+#
+#   * list                 -> ``view_members``    (owner + active members)
+#   * add / update / remove -> ``manage_members`` (owner only)
+#
+# ``require_workspace_capability`` resolves the workspace first, so a
+# non-member gets a uniform 404 (no existence oracle) while a *known* member
+# without the capability gets 403 - matching the documented contract.
+# Removal is a soft-delete that preserves history (#135).
 # --------------------------------------------------------------------------
 
 
 @bp.route("/api/workspaces/<int:workspace_id>/members", methods=["GET"])
 @login_required
+@require_workspace_capability("view_members")
 def api_list_members(workspace_id: int):
-    workspace = resolve_workspace(workspace_id)
     members = (
-        WorkspaceMember.query.filter_by(workspace_id=workspace.id, status=STATUS_ACTIVE)
+        WorkspaceMember.query.filter_by(workspace_id=workspace_id, status=STATUS_ACTIVE)
         .order_by(WorkspaceMember.joined_at)
         .all()
     )
@@ -239,8 +413,8 @@ def api_list_members(workspace_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/members", methods=["POST"])
 @login_required
+@require_workspace_capability("manage_members")
 def api_add_member(workspace_id: int):
-    _get_workspace(workspace_id)
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     role = (data.get("role") or ROLE_VIEWER).strip().lower()
@@ -297,9 +471,14 @@ def api_add_member(workspace_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/members/<int:user_id>", methods=["PATCH"])
 @login_required
+@require_workspace_capability("manage_members")
 def api_update_member(workspace_id: int, user_id: int):
-    _get_workspace(workspace_id)
+    workspace = db.session.get(Workspace, workspace_id)
     membership = _get_membership(workspace_id, user_id)
+    if user_id == workspace.user_id or membership.role == ROLE_OWNER:
+        return jsonify({"error": "The workspace owner's role cannot be changed."}), 400
+    if membership.status != STATUS_ACTIVE:
+        return jsonify({"error": "That member is not active."}), 409
     data = request.get_json(silent=True) or {}
     role = (data.get("role") or "").strip().lower()
     if role not in MEMBER_ROLES:
@@ -331,9 +510,12 @@ def api_update_member(workspace_id: int, user_id: int):
 
 @bp.route("/api/workspaces/<int:workspace_id>/members/<int:user_id>", methods=["DELETE"])
 @login_required
+@require_workspace_capability("manage_members")
 def api_remove_member(workspace_id: int, user_id: int):
-    _get_workspace(workspace_id)
+    workspace = db.session.get(Workspace, workspace_id)
     membership = _get_membership(workspace_id, user_id)
+    if user_id == workspace.user_id or membership.role == ROLE_OWNER:
+        return jsonify({"error": "The workspace owner cannot be removed."}), 400
     if membership.status != STATUS_ACTIVE:
         return jsonify({"error": "That member is already removed."}), 409
     membership.mark_removed()
@@ -390,17 +572,23 @@ def api_import_project(workspace_id: int):
     if request.files.get("file"):
         return _import_archive(workspace)
     data = request.get_json(silent=True) or {}
-    if (data.get("source") or "").strip().lower() == SOURCE_SCAFFOLD:
+    source = (data.get("source") or "").strip().lower()
+    if source == "manifest":
+        return _import_manifest(workspace, data)
+    if source == SOURCE_SCAFFOLD:
         return _import_scaffold(workspace, data)
     return _import_github(workspace)
 
 
-def _finish_project_import(workspace: Workspace, project: Project, source: str):
-    """Record activity/events for a completed import and return its JSON body."""
+def _record_import_side_effects(workspace: Workspace, project: Project, source: str, user):
+    """Record activity/events for a completed import (no request context needed).
+
+    Shared by the synchronous path and the background worker.
+    """
     record_activity(
         workspace.id,
         EVENT_PROJECT_IMPORTED,
-        actor=current_user,
+        actor=user,
         target=project,
         metadata={"source": source, "file_count": project.file_count},
     )
@@ -409,7 +597,7 @@ def _finish_project_import(workspace: Workspace, project: Project, source: str):
         "project.created",
         data={"project_id": project.id, "name": project.name, "source": source},
         workspace_id=workspace.id,
-        user_id=current_user.id,
+        user_id=user.id,
     )
     stellar_meta = project_stellar_metadata(project)
     if stellar_meta.get("is_stellar"):
@@ -422,11 +610,49 @@ def _finish_project_import(workspace: Workspace, project: Project, source: str):
                 "network_hints": stellar_meta.get("network_hints") or [],
             },
             workspace_id=workspace.id,
-            user_id=current_user.id,
+            user_id=user.id,
         )
+    return stellar_meta
+
+
+def _finish_project_import(workspace: Workspace, project: Project, source: str):
+    """Record activity/events for a completed import and return its JSON body."""
+    project.progress = 100
+    stellar_meta = _record_import_side_effects(workspace, project, source, current_user)
     response = project.to_dict()
     response["stellar"] = stellar_meta
     return jsonify(response), 201
+
+
+def _archive_import_job(raw: bytes, filename: str, workspace_id: int):
+    """Build the background worker task for an uploaded archive."""
+
+    def job(project: Project, user, set_progress):
+        set_progress(10)
+        rows = extract_archive(io.BytesIO(raw), filename)
+        if not rows:
+            raise ProjectImportError("The archive contained no importable files.")
+        set_progress(60)
+        store_project_files(project, rows)
+        set_progress(95)
+        workspace = db.session.get(Workspace, workspace_id)
+        _record_import_side_effects(workspace, project, SOURCE_ARCHIVE, user)
+
+    return job
+
+
+def _github_import_job(full_name: str, workspace_id: int):
+    """Build the background worker task for a GitHub import."""
+
+    def job(project: Project, user, set_progress):
+        set_progress(10)
+        client = get_github_client(user)
+        import_github_repo(project, full_name, client)
+        set_progress(90)
+        workspace = db.session.get(Workspace, workspace_id)
+        _record_import_side_effects(workspace, project, SOURCE_GITHUB, user)
+
+    return job
 
 
 def _import_scaffold(workspace: Workspace, data: dict):
@@ -460,12 +686,49 @@ def _import_scaffold(workspace: Workspace, data: dict):
     return _finish_project_import(workspace, project, SOURCE_SCAFFOLD)
 
 
-def _import_archive(workspace: Workspace):
-    uploaded = request.files.get("file")
-    if uploaded is None or not uploaded.filename:
-        return jsonify({"error": "No file was uploaded."}), 400
+def _confirmed(data) -> bool:
+    """Return ``True`` when a request accepts an import despite a duplicate."""
+    value = data.get("confirm") if hasattr(data, "get") else None
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-    name = Path(uploaded.filename).stem.strip() or "Untitled project"
+
+def _duplicate_response(existing: Project, match: str):
+    """Return ``409`` describing an existing matching project (nothing stored)."""
+    return (
+        jsonify(
+            {
+                "error": "A matching project already exists in this workspace.",
+                "duplicate": True,
+                "match": match,
+                "duplicate_of": existing.to_dict(),
+            }
+        ),
+        409,
+    )
+
+
+def _import_manifest(workspace: Workspace, data: dict):
+    """Import files dragged from the OS (a single file or a folder manifest).
+
+    The browser walks the dropped entries and sends ``{"source": "manifest",
+    "name": ..., "files": [{"path", "content"}]}``. Every path is re-validated
+    server-side and the Phase 5 size/count caps still apply.
+    """
+    try:
+        rows = build_manifest_rows(data.get("files"))
+    except ProjectImportError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if not rows:
+        return jsonify({"error": "The drop contained no importable files."}), 400
+
+    name = (data.get("name") or "").strip()
+    if not name:
+        # Single-file import -> a minimal project named after the file.
+        name = Path(rows[0]["path"]).stem or "Imported file"
+
     project = Project(
         workspace_id=workspace.id,
         user_id=current_user.id,
@@ -474,9 +737,57 @@ def _import_archive(workspace: Workspace):
     )
     db.session.add(project)
     db.session.commit()
+    store_project_files(project, rows)
+    return _finish_project_import(workspace, project, SOURCE_ARCHIVE)
+
+
+def _import_archive(workspace: Workspace):
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return jsonify({"error": "No file was uploaded."}), 400
+
+    raw = uploaded.stream.read()
+    digest = archive_hash(raw)
+
+    if not _confirmed(request.form):
+        duplicate = find_duplicate_archive(workspace.id, digest)
+        if duplicate is not None:
+            return _duplicate_response(duplicate, "archive")
+
+    name = Path(uploaded.filename).stem.strip() or "Untitled project"
+
+    if current_app.config.get("IMPORT_JOBS_ASYNC", True):
+        # The upload was read into memory above (the stream is closed when the
+        # request ends), then indexed in the background worker.
+        project = Project(
+            workspace_id=workspace.id,
+            user_id=current_user.id,
+            name=name[:200],
+            source=SOURCE_ARCHIVE,
+            status=STATUS_INDEXING,
+            progress=0,
+        )
+        db.session.add(project)
+        db.session.commit()
+        submit_import_job(
+            current_app._get_current_object(),
+            project.id,
+            _archive_import_job(raw, uploaded.filename, workspace.id),
+        )
+        return jsonify(project.to_dict()), 201
+
+    project = Project(
+        workspace_id=workspace.id,
+        user_id=current_user.id,
+        name=name[:200],
+        source=SOURCE_ARCHIVE,
+        content_hash=digest,
+    )
+    db.session.add(project)
+    db.session.commit()
 
     try:
-        rows = extract_archive(uploaded.stream, uploaded.filename)
+        rows = extract_archive(io.BytesIO(raw), uploaded.filename)
     except ProjectImportError as exc:
         db.session.delete(project)
         db.session.commit()
@@ -486,8 +797,6 @@ def _import_archive(workspace: Workspace):
         db.session.delete(project)
         db.session.commit()
         return jsonify({"error": "The archive contained no importable files."}), 400
-
-    from app.services.importing import store_project_files
 
     store_project_files(project, rows)
     return _finish_project_import(workspace, project, SOURCE_ARCHIVE)
@@ -503,20 +812,56 @@ def _import_github(workspace: Workspace):
     except GitHubInvalidError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    try:
+        client = get_github_client()
+        repo_data = client.get_repository(full_name)
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 502
+
+    default_branch = repo_data.get("default_branch") or "HEAD"
+
+    if not _confirmed(data):
+        duplicate = find_duplicate_github(workspace.id, full_name, default_branch)
+        if duplicate is not None:
+            return _duplicate_response(duplicate, "github")
+
+    if current_app.config.get("IMPORT_JOBS_ASYNC", True):
+        project = Project(
+            workspace_id=workspace.id,
+            user_id=current_user.id,
+            name=full_name.split("/")[1][:200],
+            source=SOURCE_GITHUB,
+            source_url=full_name,
+            status=STATUS_INDEXING,
+            progress=0,
+        )
+        db.session.add(project)
+        db.session.commit()
+        submit_import_job(
+            current_app._get_current_object(),
+            project.id,
+            _github_import_job(full_name, workspace.id),
+        )
+        return jsonify(project.to_dict()), 201
+
     project = Project(
         workspace_id=workspace.id,
         user_id=current_user.id,
         name=full_name.split("/")[1][:200],
         source=SOURCE_GITHUB,
         source_url=full_name,
+        default_branch=default_branch,
     )
     db.session.add(project)
     db.session.commit()
 
     try:
-        client = get_github_client()
-        import_github_repo(project, full_name, client)
-    except (GitHubError, ProjectImportError) as exc:
+        import_github_repo(project, full_name, client, repo=repo_data)
+    except GitHubError as exc:
+        db.session.delete(project)
+        db.session.commit()
+        return jsonify(github_error_payload(exc)), 502
+    except ProjectImportError as exc:
         db.session.delete(project)
         db.session.commit()
         return jsonify({"error": str(exc)}), 502
@@ -538,6 +883,118 @@ def api_delete_project(project_id: int):
         user_id=current_user.id,
     )
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# API: project snapshot export (#107)
+# --------------------------------------------------------------------------
+
+
+@bp.route("/api/projects/<int:project_id>/export", methods=["GET"])
+@login_required
+@per_user_limit(
+    "export",
+    max_config="RATE_LIMIT_EXPORT_MAX",
+    window_config="RATE_LIMIT_EXPORT_WINDOW",
+)
+def api_export_project(project_id: int):
+    """Stream a zip snapshot of the project's stored files for download (#107).
+
+    Owner-only via ``_get_project``: anyone who does not own the project gets a
+    404 (no existence oracle). Projects still indexing are rejected with 409
+    because their file set is not final. The archive is built in memory from
+    ``ProjectFile`` rows and streamed to the client; nothing touches the
+    filesystem. Binary and oversized files (stored with ``content=None``) are
+    included as clearly marked ``.PLACEHOLDER.txt`` metadata stubs, and a JSON
+    manifest describes exactly what was and was not included.
+    """
+    project = _get_project(project_id)
+    if project.status == STATUS_INDEXING:
+        return jsonify({"error": "This project is still indexing. Try again later."}), 409
+
+    record_activity(
+        project.workspace_id,
+        EVENT_PROJECT_EXPORTED,
+        actor=current_user,
+        target=project,
+        metadata={
+            "project_id": project.id,
+            "project": project.name,
+            "file_count": project.file_count,
+        },
+    )
+    db.session.commit()
+
+    response = Response(stream_with_context(iter_export_zip(project)), mimetype="application/zip")
+    response.headers["Content-Disposition"] = f'attachment; filename="{export_filename(project)}"'
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@bp.route("/api/projects/<int:project_id>/refresh", methods=["POST"])
+@login_required
+def api_refresh_project(project_id: int):
+    """Re-import a ready project from its original source (#88).
+
+    GitHub projects are re-fetched and scaffold projects regenerated; either way
+    ``store_project_files`` swaps the stored file set atomically (delete +
+    insert + stats recompute in one transaction), so search and chat context
+    immediately reflect the refreshed snapshot.
+
+    Archive projects cannot be refreshed because the original upload is not
+    retained on the server; they are rejected with a clear message so the user
+    knows to re-import instead.
+    """
+    project = _get_project(project_id)
+    if project.status == STATUS_INDEXING:
+        return jsonify({"error": "This project is still indexing. Try again later."}), 409
+
+    if project.source == SOURCE_GITHUB:
+        if not project.source_url:
+            return jsonify({"error": "This project has no GitHub source to refresh from."}), 409
+        try:
+            client = get_github_client()
+            import_github_repo(project, project.source_url, client)
+        except GitHubError as exc:
+            return jsonify(github_error_payload(exc)), 502
+        except ProjectImportError as exc:
+            return jsonify({"error": str(exc)}), 502
+    elif project.source == SOURCE_SCAFFOLD:
+        from app.services.soroban_scaffold import (
+            ScaffoldError,
+            normalize_crate_name,
+            soroban_scaffold_rows,
+        )
+
+        try:
+            crate_name = normalize_crate_name(project.name)
+        except ScaffoldError as exc:
+            return jsonify({"error": str(exc)}), 400
+        store_project_files(project, soroban_scaffold_rows(crate_name))
+    elif project.source == SOURCE_ARCHIVE:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Archive projects cannot be refreshed automatically because the "
+                        "original upload is not kept. Re-import the archive to update it."
+                    )
+                }
+            ),
+            409,
+        )
+    else:
+        return jsonify({"error": "This project's source does not support refresh."}), 400
+
+    db.session.refresh(project)
+    emit_event(
+        "project.refreshed",
+        data={"project_id": project.id, "file_count": project.file_count},
+        workspace_id=project.workspace_id,
+        user_id=current_user.id,
+    )
+    return jsonify(project.to_dict())
 
 
 # --------------------------------------------------------------------------
@@ -622,8 +1079,24 @@ def api_project_search(project_id: int):
     if not query:
         return jsonify({"error": "A search query is required."}), 400
     case_sensitive = request.args.get("case", "0") == "1"
+    regex = request.args.get("regex", "0") == "1"
+    scope = request.args.get("scope", "all").strip().lower()
+    if scope not in ("all", "path", "content"):
+        return jsonify({"error": "Invalid scope."}), 400
+    language = request.args.get("language", "").strip() or None
     limit = request.args.get("limit", type=int)
-    result = search_project(project.id, query, case_sensitive=case_sensitive, limit=limit)
+    try:
+        result = search_project(
+            project.id,
+            query,
+            case_sensitive=case_sensitive,
+            limit=limit,
+            language=language,
+            scope=scope,
+            regex=regex,
+        )
+    except SearchQueryError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify(result)
 
 
@@ -643,6 +1116,9 @@ def api_project_stats(project_id: int):
     test_files = [f for f in files if _is_test_path(f.path)]
     doc_files = [f for f in files if f.path.rsplit(".", 1)[-1].lower() in ("md", "rst", "txt")]
     inventory = project_analysis.dependency_inventory(project)
+    paths = [f.path for f in files]
+    ci_files = detect_ci_files(paths)
+    coverage = coverage_estimate(paths)
 
     duration = None
     if project.indexed_at and project.created_at:
@@ -660,6 +1136,8 @@ def api_project_stats(project_id: int):
             "dependency_count": len(inventory),
             "manifest_files": sorted({item["file"] for item in inventory}),
             "index_duration_seconds": duration,
+            "ci_files": ci_files,
+            "coverage_estimate": coverage,
         }
     )
 
@@ -718,10 +1196,53 @@ def _is_test_path(path: str) -> bool:
 @login_required
 def api_project_messages(project_id: int):
     project = _get_project(project_id)
-    messages = ProjectMessage.query.filter_by(project_id=project.id).order_by(
+    session_id = request.args.get("session_id", type=int)
+    session = _get_chat_session(project, session_id)
+    db.session.commit()
+    messages = ProjectMessage.query.filter_by(session_id=session.id).order_by(
         ProjectMessage.created_at
     )
     return jsonify([m.to_dict() for m in messages])
+
+
+@bp.route("/api/projects/<int:project_id>/sessions", methods=["GET", "POST"])
+@login_required
+def api_project_chat_sessions(project_id: int):
+    project = _get_project(project_id)
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        title = (data.get("title") or "").strip()
+        if not title:
+            return jsonify({"error": "A session title is required."}), 400
+        if len(title) > 200:
+            return jsonify({"error": "Session titles must be 200 characters or fewer."}), 400
+        session = ProjectChatSession(project=project, title=title)
+        db.session.add(session)
+        db.session.commit()
+        return jsonify(session.to_dict()), 201
+
+    _get_chat_session(project)
+    db.session.commit()
+    sessions = ProjectChatSession.query.filter_by(project_id=project.id).order_by(
+        ProjectChatSession.updated_at.desc()
+    )
+    return jsonify([session.to_dict() for session in sessions])
+
+
+@bp.route("/api/projects/<int:project_id>/sessions/<int:session_id>", methods=["PATCH"])
+@login_required
+def api_project_chat_session(project_id: int, session_id: int):
+    project = _get_project(project_id)
+    session = _get_chat_session(project, session_id)
+    title = ((request.get_json(silent=True) or {}).get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "A session title is required."}), 400
+    if len(title) > 200:
+        return jsonify({"error": "Session titles must be 200 characters or fewer."}), 400
+    session.title = title
+    session.updated_at = datetime.now(UTC)
+    db.session.commit()
+    return jsonify(session.to_dict())
 
 
 @bp.route("/api/projects/<int:project_id>/chat", methods=["POST"])
@@ -738,13 +1259,45 @@ def api_project_chat(project_id: int):
         return jsonify({"error": "This project has not finished indexing."}), 409
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
+    attachments = data.get("attachments") or []
+    if not isinstance(attachments, list) or not all(isinstance(path, str) for path in attachments):
+        return jsonify({"error": "Attachments must be a list of file paths."}), 400
     if not content:
         return jsonify({"error": "A message is required."}), 400
 
-    db.session.add(ProjectMessage(project_id=project.id, role="user", content=content))
-    result = project_analysis.chat_with_project(project, content)
-    message = ProjectMessage(project_id=project.id, role="assistant", content=result["analysis"])
+    # ``no_cache`` lets a client force a fresh provider call (issue #18).
+    no_cache = bool(data.get("no_cache"))
+    session = _get_chat_session(project, data.get("session_id"))
+    history = (
+        ProjectMessage.query.filter_by(session_id=session.id)
+        .order_by(ProjectMessage.created_at)
+        .all()
+    )
+    db.session.add(
+        ProjectMessage(project_id=project.id, session=session, role="user", content=content)
+    )
+    result = project_analysis.chat_with_project(
+        project, content, attachments, history=history, user=current_user, no_cache=no_cache
+    )
+    message = ProjectMessage(
+        project_id=project.id, session=session, role="assistant", content=result["analysis"]
+    )
+    session.updated_at = datetime.now(UTC)
     db.session.add(message)
+    usage = result.get("usage") or {}
+    usage_ledger.record_usage(
+        source=usage_ledger.SOURCE_PROJECT_CHAT,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens"),
+        tokens_estimated=usage.get("tokens_estimated", True),
+        provider=usage.get("provider"),
+        model=usage.get("model"),
+        user=current_user,
+        project=project,
+        workspace_id=project.workspace_id,
+        commit=False,
+    )
     db.session.commit()
     return (
         jsonify(
@@ -771,13 +1324,25 @@ def api_project_chat_stream(project_id: int):
         return jsonify({"error": "This project has not finished indexing."}), 409
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
+    attachments = data.get("attachments") or []
+    if not isinstance(attachments, list) or not all(isinstance(path, str) for path in attachments):
+        return jsonify({"error": "Attachments must be a list of file paths."}), 400
     if not content:
         return jsonify({"error": "A message is required."}), 400
 
-    history = list(project.messages)
-    db.session.add(ProjectMessage(project_id=project.id, role="user", content=content))
+    session = _get_chat_session(project, data.get("session_id"))
+    history = (
+        ProjectMessage.query.filter_by(session_id=session.id)
+        .order_by(ProjectMessage.created_at)
+        .all()
+    )
+    db.session.add(
+        ProjectMessage(project_id=project.id, session=session, role="user", content=content)
+    )
+    session.updated_at = datetime.now(UTC)
     db.session.commit()
-    messages = project_analysis.build_messages(project, content, history)
+    messages = project_analysis.build_messages(project, content, history, attachments=attachments)
+    provider_name, provider_model = usage_ledger.current_provider_metadata(user=current_user)
 
     def generate():
         try:
@@ -789,13 +1354,32 @@ def api_project_chat_stream(project_id: int):
             return
 
         try:
-            reply = project_analysis.chat_with_project(project, content)["analysis"]
+            result = project_analysis.chat_with_project(
+                project, content, attachments, history=history
+            )
         except LLMProviderError as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             return
 
-        message = ProjectMessage(project_id=project.id, role="assistant", content=reply)
+        reply = result["analysis"]
+        usage = result.get("usage") or {}
+        message = ProjectMessage(
+            project_id=project.id, session=session, role="assistant", content=reply
+        )
         db.session.add(message)
+        usage_ledger.record_usage(
+            source=usage_ledger.SOURCE_PROJECT_CHAT,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens"),
+            tokens_estimated=usage.get("tokens_estimated", True),
+            provider=usage.get("provider") or provider_name,
+            model=usage.get("model") or provider_model,
+            user=current_user,
+            project=project,
+            workspace_id=project.workspace_id,
+            commit=False,
+        )
         db.session.commit()
         yield f"data: {json.dumps({'type': 'done', 'message': message.to_dict()})}\n\n"
 
@@ -805,6 +1389,43 @@ def api_project_chat_stream(project_id: int):
 # --------------------------------------------------------------------------
 # API: project analysis
 # --------------------------------------------------------------------------
+
+
+@bp.route("/api/projects/<int:project_id>/estimate", methods=["POST"])
+@login_required
+def api_project_estimate(project_id: int):
+    """Pre-flight token/cost estimate for chat or an analysis (issue #104).
+
+    Computed from the same bounded context the real request sends (via
+    ``build_messages`` / ``build_context`` / ``_bounded_blocks``); no provider
+    is contacted, so estimating consumes no tokens.
+    """
+    project = _get_project(project_id)
+    if project.status != STATUS_READY:
+        return jsonify({"error": "This project has not finished indexing."}), 409
+
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "chat").strip().lower()
+
+    if mode == "analysis":
+        kind = (data.get("kind") or "architecture").strip().lower()
+        if kind not in project_analysis.ANALYSIS_KINDS:
+            return jsonify({"error": "Unsupported analysis kind."}), 400
+        estimate = project_analysis.estimate_analysis(project, kind)
+    elif mode == "chat":
+        content = (data.get("content") or "").strip()
+        attachments = data.get("attachments") or []
+        if not isinstance(attachments, list) or not all(
+            isinstance(path, str) for path in attachments
+        ):
+            return jsonify({"error": "Attachments must be a list of file paths."}), 400
+        if not content:
+            return jsonify({"error": "A message is required."}), 400
+        estimate = project_analysis.estimate_chat(project, content, attachments=attachments)
+    else:
+        return jsonify({"error": "mode must be 'chat' or 'analysis'."}), 400
+
+    return jsonify(estimate)
 
 
 @bp.route("/api/projects/<int:project_id>/analyze", methods=["POST"])
@@ -824,6 +1445,21 @@ def api_project_analyze(project_id: int):
     if kind not in project_analysis.ANALYSIS_KINDS:
         return jsonify({"error": "Unsupported analysis kind."}), 400
     result = project_analysis.analyze_project(project, kind)
+    usage = result.get("usage") or {}
+    provider_name, provider_model = usage_ledger.current_provider_metadata(user=current_user)
+    usage_ledger.record_usage(
+        source=usage_ledger.SOURCE_ANALYSIS,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens"),
+        tokens_estimated=usage.get("tokens_estimated", True),
+        provider=usage.get("provider") or provider_name,
+        model=usage.get("model") or provider_model,
+        user=current_user,
+        project=project,
+        workspace_id=project.workspace_id,
+        commit=False,
+    )
     record_activity(
         project.workspace_id,
         EVENT_AI_ANALYSIS_RUN,

@@ -5,33 +5,109 @@
   "use strict";
 
   var GH = window.GitHub;
-  var FULL_NAME = document.querySelector(".repo-header h1").textContent.trim().split("/").slice(1).join("/").trim();
-  var parts = FULL_NAME.split(" / ");
-  var OWNER = parts[0];
-  var REPO = parts[1];
+  var FULL_NAME = "";
+  var OWNER = "";
+  var REPO = "";
+
+  // Resolve owner/name from the URL path (/github/repos/<owner>/<name>/...)
+  // so arbitrary public repositories can be browsed, not just the user's own.
+  function resolveRepoFromLocation() {
+    var match = window.location.pathname.match(/\/github\/repos\/([^\/]+)\/([^\/]+)/);
+    if (match) {
+      OWNER = decodeURIComponent(match[1]);
+      REPO = decodeURIComponent(match[2]);
+    } else {
+      var header = document.querySelector(".repo-header h1");
+      if (header) {
+        var text = header.textContent.trim();
+        var slash = text.indexOf("/");
+        if (slash !== -1) {
+          OWNER = text.slice(0, slash).trim();
+          REPO = text.slice(slash + 1).trim();
+        }
+      }
+    }
+    FULL_NAME = OWNER + "/" + REPO;
+  }
+
+  resolveRepoFromLocation();
 
   var state = {
     ref: "HEAD",
     filePath: "",
+    issuePage: 1,
+    pullPage: 1,
+    commitPage: 1,
+    commitPath: "",
   };
 
   // -- Repo metadata -------------------------------------------------------
+
+  // Only allow http(s) links, which keeps a hostile homepage value from
+  // injecting a javascript: URL into an anchor.
+  function safeHttpUrl(url) {
+    if (typeof url !== "string") return "";
+    var trimmed = url.trim();
+    return /^https?:\/\//i.test(trimmed) ? trimmed : "";
+  }
 
   function loadMeta() {
     GH.api("/github/api/repos/" + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO))
       .then(function (repo) {
         var meta = document.getElementById("repo-meta");
-        var description = repo.description ? GH.escapeHtml(repo.description) + " " : "";
-        var visibility = repo.private ? "Private" : "Public";
-        meta.innerHTML = description +
-          '<span class="tag ' + (repo.private ? "tag-private" : "tag-public") + '">' + visibility + "</span> " +
-          (repo.language ? '<span class="repo-language">' + GH.escapeHtml(repo.language) + "</span> " : "") +
-          '<span class="repo-updated">Updated ' + GH.relativeDate(repo.updated_at) + "</span>";
+        var parts = [];
+        if (repo.description) parts.push(GH.escapeHtml(repo.description));
+        parts.push(
+          '<span class="tag ' + (repo.private ? "tag-private" : "tag-public") + '">' +
+            (repo.private ? "Private" : "Public") + "</span>"
+        );
+        if (repo.language) {
+          parts.push('<span class="repo-language">' + GH.escapeHtml(repo.language) + "</span>");
+        }
+        if (repo.stars) {
+          parts.push('<span class="repo-stat" title="Stars">' + repo.stars + " stars</span>");
+        }
+        if (repo.forks) {
+          parts.push('<span class="repo-stat" title="Forks">' + repo.forks + " forks</span>");
+        }
+        if (repo.open_issues_count) {
+          parts.push(
+            '<span class="repo-stat" title="Open issues">' +
+              repo.open_issues_count + " open issues</span>"
+          );
+        }
+        if (repo.license) {
+          parts.push('<span class="repo-stat" title="License">' + GH.escapeHtml(repo.license) + "</span>");
+        }
+        var homepage = safeHttpUrl(repo.homepage);
+        if (homepage) {
+          parts.push(
+            '<a class="repo-homepage" href="' + GH.escapeHtml(homepage) +
+              '" target="_blank" rel="noopener">' + GH.escapeHtml(homepage) + "</a>"
+          );
+        }
+        if (repo.topics && repo.topics.length) {
+          parts.push(
+            '<span class="repo-topics">' +
+              repo.topics.map(function (topic) {
+                return '<span class="tag">' + GH.escapeHtml(topic) + "</span>";
+              }).join(" ") +
+              "</span>"
+          );
+        }
+        parts.push('<span class="repo-updated">Updated ' + GH.relativeDate(repo.updated_at) + "</span>");
+        meta.innerHTML = parts.join(" ");
         if (repo.readme) {
           meta.innerHTML += '<details class="readme"><summary>README</summary><div class="readme-body">' + GH.renderMarkdownish(repo.readme.slice(0, 3000)) + "</div></details>";
         }
       })
       .catch(function (error) {
+        // GitHub returns 404 for private repos the user cannot access; surface
+        // a clear permission error rather than a generic failure.
+        if (error && (error.status === 404 || error.status === 403)) {
+          GH.flashError("Repository not found or you do not have permission to view it.");
+          return;
+        }
         GH.flashError(error.message);
       });
   }
@@ -54,7 +130,11 @@
         select.value = state.ref;
         if (document.getElementById("tab-tree").hidden === false) loadTree();
       })
-      .catch(function () { /* non-fatal */ });
+      .catch(function (error) {
+        if (error && (error.status === 404 || error.status === 403)) {
+          GH.flashError("Repository not found or you do not have permission to view it.");
+        }
+      });
   }
 
   // -- Files ---------------------------------------------------------------
@@ -98,13 +178,47 @@
       container.innerHTML = html;
     }).catch(function (error) {
       container.innerHTML = '<p class="sidebar-empty">Could not load files.</p>';
+      if (error && (error.status === 404 || error.status === 403)) {
+        GH.flashError("Repository not found or you do not have permission to view it.");
+        return;
+      }
       GH.flashError(error.message);
     });
   }
 
+  // Render a byte count in the largest sensible unit (B/KB/MB/GB).
+  function humanFileSize(bytes) {
+    var value = Number(bytes);
+    if (bytes === null || bytes === undefined || !isFinite(value) || value < 0) return "";
+    var units = ["B", "KB", "MB", "GB"];
+    var index = 0;
+    while (value >= 1024 && index < units.length - 1) {
+      value /= 1024;
+      index += 1;
+    }
+    var rounded = value >= 10 || index === 0 ? Math.round(value) : Math.round(value * 10) / 10;
+    return rounded + " " + units[index];
+  }
+
   function renderFileRow(file) {
+    var size = humanFileSize(file.size);
+    var commit = file.last_commit;
+    var commitHtml = "";
+    if (commit) {
+      var sha = (commit.sha || "").slice(0, 7);
+      var message = commit.message || "";
+      var author = commit.author ? commit.author + ": " : "";
+      commitHtml =
+        '<span class="file-commit" title="' + GH.escapeHtml(message) + '">' +
+        (sha ? '<code class="file-commit-sha">' + GH.escapeHtml(sha) + "</code> " : "") +
+        GH.escapeHtml(author + message) +
+        "</span>";
+    }
     return '<div class="file-row" data-path="' + GH.escapeHtml(file.path) + '">' +
-      "<span>" + GH.escapeHtml(file.path) + "</span>" +
+      '<span class="file-path" title="' + GH.escapeHtml(file.path) + '">' +
+      GH.escapeHtml(file.path) + "</span>" +
+      (size ? '<span class="file-size">' + GH.escapeHtml(size) + "</span>" : "") +
+      commitHtml +
       '<button class="btn btn-ghost btn-sm" data-action="open">Open</button>' +
       "</div>";
   }
@@ -125,34 +239,89 @@
         body.textContent = data.text;
       })
       .catch(function (error) {
+        if (error && (error.status === 404 || error.status === 403)) {
+          body.textContent = "You do not have permission to view this file.";
+          return;
+        }
         body.textContent = "Could not load file: " + error.message;
       });
   }
 
   // -- Commits -------------------------------------------------------------
 
-  function loadCommits() {
+  function renderCommitFilter(container) {
+    if (!state.commitPath) return;
+    var bar = document.createElement("div");
+    bar.className = "commit-filter";
+    bar.innerHTML =
+      '<span>History for <code>' + GH.escapeHtml(state.commitPath) + "</code></span>";
+    var clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "btn btn-ghost btn-sm";
+    clear.textContent = "Clear filter";
+    clear.addEventListener("click", function () {
+      state.commitPath = "";
+      loadCommits(true);
+    });
+    bar.appendChild(clear);
+    container.appendChild(bar);
+  }
+
+  function renderCommitRow(commit) {
+    var row = document.createElement("a");
+    row.className = "commit-row";
+    row.href = "/github/repos/" + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) +
+      "/commits/" + encodeURIComponent(commit.sha);
+    row.innerHTML =
+      '<span class="commit-sha">' + GH.escapeHtml(commit.short_sha) + "</span>" +
+      '<span class="commit-message">' + GH.escapeHtml(commit.message) + "</span>" +
+      '<span class="commit-meta">' + GH.escapeHtml(commit.author || "") + " &middot; " + GH.relativeDate(commit.date) + "</span>";
+    return row;
+  }
+
+  // `reset` starts a new list (page 1); otherwise the next page is appended.
+  function loadCommits(reset) {
     var container = document.getElementById("commit-list");
-    container.innerHTML = '<p class="sidebar-empty">Loading commits...</p>';
-    var url = "/github/api/repos/" + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) +
-      "/commits?ref=" + encodeURIComponent(state.ref);
-    GH.api(url).then(function (commits) {
+    if (reset) {
+      state.commitPage = 1;
       container.innerHTML = "";
-      if (!commits.length) {
-        container.innerHTML = '<p class="sidebar-empty">No commits found.</p>';
+      renderCommitFilter(container);
+    }
+    var loading = document.createElement("p");
+    loading.className = "sidebar-empty";
+    loading.textContent = "Loading commits...";
+    container.appendChild(loading);
+
+    var url = "/github/api/repos/" + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) +
+      "/commits?ref=" + encodeURIComponent(state.ref) + "&page=" + state.commitPage;
+    if (state.commitPath) url += "&path=" + encodeURIComponent(state.commitPath);
+
+    GH.api(url).then(function (result) {
+      loading.remove();
+      var commits = result.items || [];
+      if (state.commitPage === 1 && !commits.length) {
+        container.innerHTML = "";
+        renderCommitFilter(container);
+        var empty = document.createElement("p");
+        empty.className = "sidebar-empty";
+        empty.textContent = "No commits found.";
+        container.appendChild(empty);
         return;
       }
       commits.forEach(function (commit) {
-        var row = document.createElement("div");
-        row.className = "commit-row";
-        row.innerHTML =
-          '<span class="commit-sha">' + GH.escapeHtml(commit.short_sha) + "</span>" +
-          '<span class="commit-message">' + GH.escapeHtml(commit.message) + "</span>" +
-          '<span class="commit-meta">' + GH.escapeHtml(commit.author || "") + " &middot; " + GH.relativeDate(commit.date) + "</span>";
-        container.appendChild(row);
+        container.appendChild(renderCommitRow(commit));
+      });
+      // The button disappears once GitHub reports no further pages.
+      GH.renderLoadMore(container, result, function () {
+        state.commitPage = (result.page || state.commitPage) + 1;
+        loadCommits(false);
       });
     }).catch(function (error) {
-      container.innerHTML = '<p class="sidebar-empty">Could not load commits.</p>';
+      loading.remove();
+      if (error && (error.status === 404 || error.status === 403)) {
+        GH.flashError("Repository not found or you do not have permission to view it.");
+        return;
+      }
       GH.flashError(error.message);
     });
   }
@@ -161,30 +330,41 @@
 
   function loadIssues() {
     var container = document.getElementById("issue-list");
+    var pager = document.getElementById("issue-pager");
     var stateFilter = document.getElementById("issue-state").value;
     container.innerHTML = '<p class="sidebar-empty">Loading issues...</p>';
+    if (pager) pager.innerHTML = "";
     var url = "/github/api/repos/" + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) +
-      "/issues?state=" + stateFilter;
-    GH.api(url).then(function (issues) {
+      "/issues?state=" + stateFilter + "&page=" + state.issuePage;
+    GH.api(url).then(function (result) {
+      var issues = result.items || [];
       container.innerHTML = "";
-      if (!issues.length) {
+      if (issues.length) {
+        issues.forEach(function (issue) {
+          var labels = (issue.labels || []).map(function (label) {
+            return '<span class="tag">' + GH.escapeHtml(label) + "</span>";
+          }).join(" ");
+          var row = document.createElement("div");
+          row.className = "issue-row";
+          row.innerHTML =
+            '<a class="issue-number" href="/github/repos/' + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) + "/issues/" + issue.number + '">#' + issue.number + "</a>" +
+            '<span class="issue-title">' + GH.escapeHtml(issue.title) + "</span> " + labels +
+            '<span class="issue-meta">' + GH.escapeHtml(issue.author || "") + " &middot; " + GH.relativeDate(issue.created_at) + "</span>";
+          container.appendChild(row);
+        });
+      } else {
         container.innerHTML = '<p class="sidebar-empty">No issues found.</p>';
-        return;
       }
-      issues.forEach(function (issue) {
-        var labels = (issue.labels || []).map(function (label) {
-          return '<span class="tag">' + GH.escapeHtml(label) + "</span>";
-        }).join(" ");
-        var row = document.createElement("div");
-        row.className = "issue-row";
-        row.innerHTML =
-          '<a class="issue-number" href="/github/repos/' + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) + "/issues/" + issue.number + '">#' + issue.number + "</a>" +
-          '<span class="issue-title">' + GH.escapeHtml(issue.title) + "</span> " + labels +
-          '<span class="issue-meta">' + GH.escapeHtml(issue.author || "") + " &middot; " + GH.relativeDate(issue.created_at) + "</span>";
-        container.appendChild(row);
+      GH.renderPager(pager, result, function (nextPage) {
+        state.issuePage = nextPage;
+        loadIssues();
       });
     }).catch(function (error) {
       container.innerHTML = '<p class="sidebar-empty">Could not load issues.</p>';
+      if (error && (error.status === 404 || error.status === 403)) {
+        GH.flashError("Repository not found or you do not have permission to view it.");
+        return;
+      }
       GH.flashError(error.message);
     });
   }
@@ -193,27 +373,38 @@
 
   function loadPulls() {
     var container = document.getElementById("pull-list");
+    var pager = document.getElementById("pull-pager");
     var stateFilter = document.getElementById("pull-state").value;
     container.innerHTML = '<p class="sidebar-empty">Loading pull requests...</p>';
+    if (pager) pager.innerHTML = "";
     var url = "/github/api/repos/" + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) +
-      "/pulls?state=" + stateFilter;
-    GH.api(url).then(function (pulls) {
+      "/pulls?state=" + stateFilter + "&page=" + state.pullPage;
+    GH.api(url).then(function (result) {
+      var pulls = result.items || [];
       container.innerHTML = "";
-      if (!pulls.length) {
+      if (pulls.length) {
+        pulls.forEach(function (pr) {
+          var row = document.createElement("div");
+          row.className = "issue-row";
+          row.innerHTML =
+            '<a class="issue-number" href="/github/repos/' + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) + "/pulls/" + pr.number + '">#' + pr.number + "</a>" +
+            '<span class="issue-title">' + GH.escapeHtml(pr.title) + "</span>" +
+            '<span class="issue-meta">' + GH.escapeHtml(pr.author || "") + " &middot; " + GH.relativeDate(pr.updated_at) + " &middot; " + (pr.additions || 0) + "++ / " + (pr.deletions || 0) + "--</span>";
+          container.appendChild(row);
+        });
+      } else {
         container.innerHTML = '<p class="sidebar-empty">No pull requests found.</p>';
-        return;
       }
-      pulls.forEach(function (pr) {
-        var row = document.createElement("div");
-        row.className = "issue-row";
-        row.innerHTML =
-          '<a class="issue-number" href="/github/repos/' + encodeURIComponent(OWNER) + "/" + encodeURIComponent(REPO) + "/pulls/" + pr.number + '">#' + pr.number + "</a>" +
-          '<span class="issue-title">' + GH.escapeHtml(pr.title) + "</span>" +
-          '<span class="issue-meta">' + GH.escapeHtml(pr.author || "") + " &middot; " + GH.relativeDate(pr.updated_at) + " &middot; " + (pr.additions || 0) + "++ / " + (pr.deletions || 0) + "--</span>";
-        container.appendChild(row);
+      GH.renderPager(pager, result, function (nextPage) {
+        state.pullPage = nextPage;
+        loadPulls();
       });
     }).catch(function (error) {
       container.innerHTML = '<p class="sidebar-empty">Could not load pull requests.</p>';
+      if (error && (error.status === 404 || error.status === 403)) {
+        GH.flashError("Repository not found or you do not have permission to view it.");
+        return;
+      }
       GH.flashError(error.message);
     });
   }
@@ -230,8 +421,32 @@
       })
       .catch(function (error) {
         container.innerHTML = "";
+        if (error && (error.status === 404 || error.status === 403)) {
+          GH.flashError("Repository not found or you do not have permission to view it.");
+          return;
+        }
         GH.flashError(error.message);
       });
+  }
+
+  function analyzeRepoStructure() {
+    var container = document.getElementById("repo-analysis");
+    container.hidden = false;
+    container.innerHTML = '<p class="sidebar-empty">Analyzing structure and dependencies...</p>';
+    GH.api("/tools/repo-analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner: OWNER, repo: REPO, ref: state.ref }),
+    }).then(function (data) {
+      GH.renderAnalysis(container, data.analysis);
+    }).catch(function (error) {
+      container.innerHTML = "";
+      if (error && (error.status === 404 || error.status === 403)) {
+        GH.flashError("Repository not found or you do not have permission to view it.");
+        return;
+      }
+      GH.flashError(error.message);
+    });
   }
 
   function analyzeFile() {
@@ -247,6 +462,10 @@
       GH.renderAnalysis(container, data.analysis);
     }).catch(function (error) {
       container.innerHTML = "";
+      if (error && (error.status === 404 || error.status === 403)) {
+        GH.flashError("You do not have permission to view this file.");
+        return;
+      }
       GH.flashError(error.message);
     });
   }
@@ -254,6 +473,23 @@
   // -- Wiring --------------------------------------------------------------
 
   document.addEventListener("DOMContentLoaded", function () {
+    // Repository lookup form: accept owner/name and navigate to that repo.
+    var lookupForm = document.getElementById("repo-lookup-form");
+    if (lookupForm) {
+      lookupForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var input = document.getElementById("repo-lookup-input");
+        var value = (input && input.value || "").trim();
+        var match = value.match(/^([^\/\s]+)\s*\/\s*([^\/\s]+)$/);
+        if (!match) {
+          GH.flashError("Enter a repository as owner/name.");
+          return;
+        }
+        window.location.href = "/github/repos/" +
+          encodeURIComponent(match[1]) + "/" + encodeURIComponent(match[2]);
+      });
+    }
+
     loadMeta();
     loadBranches();
 
@@ -264,17 +500,26 @@
         document.querySelectorAll(".repo-tab-panel").forEach(function (p) { p.hidden = true; });
         document.getElementById("tab-" + tab.dataset.tab).hidden = false;
         if (tab.dataset.tab === "files") loadTree();
-        if (tab.dataset.tab === "commits") loadCommits();
+        if (tab.dataset.tab === "commits") loadCommits(true);
         if (tab.dataset.tab === "issues") loadIssues();
         if (tab.dataset.tab === "pulls") loadPulls();
       });
     });
+
+    // Open the tab named in ?tab=... (used by the commit detail "Back to
+    // commit list" link), defaulting to the Files tab.
+    var requestedTab = new URLSearchParams(window.location.search).get("tab");
+    if (requestedTab) {
+      var requestedButton = document.querySelector('.repo-tab[data-tab="' + requestedTab + '"]');
+      if (requestedButton) requestedButton.click();
+    }
 
     var branchSelect = document.getElementById("branch-select");
     if (branchSelect) {
       branchSelect.addEventListener("change", function () {
         state.ref = branchSelect.value;
         if (!document.getElementById("tab-tree").hidden) loadTree();
+        if (!document.getElementById("tab-commits").hidden) loadCommits(true);
       });
     }
 
@@ -296,9 +541,26 @@
     document.getElementById("file-question").addEventListener("keydown", function (event) {
       if (event.key === "Enter") analyzeFile();
     });
+    var historyBtn = document.getElementById("file-history");
+    if (historyBtn) {
+      historyBtn.addEventListener("click", function () {
+        // Filter the commits tab to this file's history (pagination follows).
+        state.commitPath = state.filePath || "";
+        document.getElementById("file-modal").hidden = true;
+        var commitsTab = document.querySelector('.repo-tab[data-tab="commits"]');
+        if (commitsTab) commitsTab.click();
+      });
+    }
     document.getElementById("analyze-repo").addEventListener("click", analyzeRepo);
+    document.getElementById("analyze-repo-structure").addEventListener("click", analyzeRepoStructure);
 
-    document.getElementById("issue-state").addEventListener("change", loadIssues);
-    document.getElementById("pull-state").addEventListener("change", loadPulls);
+    document.getElementById("issue-state").addEventListener("change", function () {
+      state.issuePage = 1;
+      loadIssues();
+    });
+    document.getElementById("pull-state").addEventListener("change", function () {
+      state.pullPage = 1;
+      loadPulls();
+    });
   });
 })();

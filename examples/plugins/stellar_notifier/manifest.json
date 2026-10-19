@@ -1,0 +1,14 @@
+{
+  "id": "stellar-notifier",
+  "name": "Stellar Notifier",
+  "version": "0.1.0",
+  "description": "Example read-only plugin that formats a bounded summary for stellar.analysis.completed events.",
+  "author": "AI Code Assistant contributors",
+  "entry_point": "stellar_notifier.plugin:StellarNotifierPlugin",
+  "compatibility": ">=0.1.0",
+  "capabilities": ["STELLAR_READ"],
+  "permissions": ["read:stellar:analysis"],
+  "configuration": {
+    "include_confidence": true
+  }
+}
