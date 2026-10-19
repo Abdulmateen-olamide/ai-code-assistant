@@ -176,3 +176,99 @@ class CapabilityGrant(db.Model):
             f"<CapabilityGrant plugin_id={self.plugin_id} workspace_id={self.workspace_id} "
             f"capability={self.capability}>"
         )
+
+
+class PluginLockEntry(db.Model):
+    """A resolved plugin pinned for reproducible installs (#394).
+
+    A lock row records exactly what a workspace resolved: the plugin id, the
+    pinned version, where it came from, and the sha256 integrity hash of the
+    artifact. Rows are scoped to both the workspace and its owner, so one
+    workspace can never read or overwrite another's lockfile, and a lock entry
+    never grants a capability — grants stay explicit and live in
+    ``CapabilityGrant``.
+
+    The row is intentionally free of volatile fields in its lockfile form:
+    ``resolved_at`` is for operators, while
+    :meth:`~app.services.plugin_lockfile.build_lockfile` serializes only the
+    stable fields (and accepts these rows directly), keeping lockfiles
+    byte-stable across resolutions.
+    """
+
+    __tablename__ = "plugin_lock_entries"
+
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(
+        db.Integer,
+        db.ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    owner_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plugin_id = db.Column(db.String(64), nullable=False, index=True)
+    version = db.Column(db.String(32), nullable=False)
+    source = db.Column(db.String(512), nullable=False)
+    integrity = db.Column(db.String(128), nullable=False)
+    dependencies = db.Column(db.JSON, default=[], nullable=False)
+
+    resolved_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    # Relationships
+    workspace = db.relationship("Workspace", foreign_keys=[workspace_id], lazy="select")
+    owner = db.relationship("User", foreign_keys=[owner_id], lazy="select")
+
+    __table_args__ = (
+        db.UniqueConstraint("workspace_id", "plugin_id", name="uq_plugin_lock_entry"),
+    )
+
+    def to_lockfile_entry(self):
+        """Return the canonical :class:`LockfileEntry` for this row.
+
+        Imported lazily so the model module does not depend on the service
+        layer at import time.
+        """
+        from app.services.plugin_lockfile import LockfileEntry, normalize_integrity
+
+        return LockfileEntry(
+            plugin_id=self.plugin_id,
+            version=self.version,
+            source=self.source,
+            integrity=normalize_integrity(self.integrity),
+            dependencies=tuple(self.dependencies or ()),
+        )
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary representation.
+
+        The result includes audit fields (``id``, ``workspace_id``,
+        ``owner_id``, ``resolved_at``) for API reads. Use
+        :meth:`to_lockfile_entry` (or pass the row to ``build_lockfile``) when
+        producing the canonical, byte-stable lockfile.
+        """
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "owner_id": self.owner_id,
+            "plugin_id": self.plugin_id,
+            "version": self.version,
+            "source": self.source,
+            "integrity": self.integrity,
+            "dependencies": self.dependencies or [],
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+    def __repr__(self) -> str:
+        """String representation."""
+        return (
+            f"<PluginLockEntry plugin={self.plugin_id} version={self.version} "
+            f"workspace={self.workspace_id}>"
+        )

@@ -144,16 +144,30 @@ futurenet) from config passphrases and file names — never from live data.
 Detection metadata is attached to every import response and exposed via
 `GET /workspaces/api/projects/<id>/stellar`.
 
+The full signal model, confidence semantics, why plain Rust is excluded, and how
+to add new signals without false positives are documented in
+[`stellar-detection.md`](stellar-detection.md).
+
 ### Stellar-aware AI analysis (`app/services/project_analysis.py`)
 
-Two analysis kinds: **`stellar`** (project overview for a Stellar developer)
-and **`stellar_security`** (Soroban-aware security review). Both:
+Three analysis kinds: **`stellar`** (project overview for a Stellar developer),
+**`stellar_security`** (Soroban-aware security review), and **`stellar_config`**
+(a review of the detected Stellar configuration files). All three:
 
 - Run the same content-access gate as every other analysis (owner-only,
   fails closed).
 - Report honestly when the project is not Stellar.
 - Ground claims in the indexed files, mark `[CONFIRMED]` vs `[SUGGESTION]`,
   and include an honest live-RPC availability note.
+
+`stellar_config` reviews only the detected configuration files
+(`stellar.toml`, `soroban.toml`, `stellar-config.toml`, `stellar.json`,
+`soroban.json`, and `.soroban/` files) for **internal consistency** and obvious
+misconfigurations — e.g. a testnet passphrase paired with a mainnet RPC
+endpoint, placeholder endpoints, or conflicting network definitions. It is
+gated on detection (non-Stellar projects get the honest "not applicable"
+result), and it marks everything `[SUGGESTION]` unless a file directly proves
+the fact.
 
 #### Structured findings (`app/services/stellar_findings.py`)
 
@@ -204,15 +218,22 @@ Display in the project developer panel is handled by the results-panel UI.
 ### CLI (`flask stellar …`)
 
 `flask stellar network`, `validate <address>`, `account <address>`, `health`,
-`contract <id>`, `ledger-entry <key>` — all read-only and scriptable:
+`contract <id>`, `ledger-entry <key>`, `config` — all read-only and scriptable:
 
 - Add `--json` to any command for a stable, parseable JSON document
-  (network info, validation result, account, health, contract, or ledger
-  entry). Human-readable output is the default and is unchanged.
+  (network info, validation result, account, health, contract, ledger entry, or
+  generated config). Human-readable output is the default and is unchanged.
+- `flask stellar config [--network <net>] [--path <path>] [--overwrite]
+  [--existing <path>]` generates a reviewable `.soroban/config.toml` for the
+  selected network (testnet/mainnet/futurenet/custom) from the app's validated
+  presets. It writes no files, emits no secrets, and refuses to overwrite a path
+  listed via `--existing` unless `--overwrite` is passed. The format is the same
+  one the scaffold and detector already understand, so the output round-trips
+  through detection.
 - Errors are printed to stderr and never leak stack traces; when `--json` is
   given the error is emitted as a JSON object with an `error` message.
 - Exit codes are documented: `0` success, `2` service error / not found /
-  RPC unreachable, `3` invalid input (address/contract/key/hash).
+  RPC unreachable, `3` invalid input (address/contract/key/hash/network).
 
 ## Endpoint safety
 
@@ -250,6 +271,10 @@ flask stellar account G…
 flask stellar health
 flask stellar contract C…
 ```
+
+For a step-by-step walkthrough of the whole developer flow (import a Soroban
+repository → see detection → run Stellar analysis → scaffold a contract), see
+[docs/soroban-workflow.md](soroban-workflow.md).
 
 ## Stellar-aware GitHub analysis (PR and issue)
 

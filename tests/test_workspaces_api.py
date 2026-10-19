@@ -1,11 +1,14 @@
-"""Tests for workspace API routes: CRUD, ownership isolation, and auth."""
+"""Tests for workspace API routes: CRUD, pinning, ownership isolation, slug uniqueness, and auth."""
+
+from datetime import UTC, datetime, timedelta
 
 from app.extensions import db
-from app.models import Workspace
+from app.models import Project, Workspace
+from app.models.workspace import generate_slug
 
 
 def _create_workspace(user_id, name="Alice workspace"):
-    workspace = Workspace(user_id=user_id, name=name, description="desc")
+    workspace = Workspace(user_id=user_id, name=name, slug=generate_slug(name), description="desc")
     db.session.add(workspace)
     db.session.commit()
     return workspace
@@ -50,8 +53,11 @@ class TestWorkspaceCRUD:
         _create_workspace(user.id, "Second")
         response = client.get("/workspaces/api/workspaces")
         assert response.status_code == 200
-        names = [w["name"] for w in response.get_json()]
+        payload = response.get_json()
+        names = [w["name"] for w in payload["items"]]
         assert names == ["Second", "First"]
+        assert payload["total"] == 2
+        assert payload["page"] == 1
 
     def test_rename_workspace(self, client, make_user, login):
         user = make_user()
@@ -80,6 +86,68 @@ class TestWorkspaceCRUD:
         assert client.get(f"/workspaces/{workspace.id}").status_code == 200
 
 
+class TestWorkspacePin:
+    def test_toggle_pin_persists(self, client, make_user, login):
+        user = make_user()
+        login()
+        workspace = _create_workspace(user.id, "Pinnable")
+        assert workspace.to_dict()["is_pinned"] is False
+
+        response = client.patch(
+            f"/workspaces/api/workspaces/{workspace.id}",
+            json={"is_pinned": True},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["is_pinned"] is True
+        assert db.session.get(Workspace, workspace.id).is_pinned is True
+
+        # Toggling back off is persisted too.
+        toggled_off = client.patch(
+            f"/workspaces/api/workspaces/{workspace.id}", json={"is_pinned": False}
+        )
+        assert toggled_off.get_json()["is_pinned"] is False
+
+    def test_pinned_workspaces_sort_first_then_recent_activity(self, client, make_user, login):
+        user = make_user()
+        login()
+        base = datetime.now(UTC)
+        pinned_old = Workspace(
+            user_id=user.id,
+            name="PinnedOld",
+            slug="pinnedold",
+            is_pinned=True,
+            updated_at=base - timedelta(days=3),
+        )
+        pinned_new = Workspace(
+            user_id=user.id,
+            name="PinnedNew",
+            slug="pinnednew",
+            is_pinned=True,
+            updated_at=base - timedelta(hours=2),
+        )
+        plain_new = Workspace(user_id=user.id, name="PlainNew", slug="plainnew", updated_at=base)
+        plain_old = Workspace(
+            user_id=user.id,
+            name="PlainOld",
+            slug="plainold",
+            updated_at=base - timedelta(days=1),
+        )
+        db.session.add_all([pinned_old, pinned_new, plain_new, plain_old])
+        db.session.commit()
+
+        names = [w["name"] for w in client.get("/workspaces/api/workspaces").get_json()["items"]]
+        assert names == ["PinnedNew", "PinnedOld", "PlainNew", "PlainOld"]
+
+    def test_dashboard_renders_pin_control(self, client, make_user, login):
+        user = make_user()
+        login()
+        workspace = _create_workspace(user.id, "Pinnable")
+        html = client.get("/workspaces/").get_data(as_text=True)
+        assert 'data-action="toggle-pin"' in html
+        assert f'data-id="{workspace.id}"' in html
+        assert 'data-pinned="false"' in html
+
+
 class TestOwnershipIsolation:
     def test_other_users_workspace_is_404(self, client, make_user, login):
         alice = make_user(username="alice", email="alice@example.com")
@@ -104,4 +172,232 @@ class TestOwnershipIsolation:
         make_user(username="bob", email="bob@example.com")
         login(email="bob@example.com")
         response = client.get("/workspaces/api/workspaces")
-        assert response.get_json() == []
+        payload = response.get_json()
+        assert payload["items"] == []
+        assert payload["total"] == 0
+
+
+class TestWorkspaceSearchPagination:
+    def _seed(self, db, user_id, count=5):
+        base = datetime.now(UTC)
+        names = []
+        for index in range(count):
+            name = f"Workspace {index:02d}"
+            names.append(name)
+            db.session.add(
+                Workspace(
+                    user_id=user_id,
+                    name=name,
+                    slug=generate_slug(name),
+                    description=f"description {index}",
+                    updated_at=base - timedelta(minutes=index),
+                )
+            )
+        db.session.commit()
+        return names
+
+    def test_search_filters_by_name(self, client, make_user, login, db):
+        user = make_user()
+        login()
+        self._seed(db, user.id)
+        items = client.get("/workspaces/api/workspaces?q=Workspace 01").get_json()["items"]
+        assert [w["name"] for w in items] == ["Workspace 01"]
+
+    def test_search_filters_by_description_and_is_case_insensitive(
+        self, client, make_user, login, db
+    ):
+        user = make_user()
+        login()
+        db.session.add(
+            Workspace(
+                user_id=user.id,
+                name="Unrelated",
+                slug="unrelated",
+                description="Stellar contracts work",
+            )
+        )
+        db.session.add(
+            Workspace(user_id=user.id, name="Other", slug="other", description="nothing here")
+        )
+        db.session.commit()
+        items = client.get("/workspaces/api/workspaces?q=STELLAR").get_json()["items"]
+        assert [w["name"] for w in items] == ["Unrelated"]
+
+    def test_search_with_no_match_returns_empty(self, client, make_user, login, db):
+        user = make_user()
+        login()
+        self._seed(db, user.id, count=2)
+        payload = client.get("/workspaces/api/workspaces?q=zzz-no-match").get_json()
+        assert payload["items"] == []
+        assert payload["total"] == 0
+
+    def test_pagination_caps_items_and_reports_total(self, client, make_user, login, db):
+        user = make_user()
+        login()
+        self._seed(db, user.id, count=5)
+
+        first = client.get("/workspaces/api/workspaces?page=1&per_page=2").get_json()
+        assert first["total"] == 5
+        assert first["page"] == 1
+        assert first["per_page"] == 2
+        assert [w["name"] for w in first["items"]] == ["Workspace 00", "Workspace 01"]
+
+        second = client.get("/workspaces/api/workspaces?page=2&per_page=2").get_json()
+        assert [w["name"] for w in second["items"]] == ["Workspace 02", "Workspace 03"]
+
+        third = client.get("/workspaces/api/workspaces?page=3&per_page=2").get_json()
+        assert [w["name"] for w in third["items"]] == ["Workspace 04"]
+
+    def test_per_page_is_capped(self, client, make_user, login, db):
+        user = make_user()
+        login()
+        self._seed(db, user.id, count=1)
+        payload = client.get("/workspaces/api/workspaces?per_page=500").get_json()
+        assert payload["per_page"] == 100
+
+    def test_search_and_pagination_combine(self, client, make_user, login, db):
+        user = make_user()
+        login()
+        self._seed(db, user.id, count=5)
+        payload = client.get("/workspaces/api/workspaces?q=Workspace&page=2&per_page=2").get_json()
+        assert payload["total"] == 5
+        assert [w["name"] for w in payload["items"]] == ["Workspace 02", "Workspace 03"]
+
+    def test_project_count_is_accurate_across_pages(self, client, make_user, login, db):
+        user = make_user()
+        login()
+        names = self._seed(db, user.id, count=2)
+        target = Workspace.query.filter_by(user_id=user.id, name=names[0]).one()
+        db.session.add_all(
+            [
+                Project(workspace_id=target.id, user_id=user.id, name="one"),
+                Project(workspace_id=target.id, user_id=user.id, name="two"),
+            ]
+        )
+        db.session.commit()
+        payload = client.get("/workspaces/api/workspaces?page=1&per_page=1").get_json()
+        # names[0] is the most recently updated, so it is the first item.
+        assert payload["items"][0]["name"] == names[0]
+        assert payload["items"][0]["project_count"] == 2
+
+
+class TestWorkspaceSlug:
+    """Slug generation, uniqueness enforcement, and serialization."""
+
+    def test_create_sets_slug_from_name(self, client, make_user, login):
+        make_user()
+        login()
+        response = client.post(
+            "/workspaces/api/workspaces",
+            json={"name": "My Cool Workspace!"},
+        )
+        assert response.status_code == 201
+        payload = response.get_json()
+        assert payload["slug"] == "my-cool-workspace"
+
+    def test_slug_normalizes_special_characters(self, client, make_user, login):
+        make_user()
+        login()
+        response = client.post(
+            "/workspaces/api/workspaces",
+            json={"name": "  @Hello---World!!  "},
+        )
+        assert response.status_code == 201
+        assert response.get_json()["slug"] == "hello-world"
+
+    def test_create_duplicate_slug_returns_400(self, client, make_user, login):
+        make_user()
+        login()
+        first = client.post("/workspaces/api/workspaces", json={"name": "Alpha"})
+        assert first.status_code == 201
+
+        # Same slug despite different casing and punctuation.
+        second = client.post("/workspaces/api/workspaces", json={"name": "  ALPHA  "})
+        assert second.status_code == 400
+        error = second.get_json()
+        assert "alpha" in error["error"]
+        assert error["slug"] == "alpha"
+        assert error["existing_workspace_id"] == first.get_json()["id"]
+
+    def test_rename_colliding_with_other_workspace_returns_400(self, client, make_user, login):
+        user = make_user()
+        login()
+        ws_a = _create_workspace(user.id, "Project Alpha")
+        _create_workspace(user.id, "Project Beta")
+
+        response = client.patch(
+            f"/workspaces/api/workspaces/{ws_a.id}",
+            json={"name": "Project  Beta"},
+        )
+        assert response.status_code == 400
+        assert "project-beta" in response.get_json()["error"]
+
+    def test_rename_to_same_slug_succeeds(self, client, make_user, login):
+        """Renaming to a name with the same slug (e.g. changing casing) should work."""
+        user = make_user()
+        login()
+        ws = _create_workspace(user.id, "My Workspace")
+
+        response = client.patch(
+            f"/workspaces/api/workspaces/{ws.id}",
+            json={"name": "MY WORKSPACE"},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["name"] == "MY WORKSPACE"
+        assert response.get_json()["slug"] == "my-workspace"
+
+    def test_rename_updates_slug(self, client, make_user, login):
+        user = make_user()
+        login()
+        ws = _create_workspace(user.id, "Old Name")
+
+        response = client.patch(
+            f"/workspaces/api/workspaces/{ws.id}",
+            json={"name": "Brand New Name"},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["slug"] == "brand-new-name"
+
+    def test_description_only_update_preserves_slug(self, client, make_user, login):
+        user = make_user()
+        login()
+        ws = _create_workspace(user.id, "Keep Slug")
+
+        response = client.patch(
+            f"/workspaces/api/workspaces/{ws.id}",
+            json={"description": "new desc"},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["slug"] == "keep-slug"
+
+    def test_different_users_can_have_same_slug(self, client, make_user, login):
+        make_user(username="alice", email="alice@example.com")
+        login(email="alice@example.com")
+        r1 = client.post("/workspaces/api/workspaces", json={"name": "Shared Name"})
+        assert r1.status_code == 201
+        client.post("/auth/logout")
+
+        make_user(username="bob", email="bob@example.com")
+        login(email="bob@example.com")
+        r2 = client.post("/workspaces/api/workspaces", json={"name": "Shared Name"})
+        assert r2.status_code == 201
+        assert r1.get_json()["slug"] == r2.get_json()["slug"]
+
+    def test_empty_slug_from_special_chars_rejected(self, client, make_user, login):
+        make_user()
+        login()
+        response = client.post("/workspaces/api/workspaces", json={"name": "!!@@##"})
+        assert response.status_code == 400
+        assert "alphanumeric" in response.get_json()["error"].lower()
+
+    def test_rename_to_empty_slug_rejected(self, client, make_user, login):
+        user = make_user()
+        login()
+        ws = _create_workspace(user.id, "Valid Name")
+
+        response = client.patch(
+            f"/workspaces/api/workspaces/{ws.id}",
+            json={"name": "---"},
+        )
+        assert response.status_code == 400
+        assert "alphanumeric" in response.get_json()["error"].lower()

@@ -31,7 +31,12 @@
   }
 
   function statusLabel(review) {
-    var cls = review.status === "completed" ? "tag-public" : review.status === "failed" ? "tag-private" : "";
+    var cls =
+      review.status === "completed"
+        ? "tag-public"
+        : review.status === "failed"
+          ? "tag-private"
+          : "tag-running";
     return '<span class="tag ' + cls + '">' + GH.escapeHtml(review.status) + "</span>";
   }
 
@@ -53,32 +58,70 @@
 
   // ----- Quality dashboard strip ----------------------------------------
 
+  function metricCard(value, label) {
+    return (
+      "<div class='metric-card'>" +
+      "<span class='metric-value'>" + value + "</span>" +
+      "<span class='metric-label'>" + label + "</span>" +
+      "</div>"
+    );
+  }
+
+  function breakdown(title, counts, limit) {
+    var keys = Object.keys(counts || {});
+    if (!keys.length) return "";
+    var html = "<h3 class='metric-title'>" + GH.escapeHtml(title) + "</h3><ul class='metric-list'>";
+    keys.slice(0, limit || keys.length).forEach(function (key) {
+      html += "<li><code>" + GH.escapeHtml(key) + "</code> — " + counts[key] + "</li>";
+    });
+    return html + "</ul>";
+  }
+
+  function trendSection(trend) {
+    if (!trend || !trend.length) return "";
+    var max = 0;
+    trend.forEach(function (point) { max = Math.max(max, point.total || 0); });
+    max = max || 1;
+    var html = "<h3 class='metric-title'>Findings addressed over time</h3>" +
+      "<p class='repo-meta'>Open vs addressed findings for each of the last " +
+      trend.length + " review" + (trend.length === 1 ? "" : "s") + ".</p>" +
+      "<ul class='trend-list'>";
+    trend.forEach(function (point) {
+      var openPct = Math.round(((point.open || 0) / max) * 100);
+      var donePct = Math.round(((point.addressed || 0) / max) * 100);
+      html += "<li class='trend-row'>" +
+        "<span class='trend-date'>" + GH.escapeHtml(GH.relativeDate(point.created_at)) + "</span>" +
+        "<span class='trend-bar' title='" + (point.open || 0) + " open / " +
+        (point.addressed || 0) + " addressed'>" +
+        "<span class='trend-open' style='width:" + openPct + "%'></span>" +
+        "<span class='trend-done' style='width:" + donePct + "%'></span>" +
+        "</span>" +
+        "<span class='trend-counts'>" + (point.open || 0) + " open &middot; " +
+        (point.addressed || 0) + " addressed</span>" +
+        "</li>";
+    });
+    return html + "</ul>";
+  }
+
   function renderMetrics(metrics, container) {
     if (!container) return;
     var findings = metrics.findings || {};
-    var parts = [
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + metrics.total_reviews + "</span>",
-      "<span class='metric-label'>reviews</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.total || 0) + "</span>",
-      "<span class='metric-label'>findings</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.high_risk || 0) + "</span>",
-      "<span class='metric-label'>high risk</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.unaddressed_high_risk || 0) + "</span>",
-      "<span class='metric-label'>open high risk</span>",
-      "</div>",
-      "<div class='metric-card'>",
-      "<span class='metric-value'>" + (findings.confirmed || 0) + "</span>",
-      "<span class='metric-label'>confirmed</span>",
-      "</div>",
-    ];
-    container.innerHTML = "<div class='metric-grid'>" + parts.join("") + "</div>";
+    var html = "<div class='metric-grid'>" +
+      metricCard(metrics.total_reviews || 0, "reviews") +
+      metricCard(findings.total || 0, "findings") +
+      metricCard(findings.high_risk || 0, "high risk") +
+      metricCard(findings.unaddressed_high_risk || 0, "open high risk") +
+      metricCard(findings.addressed || 0, "addressed") +
+      metricCard(metrics.reviews_last_7_days || 0, "reviews / 7d") +
+      "</div>";
+    html += trendSection(metrics.findings_trend);
+    html += breakdown("Findings by severity", findings.by_severity);
+    html += breakdown("Findings by category", findings.by_category, 10);
+    if (metrics.last_review_at) {
+      html += "<p class='repo-meta'>Last review " + GH.relativeDate(metrics.last_review_at) +
+        " &middot; " + (metrics.reviews_last_30_days || 0) + " in the last 30 days</p>";
+    }
+    container.innerHTML = html;
   }
 
   function loadMetrics(container) {
@@ -93,19 +136,23 @@
 
   // ----- Index / history -------------------------------------------------
 
-  function loadReviewList(container, filter) {
+  function loadReviewList(container, filter, pagerEl, page) {
     var params = [];
     if (filter) {
       if (filter.source) params.push("source=" + encodeURIComponent(filter.source));
       if (filter.kind) params.push("kind=" + encodeURIComponent(filter.kind));
+      if (filter.status) params.push("status=" + encodeURIComponent(filter.status));
       if (filter.project_id) params.push("project_id=" + encodeURIComponent(filter.project_id));
     }
-    var url = "/reviews/api/reviews" + (params.length ? "?" + params.join("&") : "");
-    GH.api(url).then(function (reviews) {
+    params.push("page=" + encodeURIComponent(page || 1));
+    var url = "/reviews/api/reviews?" + params.join("&");
+    GH.api(url).then(function (data) {
+      var reviews = data.items || [];
       container.innerHTML = "";
       if (!reviews.length) {
         container.innerHTML =
           '<p class="sidebar-empty">No reviews yet. Run a review from a project or a pull request.</p>';
+        renderPager(pagerEl, null);
         return;
       }
       reviews.forEach(function (review) {
@@ -113,31 +160,110 @@
         el.innerHTML = reviewCard(review);
         container.appendChild(el.firstChild);
       });
+      renderPager(pagerEl, data);
     }).catch(function (error) {
       container.innerHTML = '<p class="sidebar-empty">Could not load reviews.</p>';
       GH.flashError(error.message);
     });
   }
 
+  // The pager is only rendered where a pager element exists; the project
+  // history section shows just the most recent page instead.
+  function renderPager(pagerEl, data) {
+    if (!pagerEl) return;
+    pagerEl.innerHTML = "";
+    if (!data || data.total_pages <= 1) return;
+
+    function pageLink(target, label) {
+      var link = document.createElement("a");
+      link.className = "btn btn-ghost btn-sm";
+      link.href = "#";
+      link.dataset.page = target;
+      link.textContent = label;
+      return link;
+    }
+
+    if (data.has_prev) pagerEl.appendChild(pageLink(data.page - 1, "Previous"));
+    var info = document.createElement("span");
+    info.className = "field-hint";
+    info.textContent =
+      "Page " + data.page + " of " + data.total_pages +
+      " (" + data.total + " review" + (data.total === 1 ? "" : "s") + ")";
+    pagerEl.appendChild(info);
+    if (data.has_next) pagerEl.appendChild(pageLink(data.page + 1, "Next"));
+  }
+
+  function reviewFilter() {
+    var source = document.getElementById("review-source");
+    var kind = document.getElementById("review-kind");
+    var status = document.getElementById("review-status");
+    var filter = {};
+    if (source && source.value) filter.source = source.value;
+    if (kind && kind.value) filter.kind = kind.value;
+    if (status && status.value) filter.status = status.value;
+    return filter;
+  }
+
   function initIndex() {
     var metricsEl = document.getElementById("metrics-strip");
     var listEl = document.getElementById("review-list");
+    var pagerEl = document.getElementById("review-pager");
     if (!listEl) return;
+    var page = 1;
+
+    function refresh() {
+      loadReviewList(listEl, reviewFilter(), pagerEl, page);
+    }
+
     loadMetrics(metricsEl);
-    loadReviewList(listEl, null);
+    refresh();
+    ["review-source", "review-kind", "review-status"].forEach(function (id) {
+      var select = document.getElementById(id);
+      if (select) {
+        select.addEventListener("change", function () {
+          // A narrower filter usually has fewer pages; jumping back to the
+          // first one avoids landing on an empty out-of-range page.
+          page = 1;
+          refresh();
+        });
+      }
+    });
+    if (pagerEl) {
+      pagerEl.addEventListener("click", function (event) {
+        var link = event.target.closest("a[data-page]");
+        if (!link) return;
+        event.preventDefault();
+        page = parseInt(link.dataset.page, 10) || 1;
+        refresh();
+      });
+    }
   }
 
   // ----- Detail ----------------------------------------------------------
 
   function findingsUrl(base) {
     var severity = document.getElementById("finding-severity");
+    var category = document.getElementById("finding-category");
     var confidence = document.getElementById("finding-confidence");
     var addressed = document.getElementById("finding-addressed");
     var params = [];
     if (severity && severity.value) params.push("severity=" + encodeURIComponent(severity.value));
+    if (category && category.value) params.push("category=" + encodeURIComponent(category.value));
     if (confidence && confidence.value) params.push("confidence=" + encodeURIComponent(confidence.value));
     if (addressed && addressed.value !== "") params.push("addressed=" + encodeURIComponent(addressed.value));
     return base + (params.length ? "?" + params.join("&") : "");
+  }
+
+  function populateCategories(categories) {
+    var select = document.getElementById("finding-category");
+    if (!select) return;
+    select.innerHTML = '<option value="">All categories</option>';
+    (categories || []).forEach(function (category) {
+      var option = document.createElement("option");
+      option.value = category;
+      option.textContent = category;
+      select.appendChild(option);
+    });
   }
 
   function summarySection(title, items) {
@@ -151,23 +277,29 @@
     );
   }
 
+  function confidenceTag(finding) {
+    var confirmed = finding.confidence === "confirmed";
+    var label = finding.confidence_label || (confirmed ? "[CONFIRMED]" : "[SUGGESTION]");
+    return (
+      '<span class="tag ' + (confirmed ? "tag-confirmed" : "tag-suggestion") + '">' +
+      GH.escapeHtml(label) + "</span>"
+    );
+  }
+
   function findingCard(finding) {
     var location = finding.file ? GH.escapeHtml(finding.file) : "(whole repo)";
     if (finding.line != null) location += ":" + finding.line;
-    var addressed = finding.addressed
-      ? '<span class="tag tag-confirmed">addressed</span>'
-      : '<span class="tag tag-suggestion">open</span>';
     return (
       '<div class="finding-card">' +
       '<div class="finding-header">' +
       badge(finding.severity) +
+      " " + confidenceTag(finding) +
       " " + GH.escapeHtml(finding.category) +
       " <span class='finding-location'>" + location + "</span>" +
       '<button class="btn btn-ghost btn-sm finding-toggle" data-id="' + finding.id +
       '" data-addressed="' + (finding.addressed ? "0" : "1") + '" type="button">' +
       (finding.addressed ? "Reopen" : "Mark addressed") + "</button>" +
       "</div>" +
-      "<p class='finding-confidence'>confidence: " + GH.escapeHtml(finding.confidence) + "</p>" +
       "<p>" + GH.renderMarkdownish(finding.explanation) + "</p>" +
       (finding.recommendation
         ? "<p class='finding-recommendation'><strong>Recommendation:</strong> " +
@@ -220,6 +352,9 @@
         '<div class="issue-meta">' +
         statusLabel(review) + " " + GH.escapeHtml(review.kind) + " &middot; " +
         (review.findings_count || 0) + " findings &middot; " + GH.relativeDate(review.created_at) +
+        (review.status === "failed"
+          ? ' <button id="retry-review" class="btn btn-primary btn-sm" type="button">Retry review</button>'
+          : "") +
         "</div>" +
         (review.error_message ? '<p class="flash flash-error">' + GH.escapeHtml(review.error_message) + "</p>" : "") +
         "</div>" +
@@ -233,6 +368,7 @@
         summarySection("Files affected", summary.files_affected) +
         (review.status === "failed" ? '<p class="sidebar-empty">This review did not complete.</p>' : "") +
         "</div>";
+      populateCategories(review.categories);
       loadFindings(id);
     }).catch(function (error) {
       container.innerHTML = '<p class="sidebar-empty">Could not load review.</p>';
@@ -246,6 +382,7 @@
     if (!document.getElementById("review-detail")) return;
     loadDetail();
     document.getElementById("finding-severity").addEventListener("change", function () { loadFindings(id); });
+    document.getElementById("finding-category").addEventListener("change", function () { loadFindings(id); });
     document.getElementById("finding-confidence").addEventListener("change", function () { loadFindings(id); });
     document.getElementById("finding-addressed").addEventListener("change", function () { loadFindings(id); });
     document.addEventListener("click", function (event) {
@@ -258,6 +395,21 @@
         }).then(function () {
           loadFindings(id);
         }).catch(function (error) { GH.flashError(error.message); });
+        return;
+      }
+      var retry = event.target.closest("#retry-review");
+      if (retry) {
+        retry.disabled = true;
+        retry.textContent = "Retrying...";
+        GH.api("/reviews/api/reviews/" + id + "/retry", { method: "POST" })
+          .then(function (created) {
+            window.location.href = "/reviews/" + created.id;
+          })
+          .catch(function (error) {
+            retry.disabled = false;
+            retry.textContent = "Retry review";
+            GH.flashError(error.message);
+          });
       }
     });
     if (deleteBtn) {

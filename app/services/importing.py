@@ -1,9 +1,10 @@
 """Project import service.
 
-Extracts project snapshots from uploaded archives (``.zip`` / ``.tar.gz``) or a
-connected GitHub repository into bounded, sanitized metadata rows. Never writes
-extracted files to disk: entries are validated in-memory and only their
-metadata plus a capped copy of plain-text content is stored in the database.
+Extracts project snapshots from uploaded archives (``.zip``, ``.tar``,
+``.tar.gz``, ``.tgz``, ``.7z`` and ``.rar``) or a connected GitHub repository
+into bounded, sanitized metadata rows. Never writes extracted files to disk:
+entries are validated in-memory and only their metadata plus a capped copy of
+plain-text content is stored in the database.
 
 Security invariants enforced here:
 
@@ -15,6 +16,7 @@ Security invariants enforced here:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import tarfile
@@ -22,8 +24,8 @@ import zipfile
 from datetime import UTC, datetime
 
 from app.extensions import db
-from app.models import ProjectFile
-from app.models.project import STATUS_READY
+from app.models import Project, ProjectFile
+from app.models.project import SOURCE_GITHUB, STATUS_READY
 from app.services.github import GitHubError
 
 
@@ -73,7 +75,7 @@ LANGUAGE_BY_EXT = {
     "dockerfile": "Dockerfile",
 }
 
-_ARCHIVE_EXT_RE = re.compile(r"\.(?:zip|tar|tar\.gz|tgz)$", re.IGNORECASE)
+_ARCHIVE_EXT_RE = re.compile(r"\.(?:zip|tar|tar\.gz|tgz|7z|rar)$", re.IGNORECASE)
 
 
 def _config_set(name: str) -> set[str]:
@@ -161,6 +163,47 @@ def _to_file_row(path: str, raw: bytes, *, max_chars: int) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Duplicate detection
+# --------------------------------------------------------------------------
+
+
+def archive_hash(raw: bytes) -> str:
+    """Return the SHA-256 hex digest of an archive payload."""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def find_duplicate_archive(workspace_id: int, content_hash: str) -> Project | None:
+    """Return an existing archive import with the same content hash, if any.
+
+    Scoped to the workspace: the same archive imported into another workspace is
+    a separate project.
+    """
+    return (
+        Project.query.filter_by(workspace_id=workspace_id, content_hash=content_hash)
+        .order_by(Project.created_at)
+        .first()
+    )
+
+
+def find_duplicate_github(workspace_id: int, full_name: str, default_branch: str) -> Project | None:
+    """Return an existing GitHub import of the same repo + default branch.
+
+    ``owner/name`` is compared case-insensitively because GitHub identifiers are
+    case-insensitive.
+    """
+    return (
+        Project.query.filter(
+            Project.workspace_id == workspace_id,
+            Project.source == SOURCE_GITHUB,
+            db.func.lower(Project.source_url) == full_name.lower(),
+            Project.default_branch == default_branch,
+        )
+        .order_by(Project.created_at)
+        .first()
+    )
+
+
+# --------------------------------------------------------------------------
 # Archive extraction
 # --------------------------------------------------------------------------
 
@@ -240,25 +283,180 @@ def _extract_tar(fileobj: io.BytesIO, limits: dict) -> list[dict]:
     return rows
 
 
-def extract_archive(fileobj, filename: str) -> list[dict]:
-    """Extract a ``.zip`` or ``.tar.gz`` upload into sanitized file rows.
+def _extract_7z(fileobj: io.BytesIO, limits: dict) -> list[dict]:
+    """Extract a ``.7z`` archive in memory (no filesystem writes)."""
+    try:
+        import py7zr
+        from py7zr.io import BytesIOFactory
+    except ImportError as exc:  # pragma: no cover - dependency is declared
+        raise ProjectImportError("7z archive support is unavailable.") from exc
 
-    Raises :class:`ProjectImportError` on unsupported types, size/count
-    violations, or traversal attempts.
+    try:
+        with py7zr.SevenZipFile(fileobj, mode="r") as archive:
+            selected: list[str] = []
+            total = 0
+            for info in archive.list():
+                if getattr(info, "is_directory", False):
+                    continue
+                path = sanitize_member_path(info.filename)
+                if not path or should_skip(path):
+                    continue
+                size = info.uncompressed or 0
+                if size > limits["max_total"]:
+                    raise ProjectImportError(
+                        "Archive contains a file larger than the project size limit."
+                    )
+                if total + size > limits["max_total"]:
+                    raise ProjectImportError("Archive expands beyond the project size limit.")
+                if len(selected) >= limits["max_files"]:
+                    raise ProjectImportError("Archive contains too many files to import.")
+                total += size
+                selected.append(info.filename)
+
+            if not selected:
+                return []
+
+            archive.reset()
+            factory = BytesIOFactory(limit=limits["max_total"])
+            archive.extract(targets=selected, factory=factory)
+
+            rows: list[dict] = []
+            for name in selected:
+                product = factory.products.get(name)
+                if product is None:
+                    continue
+                path = sanitize_member_path(name)
+                if not path or should_skip(path):
+                    continue
+                product.seek(0)
+                rows.append(_to_file_row(path, product.read(), max_chars=limits["max_chars"]))
+            return rows
+    except ProjectImportError:
+        raise
+    except py7zr.exceptions.Bad7zFile as exc:
+        raise ProjectImportError("The uploaded file is not a valid 7z archive.") from exc
+    except py7zr.exceptions.PasswordRequired as exc:
+        raise ProjectImportError("Password-protected 7z archives are not supported.") from exc
+    except py7zr.exceptions.DecompressionBombError as exc:
+        raise ProjectImportError("Archive expands beyond the project size limit.") from exc
+    except py7zr.exceptions.ArchiveError as exc:
+        raise ProjectImportError(f"Could not read the 7z archive: {exc}") from exc
+
+
+def _extract_rar(fileobj: io.BytesIO, limits: dict) -> list[dict]:
+    """Extract a ``.rar`` archive in memory (stored entries only).
+
+    ``rarfile`` reads uncompressed ("stored") entries directly from the
+    in-memory buffer. Archives whose entries use a compression method that
+    requires an external ``unrar``/``bsdtar`` binary are rejected with a clear
+    error rather than shelling out, preserving the in-memory guarantee.
+    """
+    try:
+        import rarfile
+    except ImportError as exc:  # pragma: no cover - dependency is declared
+        raise ProjectImportError("RAR archive support is unavailable.") from exc
+
+    rows: list[dict] = []
+    total = 0
+    try:
+        with rarfile.RarFile(fileobj) as archive:
+            for info in archive.infolist():
+                if info.isdir():
+                    continue
+                path = sanitize_member_path(info.filename)
+                if not path or should_skip(path):
+                    continue
+                if info.file_size > limits["max_total"]:
+                    raise ProjectImportError(
+                        "Archive contains a file larger than the project size limit."
+                    )
+                if total + info.file_size > limits["max_total"]:
+                    raise ProjectImportError("Archive expands beyond the project size limit.")
+                if len(rows) >= limits["max_files"]:
+                    raise ProjectImportError("Archive contains too many files to import.")
+                with archive.open(info) as handle:
+                    raw = handle.read()
+                total += len(raw)
+                rows.append(_to_file_row(path, raw, max_chars=limits["max_chars"]))
+    except ProjectImportError:
+        raise
+    except rarfile.PasswordRequired as exc:
+        raise ProjectImportError("Password-protected RAR archives are not supported.") from exc
+    except rarfile.NeedFirstVolume as exc:
+        raise ProjectImportError("Multi-volume RAR archives are not supported.") from exc
+    except rarfile.RarCannotExec as exc:
+        raise ProjectImportError(
+            "This RAR archive uses a compression method that requires an external "
+            "extractor; only uncompressed RAR archives are supported."
+        ) from exc
+    except rarfile.Error as exc:
+        raise ProjectImportError(f"The uploaded file is not a valid RAR archive: {exc}") from exc
+    return rows
+
+
+def extract_archive(fileobj, filename: str) -> list[dict]:
+    """Extract a supported archive upload into sanitized file rows.
+
+    Supports ``.zip``, ``.tar``, ``.tar.gz``, ``.tgz``, ``.7z`` and ``.rar``.
+    Every format goes through the same path-traversal, secret-file, size, and
+    file-count checks, and nothing is ever written to disk. Raises
+    :class:`ProjectImportError` on unsupported types, size/count violations,
+    traversal attempts, or archives that cannot be read.
     """
     from flask import current_app
 
     raw = fileobj.read()
     if len(raw) > current_app.config["PROJECT_MAX_ARCHIVE_BYTES"]:
         raise ProjectImportError("Archive exceeds the maximum allowed upload size.")
-    if not _ARCHIVE_EXT_RE.search((filename or "").lower()):
-        raise ProjectImportError("Unsupported archive type. Upload a .zip or .tar.gz file.")
+
+    name = (filename or "").lower()
+    if not _ARCHIVE_EXT_RE.search(name):
+        raise ProjectImportError(
+            "Unsupported archive type. Upload a .zip, .tar, .tar.gz, .tgz, .7z or .rar file."
+        )
 
     limits = _limits()
     buffer = io.BytesIO(raw)
-    if (filename or "").lower().endswith(".zip"):
+    if name.endswith(".zip"):
         return _extract_zip(buffer, limits)
+    if name.endswith(".7z"):
+        return _extract_7z(buffer, limits)
+    if name.endswith(".rar"):
+        return _extract_rar(buffer, limits)
     return _extract_tar(buffer, limits)
+
+
+def build_manifest_rows(files: list[dict]) -> list[dict]:
+    """Validate a client-built file manifest (files/folder dragged from the OS).
+
+    Each entry is ``{"path": str, "content": str}``. Paths go through the same
+    :func:`sanitize_member_path` as archives and the Phase 5 size/count caps are
+    enforced, so a manifest cannot bypass the archive import rules. Skips the
+    same VCS/vendor and obvious-secret paths as archives.
+    """
+    if not isinstance(files, list) or not files:
+        raise ProjectImportError("No files were provided in the import manifest.")
+
+    limits = _limits()
+    rows: list[dict] = []
+    total = 0
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        path = sanitize_member_path(str(entry.get("path") or ""))
+        if not path or should_skip(path):
+            continue
+        content = entry.get("content")
+        raw = str(content if content is not None else "").encode("utf-8", errors="replace")
+        if len(raw) > limits["max_total"]:
+            raise ProjectImportError("A dropped file is larger than the project size limit.")
+        if total + len(raw) > limits["max_total"]:
+            raise ProjectImportError("Dropped files exceed the project size limit.")
+        if len(rows) >= limits["max_files"]:
+            raise ProjectImportError("Too many files to import.")
+        total += len(raw)
+        rows.append(_to_file_row(path, raw, max_chars=limits["max_chars"]))
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -266,16 +464,21 @@ def extract_archive(fileobj, filename: str) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
-def import_github_repo(project, full_name: str, client) -> None:
+def import_github_repo(project, full_name: str, client, *, repo: dict | None = None) -> None:
     """Import a GitHub repository into ``project`` using an authenticated client.
 
     Stores bounded metadata + content for the repository's blob tree and marks
     the project ready on success. Raises :class:`GitHubError` for API-level
     failures, which the caller can surface as a failed project.
+
+    ``repo`` may be a repository payload already fetched by the caller (this
+    avoids a duplicate API call when the default branch was needed for duplicate
+    detection); when omitted it is fetched here.
     """
     from flask import current_app
 
-    repo = client.get_repository(full_name)
+    if repo is None:
+        repo = client.get_repository(full_name)
     default_branch = repo.get("default_branch") or "HEAD"
     tree = client.get_tree(full_name, default_branch, recursive=True)
 

@@ -32,17 +32,44 @@ def create_app(config_name: str | None = None) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_by_name[config_name])
 
+    # Reject malformed plugin trust configuration at startup instead of
+    # silently treating every publisher as untrusted (#386).
+    from app.services.plugin_trust import PluginTrustConfigError, validate_trust_config
+
+    try:
+        validate_trust_config(app.config)
+    except PluginTrustConfigError as exc:
+        raise RuntimeError(f"Invalid plugin trust configuration: {exc}") from exc
+
     # Initialize extensions with the application.
     db.init_app(app)
     migrate.init_app(app, db)
     login_manager.init_app(app)
     csrf.init_app(app)
 
+    # Structured, security-relevant chat logging + request-id correlation (#17).
+    from app.services import chat_audit
+
+    chat_audit.init_app(app)
+
+    # Per-user LLM response cache (issue #18).
+    from app.services.llm_cache import configure_cache
+
+    configure_cache(app)
+
+    # Per-account GitHub GET response cache with ETag revalidation (issue #76).
+    from app.services.github_cache import configure_github_cache
+
+    configure_github_cache(app)
+
     # Register blueprints.
+    from app.admin import bp as admin_bp
     from app.auth import bp as auth_bp
     from app.chat import bp as chat_bp
+    from app.chat.api import bp as chat_api_bp
     from app.collaboration import bp as collaboration_bp
     from app.github import bp as github_bp
+    from app.keys import bp as keys_bp
     from app.main import bp as main_bp
     from app.plugins import bp as plugins_bp
     from app.prompts import bp as prompts_bp
@@ -54,14 +81,17 @@ def create_app(config_name: str | None = None) -> Flask:
     app.register_blueprint(auth_bp)
     app.register_blueprint(main_bp)
     app.register_blueprint(chat_bp)
+    app.register_blueprint(chat_api_bp)
     app.register_blueprint(prompts_bp)
     app.register_blueprint(tools_bp)
     app.register_blueprint(github_bp)
+    app.register_blueprint(keys_bp)
     app.register_blueprint(plugins_bp)
     app.register_blueprint(workspaces_bp)
     app.register_blueprint(collaboration_bp)
     app.register_blueprint(reviews_bp)
     app.register_blueprint(stellar_bp)
+    app.register_blueprint(admin_bp)
 
     # Make the current time available to every template as ``now``.
     @app.context_processor
@@ -102,5 +132,11 @@ def create_app(config_name: str | None = None) -> Flask:
     from app.services.plugins_cli import register_plugins_cli
 
     register_plugins_cli(app)
+
+    # Usage-ledger maintenance (historical chat backfill and future retention
+    # commands). The backfill is bounded and idempotent.
+    from app.services.usage_cli import register_usage_cli
+
+    register_usage_cli(app)
 
     return app

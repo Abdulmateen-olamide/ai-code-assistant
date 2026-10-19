@@ -73,6 +73,43 @@ def consume(key: str, *, max_hits: int, window: int) -> tuple[bool, int]:
         return True, 0
 
 
+def count(key: str, *, window: int) -> int:
+    """Return the current number of recorded hits for ``key`` in ``window``.
+
+    Read-only: unlike :func:`hit`/:func:`consume` it never records a hit, so it
+    is safe to call as a pre-check before deciding whether an action is allowed.
+    """
+    with _LOCK:
+        _prune(key, window)
+        return len(_ENTRIES.get(key, ()))
+
+
+def record(key: str) -> None:
+    """Record a hit for ``key`` outside of any limit check.
+
+    Used for failure-based throttling (e.g. the OAuth callback): only failed
+    attempts are recorded, so legitimate successes never count against the limit.
+    """
+    with _LOCK:
+        _ENTRIES.setdefault(key, []).append(time.monotonic())
+
+
+def retry_after(key: str, *, window: int) -> int:
+    """Return seconds until the oldest recorded hit for ``key`` expires."""
+    with _LOCK:
+        _prune(key, window)
+        timestamps = _ENTRIES.get(key)
+        if not timestamps:
+            return 0
+        return max(round(window - (time.monotonic() - timestamps[0])), 1)
+
+
+def clear(key: str) -> None:
+    """Drop all recorded hits for a single ``key`` (e.g. after a success)."""
+    with _LOCK:
+        _ENTRIES.pop(key, None)
+
+
 def per_user_limit(bucket: str, *, max_config: str, window_config: str):
     """Decorator enforcing a per-user sliding-window limit on a view.
 
@@ -113,6 +150,44 @@ def client_key(extra: str = "") -> str:
 
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0]
     return f"{extra}:{ip}"
+
+
+def ai_limit(view):
+    """Per-user rate limit for the AI-powered endpoints (#28).
+
+    Reads ``RATE_LIMIT_AI_PER_MINUTE`` (requests) and ``RATE_LIMIT_AI_WINDOW``
+    (seconds) from the app config at request time, and is a no-op when
+    ``RATE_LIMIT_AI_ENABLED`` is false (e.g. the testing config) or when either
+    value is not configured. Over-limit requests receive the same ``429``
+    ``application/json`` body as :func:`per_user_limit`.
+    """
+
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        if not current_app.config.get("RATE_LIMIT_AI_ENABLED", True):
+            return view(*args, **kwargs)
+        max_hits = current_app.config.get("RATE_LIMIT_AI_PER_MINUTE") or 0
+        window = current_app.config.get("RATE_LIMIT_AI_WINDOW") or 0
+        if not max_hits or not window:
+            return view(*args, **kwargs)
+        allowed, retry_after = consume(
+            f"ai:user:{current_user.get_id()}",
+            max_hits=max_hits,
+            window=window,
+        )
+        if not allowed:
+            response = jsonify(
+                {
+                    "error": "Rate limit exceeded. Please retry later.",
+                    "kind": "rate_limited",
+                }
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        return view(*args, **kwargs)
+
+    return wrapper
 
 
 def reset() -> None:
