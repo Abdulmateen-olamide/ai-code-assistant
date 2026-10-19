@@ -28,6 +28,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from app.extensions import db
@@ -35,6 +36,7 @@ from app.models import Plugin, PluginInstallation, Project, User, Workspace
 from app.services.capabilities import Capability, CapabilityStore
 from app.services.permissions import role_for
 from app.services.plugin_audit import record_plugin_audit
+from app.services.plugin_execution import run_with_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +321,10 @@ class EventDispatcher:
                     )
                     continue
             try:
-                handler(event=event)
+                run_with_timeout(
+                    partial(handler, event=event),
+                    operation=f"dispatch:{event.event_type}",
+                )
                 results["successful"] += 1
             except Exception as e:
                 results["failed"] += 1

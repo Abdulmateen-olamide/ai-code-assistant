@@ -27,7 +27,7 @@ PREFERENCE_TYPES = (
     PREF_SHARES,
 )
 
-# Map notification type -> preference key. ``None`` means the notification is
+# Map notification type -> preference key. ``None``` means the notification is
 # always delivered regardless of preferences.
 TYPE_PREFERENCE_MAP = {
     "invitation": PREF_INVITATIONS,

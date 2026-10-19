@@ -50,7 +50,7 @@ Per-conversation generation settings (issue #12) resolve through
 with its `supported_models` and whether the user has a usable key, and
 `build_provider(user, name)` applies the user's stored (decrypted) key when the
 environment does not provide one. A conversation's `model`, `temperature`, and
-`system_prompt` are passed through to `chat()`/`stream()` on every message.
+`system_prompt` are passed through to `chat()/`stream()` on every message.
 
 `ProviderResponse` carries `content`, `model`, `prompt_tokens`,
 `completion_tokens`, `total_tokens`, and `latency_seconds`. Failures use the
@@ -59,6 +59,43 @@ environment does not provide one. A conversation's `model`, `temperature`, and
 `ProviderUnavailableError`, and `ProviderResponseError`. `LLMProviderError` (the
 historical name) is an alias of `ProviderError`, so existing `except
 LLMProviderError` blocks keep working.
+
+## Default price table (issue #439)
+
+`app/services/pricing.py` ships default cost estimates for the models exposed
+by the built-in providers, in USD per 1,000 tokens:
+
+| Provider | Model | Input / 1k | Output / 1k | Source |
+| --- | --- | --- | --- | --- |
+| `mock` | `mock-1` | `0.00000` | `0.00000` | Offline provider, always free |
+| `openai` | `gpt-4o-mini` | `0.00015` | `0.00060` | Estimate |
+| `openai` | `gpt-4o` | `0.00250` | `0.01000` | Estimate |
+| `openai` | `gpt-4.1-mini` | `0.00040` | `0.00160` | Estimate |
+| `openai` | `gpt-4.1` | `0.00200` | `0.00800` | Estimate |
+| `anthropic` | `claude-3-5-sonnet-latest` | `0.00300` | `0.01500` | Estimate |
+| `anthropic` | `claude-3-5-haiku-latest` | `0.00080` | `0.00400` | Estimate |
+
+> **These are estimates, not billing data.** Vendors change prices and add
+> dated model snapshots, so operators must verify the numbers against their
+> current provider contract before using them for budgets or invoices. The
+> table exposes `ESTIMATE_DISCLAIMER` (`estimated: true` on every vendor
+> entry) for exactly that reason; only the offline `mock` provider is a
+> guaranteed zero-cost entry.
+
+```python
+from app.services.pricing import estimate_cost_usd, get_model_price, price_table
+
+price = get_model_price("openai", "gpt-4o")
+cost = estimate_cost_usd(
+    "openai", "gpt-4o", prompt_tokens=2_000, completion_tokens=500
+)
+# 2 * price.input_per_1k_usd + 0.5 * price.output_per_1k_usd
+```
+
+Lookups ignore case and surrounding whitespace. Unknown providers or models
+return `None` (cost unknown) instead of assuming zero, and negative token
+counts raise `ValueError`. `price_table()` returns the full table grouped by
+provider for operator-facing surfaces.
 
 ## Adding a provider
 
@@ -77,7 +114,7 @@ specific response shape outside their own module.
 
 ## Retries and backoff (issue #29)
 
-`get_retrying_provider()` returns the resolved provider wrapped in
+get_retrying_provider()` returns the resolved provider wrapped in
 `RetryingProvider`, which retries transient failures — network errors, HTTP 429
 and 5xx (`ProviderRateLimitError` / `ProviderUnavailableError`) — with
 exponential backoff plus jitter. Non-transient failures (`401`/`400`,

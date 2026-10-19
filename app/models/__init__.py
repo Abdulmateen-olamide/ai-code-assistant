@@ -5,17 +5,19 @@ can discover every table in the application.
 """
 
 from app.models.activity_event import ActivityEvent
+from app.models.analyzed_file import AnalyzedFile
 from app.models.api_key import ApiKey
 from app.models.audit_log import AuditLog
 from app.models.conversation import Conversation
 from app.models.conversation_share import ConversationShare
+from app.models.file_analysis import FileAnalysis
 from app.models.github_account import GithubAccount
 from app.models.invitation import WorkspaceInvitation
 from app.models.message import Message
 from app.models.message_attachment import MessageAttachment
 from app.models.notification import Notification
 from app.models.notification_preference import NotificationPreference
-from app.models.plugin import CapabilityGrant, Plugin, PluginInstallation
+from app.models.plugin import CapabilityGrant, Plugin, PluginInstallation, PluginLockEntry
 from app.models.plugin_error_report import PluginErrorReport
 from app.models.project import Project
 from app.models.project_chat_session import ProjectChatSession
@@ -29,6 +31,7 @@ from app.models.review_comment import ReviewComment
 from app.models.review_config import ReviewConfig
 from app.models.review_finding import ReviewFinding
 from app.models.stellar_security_finding import StellarSecurityFinding
+from app.models.usage_record import UsageRecord
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.workspace_member import WorkspaceMember
@@ -36,11 +39,13 @@ from app.models.workspace_settings import WorkspaceSettings
 
 __all__ = [
     "ActivityEvent",
+    "AnalyzedFile",
     "ApiKey",
     "AuditLog",
     "CapabilityGrant",
     "Conversation",
     "ConversationShare",
+    "FileAnalysis",
     "GithubAccount",
     "Message",
     "MessageAttachment",
@@ -49,6 +54,7 @@ __all__ = [
     "Plugin",
     "PluginErrorReport",
     "PluginInstallation",
+    "PluginLockEntry",
     "Project",
     "ProjectChatSession",
     "ProjectComment",
@@ -61,6 +67,7 @@ __all__ = [
     "ReviewConfig",
     "ReviewFinding",
     "StellarSecurityFinding",
+    "UsageRecord",
     "User",
     "Workspace",
     "WorkspaceInvitation",

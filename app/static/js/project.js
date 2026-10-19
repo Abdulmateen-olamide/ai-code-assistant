@@ -8,6 +8,7 @@
   var PROJECT_ID = null;
   var treeEl = document.getElementById("project-tree");
   var viewerEl = document.getElementById("file-viewer");
+  var currentFile = null;
   var breadcrumbsEl = document.getElementById("file-breadcrumbs");
   var currentPath = "";
   var chatMessagesEl = document.getElementById("project-chat-messages");
@@ -294,6 +295,7 @@
   function loadFile(path) {
     switchTab("files");
     setCurrentPath(path);
+    currentFile = null;
     viewerEl.innerHTML = '<p class="sidebar-empty">Loading file...</p>';
     api("/workspaces/api/projects/" + PROJECT_ID + "/file?path=" + encodeURIComponent(path))
       .then(function (data) {
@@ -313,16 +315,46 @@
             header + '<p class="repo-meta">This file is ' + reason + " — its contents are unavailable.</p>";
           return;
         }
+        currentFile = data;
         var codeClass = data.language ? ' class="language-' + escapeHtml(data.language) + '"' : "";
-        viewerEl.innerHTML =
-          header +
-          '<pre class="code-view"><code' + codeClass + ">" + escapeHtml(data.content) + "</code></pre>";
+        viewerEl.innerHTML = header + renderFileBody(data, "rendered");
         if (window.AICASyntaxHighlight) window.AICASyntaxHighlight.apply(viewerEl);
       })
       .catch(function (error) {
         viewerEl.innerHTML = '<p class="sidebar-empty">' + escapeHtml(error.message) + "</p>";
       });
   }
+
+  function renderFileBody(data, mode) {
+    var codeClass = data.language ? ' class="language-' + escapeHtml(data.language) + '"' : "";
+    if (mode === "raw") {
+      var lines = String(data.content == null ? "" : data.content).split("\n");
+      var rows = lines.map(function (line, index) {
+        return '<span class="code-line"><span class="code-line-number">' + (index + 1) +
+          '</span><span class="code-line-content">' + escapeHtml(line) + "</span></span>";
+      }).join("\n");
+      return '<pre class="code-view code-view-raw"><code' + codeClass + ">" + rows + "</code></pre>";
+    }
+    return '<pre class="code-view"><code' + codeClass + ">" + escapeHtml(data.content) + "</code></pre>";
+  }
+
+  function setFileView(mode) {
+    if (!currentFile) return;
+    var header = viewerEl.querySelector(".file-viewer-header");
+    viewerEl.innerHTML = (header ? header.outerHTML : "") + renderFileBody(currentFile, mode);
+    viewerEl.querySelectorAll(".file-view-toggle").forEach(function (button) {
+      button.classList.toggle("active", button.dataset.view === mode);
+    });
+    if (mode === "rendered" && window.AICASyntaxHighlight) {
+      window.AICASyntaxHighlight.apply(viewerEl);
+    }
+  }
+
+  document.addEventListener("click", function (event) {
+    var toggle = event.target.closest(".file-view-toggle");
+    if (!toggle) return;
+    setFileView(toggle.dataset.view);
+  });
 
   // ---------------------------------------------------------------- search
 
@@ -502,9 +534,12 @@
   // Pre-flight token/cost estimate (issue #104). Best-effort: failures clear
   // the hint rather than surfacing an error, so typing is never interrupted.
   function formatEstimate(estimate) {
+    if (window.AICACurrency && typeof window.AICACurrency.formatEstimate === "function") {
+      return window.AICACurrency.formatEstimate(estimate);
+    }
     var tokens = Number(estimate && estimate.prompt_tokens) || 0;
     var cost = Number(estimate && estimate.estimated_cost_usd) || 0;
-    return "Estimated: ~" + tokens.toLocaleString() + " tokens (~$" + cost.toFixed(4) + ")";
+    return "Estimated: ~" + tokens.toLocaleString() + " tokens (~$" + cost.toFixed(4) + " USD; estimate)";
   }
 
   var chatEstimateTimer = null;
@@ -735,7 +770,8 @@
     if (!output || reviewsLoaded) return;
     reviewsLoaded = true;
     api("/reviews/api/reviews?project_id=" + PROJECT_ID)
-      .then(function (reviews) {
+      .then(function (data) {
+        var reviews = (data && data.items) || [];
         if (!reviews.length) {
           output.innerHTML =
             '<p class="sidebar-empty">No reviews yet. Open the review runner to run one.</p>';

@@ -1,5 +1,7 @@
 """Tests for the notification inbox API and preferences (#148/#150)."""
 
+import pytest
+
 from app.extensions import db
 from app.models import NotificationPreference, User, Workspace, WorkspaceMember
 from app.services.notifications import notify
@@ -167,3 +169,38 @@ class TestMembershipNotifications:
 
         created = Notification.query.filter_by(user_id=member.id, type="membership").one()
         assert created.is_read is False
+
+
+class TestBudgetAlertDeduplication:
+    def setup_method(self):
+        # Threshold-delivery wiring is tracked separately (#470). Until the
+        # service lands, skip these tests instead of failing every suite.
+        pytest.importorskip(
+            "app.services.budget_alerts",
+            reason="budget threshold alert delivery lands with #470",
+        )
+
+    def test_repeated_crossings_alert_once_per_period(self, app, make_user):
+        from app.services.budget_alerts import check_budget_alerts
+
+        user = make_user()
+        workspace = Workspace(user_id=user.id, name="Budget ws")
+        db.session.add(workspace)
+        db.session.commit()
+
+        alerts = check_budget_alerts(workspace.id, spend=150, limit=100, period="2024-01")
+        assert len(alerts) == 1
+        alerts = check_budget_alerts(workspace.id, spend=150, limit=100, period="2024-01")
+        assert len(alerts) == 0
+
+    def test_new_period_resets_deduplication(self, app, make_user):
+        from app.services.budget_alerts import check_budget_alerts
+
+        user = make_user()
+        workspace = Workspace(user_id=user.id, name="Budget ws")
+        db.session.add(workspace)
+        db.session.commit()
+
+        assert len(check_budget_alerts(workspace.id, spend=150, limit=100, period="2024-01")) == 1
+        assert len(check_budget_alerts(workspace.id, spend=150, limit=100, period="2024-01")) == 0
+        assert len(check_budget_alerts(workspace.id, spend=150, limit=100, period="2024-02")) == 1

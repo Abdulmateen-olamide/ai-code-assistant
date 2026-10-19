@@ -98,8 +98,15 @@ class Config:
     LLM_CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "300"))
     LLM_CACHE_MAX_ENTRIES = int(os.getenv("LLM_CACHE_MAX_ENTRIES", "256"))
     # Pre-flight token/cost estimate (issue #104). The rate is only used to turn
-    # an estimated token count into a rough USD figure shown before sending.
+    # an estimated token count into a rough figure shown before sending.
     LLM_ESTIMATE_USD_PER_1K_TOKENS = float(os.getenv("LLM_ESTIMATE_USD_PER_1K_TOKENS", "0.002"))
+    # Display currency for every cost figure (issue #441). Defaults to USD; the
+    # code is always shown next to the symbol so a figure is never ambiguous.
+    # Operators that change the code are responsible for keeping the configured
+    # price/estimate rates in the same currency.
+    CURRENCY_CODE = os.getenv("CURRENCY_CODE", "USD")
+    CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "$")
+    CURRENCY_DECIMAL_PLACES = int(os.getenv("CURRENCY_DECIMAL_PLACES", "4"))
     # Structured chat audit logging (issue #17). ``CHAT_AUDIT_LOG_LEVEL`` may be
     # any logging level or OFF to disable.
     CHAT_AUDIT_LOG_ENABLED = os.getenv("CHAT_AUDIT_LOG_ENABLED", "1") == "1"
@@ -115,12 +122,25 @@ class Config:
     PLUGIN_TRUST_POLICY = os.getenv("PLUGIN_TRUST_POLICY", "if-present")
     PLUGIN_TRUSTED_KEYS = _trusted_plugin_keys()
 
+    # Operator-controlled catalog used by the remote-install endpoint (#389).
+    # Empty by default so remote installation is disabled until an operator
+    # points it at a vetted catalog file; the endpoint never accepts a
+    # client-supplied manifest or URL. See ``app/services/plugin_catalog.py``.
+    PLUGIN_CATALOG_FILE = os.getenv("PLUGIN_CATALOG_FILE", "")
+
     # Directory scanned by the read-only plugin discovery endpoint (#172).
     # Discovery only reads ``manifest.json`` files from plugin subdirectories
     # and never installs, loads, or mutates anything. Defaults to the repo's
     # ``plugins/`` directory; point it at a local directory to advertise
     # discoverable plugins.
     PLUGIN_DISCOVERY_DIR = os.getenv("PLUGIN_DISCOVERY_DIR", str(BASE_DIR / "plugins"))
+
+    # Plugin execution budget (#408). Event handlers and lifecycle hooks run in
+    # a daemon thread and are abandoned once they exceed this many seconds, so
+    # one slow plugin cannot stall a request. The timeout is recorded as a
+    # bounded error report and dispatch continues with the remaining handlers.
+    # Set to 0 (or negative) to disable the bound for local debugging.
+    PLUGIN_EXECUTION_TIMEOUT = float(os.getenv("PLUGIN_EXECUTION_TIMEOUT", "5"))
 
     # Plugin outbound network policy (#193). Every plugin-triggered request must
     # pass ``app.services.plugin_network``: it is https-only, denies
@@ -149,6 +169,20 @@ class Config:
     # Remaining core API quota at or below this value triggers the low-quota
     # warning on the GitHub dashboard (issue #77).
     GITHUB_LOW_QUOTA_THRESHOLD = int(os.getenv("GITHUB_LOW_QUOTA_THRESHOLD", "100"))
+
+    # GitHub GET responses are revalidated with their stored ETag
+    # (If-None-Match) instead of being re-downloaded; a 304 replays the cached
+    # body and preserves rate-limit quota (issue #76). Set
+    # GITHUB_RESPONSE_CACHE_ENABLED="0" to disable. Entries expire after
+    # GITHUB_RESPONSE_CACHE_TTL seconds, the store keeps at most
+    # GITHUB_RESPONSE_CACHE_MAX_ENTRIES entries (LRU), and a single body larger
+    # than GITHUB_RESPONSE_CACHE_MAX_BODY_BYTES is not cached at all.
+    GITHUB_RESPONSE_CACHE_ENABLED = os.getenv("GITHUB_RESPONSE_CACHE_ENABLED", "1") == "1"
+    GITHUB_RESPONSE_CACHE_TTL = int(os.getenv("GITHUB_RESPONSE_CACHE_TTL", "300"))
+    GITHUB_RESPONSE_CACHE_MAX_ENTRIES = int(os.getenv("GITHUB_RESPONSE_CACHE_MAX_ENTRIES", "256"))
+    GITHUB_RESPONSE_CACHE_MAX_BODY_BYTES = int(
+        os.getenv("GITHUB_RESPONSE_CACHE_MAX_BODY_BYTES", str(512 * 1024))
+    )
 
     # Project workspaces (Phase 5): limits that protect the server from being
     # overwhelmed by large or malicious project imports. Archives are validated
@@ -224,6 +258,12 @@ class Config:
     # tight per-user limit of its own.
     RATE_LIMIT_EXPORT_MAX = int(os.getenv("RATE_LIMIT_EXPORT_MAX", "10"))
     RATE_LIMIT_EXPORT_WINDOW = int(os.getenv("RATE_LIMIT_EXPORT_WINDOW", "3600"))
+    # Per-user rate limit for AI-powered endpoints (#28): project chat,
+    # conversation streaming, and the code tools. Applies per authenticated user
+    # (not per IP) and can be switched off entirely (the testing config does).
+    RATE_LIMIT_AI_PER_MINUTE = int(os.getenv("RATE_LIMIT_AI_PER_MINUTE", "60"))
+    RATE_LIMIT_AI_WINDOW = int(os.getenv("RATE_LIMIT_AI_WINDOW", "60"))
+    RATE_LIMIT_AI_ENABLED = True
     # Optional SMTP for invitation email delivery. When unset, invitations are
     # delivered as in-app notifications only and the app never crashes on mail.
     SMTP_HOST = os.getenv("SMTP_HOST", "")
@@ -276,6 +316,9 @@ class TestingConfig(Config):
     SQLALCHEMY_DATABASE_URI = os.getenv("TEST_DATABASE_URL", "sqlite:///:memory:")
     # Run import jobs inline so tests can assert final status deterministically.
     IMPORT_JOBS_ASYNC = False
+    # No per-user AI rate limiting in tests: assertions must not depend on the
+    # number of requests a test happens to make.
+    RATE_LIMIT_AI_ENABLED = False
     # In-memory SQLite needs a single shared connection, and ``check_same_thread``
     # is a SQLite-only connect arg. A PostgreSQL test database (issue #20) must
     # not receive either, or the driver rejects the DSN outright.

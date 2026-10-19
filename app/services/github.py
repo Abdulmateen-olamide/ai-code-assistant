@@ -28,6 +28,12 @@ from app.config import Config
 from app.extensions import db
 from app.models import GithubAccount
 from app.services.crypto import decrypt_secret
+from app.services.github_cache import (
+    CachedSession,
+    GitHubResponseCache,
+    auth_fingerprint,
+    get_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +143,7 @@ class GitHubInvalidError(GitHubError):
 ERROR_MESSAGES = {
     "not_connected": "Connect your GitHub account to use this feature.",
     "auth": "Your GitHub connection is no longer valid. Reconnect your account.",
+    "cancelled": "GitHub connection was cancelled. You can retry whenever you're ready.",
     "permission": "GitHub denied access to this resource.",
     "not_found": "The requested GitHub resource was not found.",
     "rate_limit": "GitHub API rate limit reached. Please try again later.",
@@ -144,6 +151,20 @@ ERROR_MESSAGES = {
     "validation": "The GitHub request was invalid.",
     "github_error": "The GitHub request failed. Please try again.",
 }
+
+
+def is_access_denied(error: str | None) -> bool:
+    """Return ``True`` when GitHub reports the user denied the OAuth consent.
+
+    GitHub sends ``error=access_denied`` on the callback when the user clicks
+    "Cancel" on the consent screen. That is a user cancellation, not a
+    failure, so callers should treat it as such (issue: OAuth denial page).
+    """
+    return (error or "").strip().lower() == "access_denied"
+
+
+class GitHubCancelledError(GitHubError):
+    kind = "cancelled"
 
 
 def github_error_message(exc: GitHubError) -> str:
@@ -173,12 +194,26 @@ def _parse_error_body(response: requests.Response) -> str:
     return f"HTTP {response.status_code}"
 
 
+def compare_refs(client: GitHubClient, full_name: str, base: str, head: str) -> dict:
+    """Compare two refs on GitHub and return the diff summary.
+
+    Convenience wrapper around :meth:`GitHubClient.compare_refs` so callers
+    that already hold a client instance can use either form. ``base`` and
+    ``head`` are plain refs (branch names, tags, or SHAs) and are joined as
+    ``base...head`` for the REST comparison endpoint.
+    """
+    return client.compare_refs(full_name, base, head)
+
+
 class GitHubClient:
     """Authenticated client for the GitHub REST API.
 
     Provides bounded retry behaviour: transient failures (network errors and
     HTTP 5xx) are retried with exponential backoff, and rate-limit responses
     (429 or 403 with exhausted quota) pause until the documented reset time.
+
+    ``GET`` responses are also revalidated with GitHub's ``ETag`` via a bounded
+    in-memory cache (issue #76); see :mod:`app.services.github_cache`.
     """
 
     def __init__(
@@ -188,10 +223,14 @@ class GitHubClient:
         api_url: str | None = None,
         timeout: int | None = None,
         max_retries: int = 3,
+        cache: GitHubResponseCache | None = None,
     ) -> None:
         self.api_url = (api_url or Config.GITHUB_API_URL).rstrip("/")
         self.timeout = timeout or Config.GITHUB_REQUEST_TIMEOUT
         self.max_retries = max_retries
+        #: Scopes GitHub reports as actually granted (``X-OAuth-Scopes``).
+        #: Display-only hint; never used to make an authorization decision.
+        self._granted_scopes: list[str] = []
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -200,6 +239,15 @@ class GitHubClient:
                 "X-GitHub-Api-Version": API_VERSION,
             }
         )
+        # Revalidate GETs with If-None-Match so listings, trees, and READMEs are
+        # not re-downloaded on every page load (issue #76). Keying on a
+        # fingerprint of this token keeps one account's cached responses from ever
+        # being replayed for another.
+        self.response_cache = cache if cache is not None else get_cache()
+        if self.response_cache.enabled:
+            self.session = CachedSession(
+                self.session, self.response_cache, auth_fingerprint(access_token)
+            )
 
     # -- Core request machinery --------------------------------------------
 
@@ -219,6 +267,8 @@ class GitHubClient:
                 raise GitHubNetworkError(
                     "Could not reach the GitHub API. Please try again.", detail=str(exc)
                 ) from exc
+
+            self._capture_scopes(response)
 
             if response.status_code == 404:
                 raise GitHubNotFoundError("The requested GitHub resource was not found.")
@@ -266,6 +316,22 @@ class GitHubClient:
         raise GitHubNetworkError(
             "Could not reach the GitHub API. Please try again.", detail=str(last_exc)
         )
+
+    def _capture_scopes(self, response: requests.Response) -> None:
+        """Record the granted OAuth scopes GitHub reports (issue #57).
+
+        GitHub returns the scopes the token actually holds in the
+        ``X-OAuth-Scopes`` response header. The value is a display hint only;
+        it is never used to make an authorization decision.
+        """
+        header = response.headers.get("X-OAuth-Scopes")
+        if header is not None:
+            self._granted_scopes = [scope.strip() for scope in header.split(",") if scope.strip()]
+
+    @property
+    def granted_scopes(self) -> list[str]:
+        """Scopes GitHub actually granted, as reported by ``X-OAuth-Scopes``."""
+        return list(self._granted_scopes)
 
     def _get(self, path: str, *, params: dict | None = None) -> dict | list:
         return self._request("GET", path, params=params)
@@ -356,6 +422,23 @@ class GitHubClient:
     def get_user(self) -> dict:
         return self._get("/user")
 
+    def get_granted_scopes(self) -> list[str]:
+        """Return the OAuth scopes GitHub actually granted this token (issue #57).
+
+        GitHub reports the granted scopes in the ``X-OAuth-Scopes`` response
+        header of an authenticated request (the token exchange response also
+        carries them, but the header reflects the token's *current* grants).
+        The result is informational only: it is never used to make
+        authorization decisions, which always depend on the token itself.
+        """
+        response = self.session.get(f"{self.api_url}/user", timeout=self.timeout)
+        if response.status_code >= 400:
+            # Re-issue through _request so failures become the typed errors the
+            # rest of the app expects (auth, rate limit, not found, ...).
+            self._request("GET", "/user")
+        raw = response.headers.get("X-OAuth-Scopes", "")
+        return [scope.strip() for scope in raw.split(",") if scope.strip()]
+
     def get_rate_limit(self) -> dict | None:
         """Return the caller's core rate-limit budget, or ``None`` if unknown.
 
@@ -396,6 +479,23 @@ class GitHubClient:
 
     def get_repository(self, full_name: str) -> dict:
         return self._get(f"/repos/{full_name}")
+
+    def get_public_repository(self, full_name: str) -> dict:
+        """Fetch a repository by ``owner/name`` respecting GitHub permissions.
+
+        Works for any public repository and for private repositories the
+        authenticated user can access. GitHub returns 404 for repositories the
+        token cannot see (including private ones), which is translated into a
+        clear permission error so the caller can tell the user access was
+        denied rather than the repo not existing.
+        """
+        name = validate_full_name(full_name)
+        try:
+            return self._get(f"/repos/{name}")
+        except GitHubNotFoundError as exc:
+            raise GitHubPermissionError(
+                "GitHub denied access to this resource.", detail=str(exc)
+            ) from exc
 
     def list_branches(self, full_name: str) -> list[dict]:
         return self._get_paginated(f"/repos/{full_name}/branches")
@@ -532,6 +632,15 @@ class GitHubClient:
     def get_commit(self, full_name: str, sha: str) -> dict:
         return self._get(f"/repos/{full_name}/commits/{sha}")
 
+    def compare_refs(self, full_name: str, base: str, head: str) -> dict:
+        """Return GitHub's comparison of ``base`` against ``head``.
+
+        The GitHub compare endpoint returns an envelope containing ``status``,
+        ``ahead_by``/``behind_by``, ``commits``, and the changed ``files``
+        (each with ``additions``/``deletions``/``patch``).
+        """
+        return self._get(f"/repos/{full_name}/compare/{base}...{head}")
+
     def _graphql(self, query: str, variables: dict) -> dict:
         """Execute a GraphQL query against the GitHub GraphQL API."""
         url = f"{self.api_url}/graphql"
@@ -619,6 +728,9 @@ class GitHubClient:
         full_name: str,
         *,
         state: str = "open",
+        labels: str | None = None,
+        assignee: str | None = None,
+        search: str | None = None,
         page: int = 1,
         per_page: int = PAGE_SIZE_DEFAULT,
     ) -> GitHubPage:
@@ -628,9 +740,16 @@ class GitHubClient:
         filtered; the returned navigation metadata still reflects GitHub's own
         paging links for the endpoint.
         """
+        params: dict = {"state": state}
+        if labels:
+            params["labels"] = labels
+        if assignee:
+            params["assignee"] = assignee
+        if search:
+            params["q"] = search
         result = self._get_page(
             f"/repos/{full_name}/issues",
-            params={"state": state},
+            params=params,
             page=page,
             per_page=per_page,
         )
@@ -822,6 +941,25 @@ def validate_full_name(full_name: str) -> str:
     return name
 
 
+def lookup_repository(user, full_name: str) -> dict:
+    """Look up an arbitrary public repository by ``owner/name`` (issue #78).
+
+    Returns the normalized repository payload. Access is decided entirely by
+    GitHub's own permission model: the user's token is used for the request, so
+    private repositories the user cannot see come back as a permission error and
+    the token never grants access beyond what GitHub already allows.
+    """
+    name = validate_full_name(full_name)
+    client = get_github_client(user)
+    try:
+        repo = client.get_repository(name)
+    except GitHubNotFoundError as exc:
+        raise GitHubPermissionError(
+            "GitHub denied access to this resource.", detail=str(exc)
+        ) from exc
+    return repo_payload(repo)
+
+
 def validate_path(path: str) -> str:
     """Validate a repository-relative file path against path traversal.
 
@@ -838,6 +976,11 @@ def validate_path(path: str) -> str:
 
 def revoke_github_token(access_token: str) -> None:
     """Best-effort revocation of a GitHub OAuth token."""
+    # Drop any responses cached under this token first, so a disconnected
+    # account's private repository data does not linger in process memory (#76).
+    # Done unconditionally: the local account is being disconnected regardless of
+    # whether the upstream DELETE succeeds.
+    get_cache().invalidate_auth(auth_fingerprint(access_token))
     try:
         response = requests.delete(
             GITHUB_REVOKE_URL.format(client_id=_github_config("GITHUB_CLIENT_ID")),

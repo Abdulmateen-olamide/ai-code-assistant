@@ -14,6 +14,7 @@ import pytest
 
 from app.services.plugin_deps import (
     DependencyResolver,
+    PluginDependencyConflictError,
     PluginDependencyCycleError,
     PluginDependencyDisabledError,
     PluginDependencyNotFoundError,
@@ -191,6 +192,70 @@ class TestPluginDependencies:
 
 
 # ---------------------------------------------------------------------------
+# Resolver-level: unsatisfiable version ranges across the graph
+# ---------------------------------------------------------------------------
+
+
+class TestVersionConflicts:
+    def test_direct_conflict_between_two_requirements(self):
+        plugins = {"shared": _ref("shared", version="1.5.0")}
+        with pytest.raises(PluginDependencyConflictError) as excinfo:
+            _resolver(plugins).resolve(_ref("plugin-a", dependencies=["shared>=2", "shared<2"]))
+
+        assert excinfo.value.plugin_id == "plugin-a"
+        assert "version conflict" in excinfo.value.message
+        assert "shared>=2" in excinfo.value.message
+        assert "shared<2" in excinfo.value.message
+        assert "path: plugin-a" in excinfo.value.message
+
+    def test_transitive_conflict_reports_both_paths(self):
+        plugins = {
+            "shared": _ref("shared", version="1.5.0"),
+            "plugin-b": _ref("plugin-b", dependencies=["shared>=2"]),
+            "plugin-c": _ref("plugin-c", dependencies=["shared<2"]),
+        }
+        with pytest.raises(PluginDependencyConflictError) as excinfo:
+            _resolver(plugins).resolve(_ref("plugin-a", dependencies=["plugin-b", "plugin-c"]))
+
+        message = excinfo.value.message
+        assert "version conflict for 'shared'" in message
+        assert "path: plugin-a -> plugin-b" in message
+        assert "path: plugin-a -> plugin-c" in message
+
+    def test_transitive_package_conflict_is_detected(self):
+        plugins = {
+            "plugin-b": _ref("plugin-b", dependencies=["shared-pkg>=2"]),
+            "plugin-c": _ref("plugin-c", dependencies=["shared-pkg<2"]),
+        }
+        resolver = _resolver(plugins, installed={"shared-pkg": "1.5.0"})
+        with pytest.raises(PluginDependencyConflictError) as excinfo:
+            resolver.resolve(_ref("plugin-a", dependencies=["plugin-b", "plugin-c"]))
+
+        assert "version conflict for 'shared-pkg'" in excinfo.value.message
+
+    def test_wildcard_pins_that_do_not_overlap_conflict(self):
+        plugins = {"shared": _ref("shared", version="1.5.0")}
+        with pytest.raises(PluginDependencyConflictError):
+            _resolver(plugins).resolve(
+                _ref("plugin-a", dependencies=["shared==1.*", "shared==2.*"])
+            )
+
+    def test_overlapping_ranges_do_not_conflict(self):
+        plugins = {"shared": _ref("shared", version="1.8.0")}
+        _resolver(plugins).resolve(
+            _ref("plugin-a", dependencies=["shared>=1,<3", "shared>=1.5,<2"])
+        )
+
+    def test_compatible_requirements_on_the_same_dependency_resolve(self):
+        plugins = {
+            "shared": _ref("shared", version="1.8.0"),
+            "plugin-b": _ref("plugin-b", dependencies=["shared>=1"]),
+            "plugin-c": _ref("plugin-c", dependencies=["shared<2"]),
+        }
+        _resolver(plugins).resolve(_ref("plugin-a", dependencies=["plugin-b", "plugin-c"]))
+
+
+# ---------------------------------------------------------------------------
 # Resolver-level: cycles
 # ---------------------------------------------------------------------------
 
@@ -304,3 +369,20 @@ class TestRegistryEnableGuard:
         registry.register(plugin)
         registry.enable("plugin-a")  # must not re-resolve or raise
         assert plugin.enabled is True
+
+    def test_enable_refused_for_version_conflict(self):
+        registry = PluginRegistry()
+        registry.register(_registry_plugin("shared", version="1.5.0"))
+        registry.register(_registry_plugin("plugin-b", dependencies=["shared>=2"]))
+        registry.register(_registry_plugin("plugin-c", dependencies=["shared<2"]))
+        plugin_a = _registry_plugin(
+            "plugin-a", dependencies=["plugin-b", "plugin-c"], enabled=False
+        )
+        registry.register(plugin_a)
+
+        with pytest.raises(PluginDependencyResolutionError) as excinfo:
+            registry.enable("plugin-a")
+
+        assert "version conflict" in str(excinfo.value)
+        assert "plugin-a -> plugin-b" in str(excinfo.value)
+        assert plugin_a.enabled is False

@@ -13,6 +13,8 @@
   var conversationUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   var listEl = document.getElementById("conversation-list");
   var searchEl = document.getElementById("conversation-search");
+  var workspaceSelectEl = document.getElementById("workspace-select");
+  var newWorkspaceBtn = document.getElementById("new-workspace");
   var actionsEl = document.getElementById("conversation-actions");
   var currentId = null;
   var streaming = false;
@@ -170,6 +172,46 @@
     return el;
   }
 
+  // Blinking cursor appended to the in-progress assistant bubble while tokens
+  // stream in, so the user sees the reply is still being generated.
+  function addStreamingCursor(container) {
+    if (!container) return null;
+    var cursor = document.createElement("span");
+    cursor.className = "streaming-cursor";
+    cursor.setAttribute("aria-hidden", "true");
+    cursor.textContent = "\u258c";
+    container.appendChild(cursor);
+    return cursor;
+  }
+
+  function removeStreamingCursor(container) {
+    if (!container) return;
+    var cursor = container.querySelector(".streaming-cursor");
+    if (cursor && cursor.parentNode) cursor.parentNode.removeChild(cursor);
+  }
+
+  // Mark the sidebar entry for the active conversation with a subtle status
+  // while its reply is streaming, and clear it when generation ends.
+  function setConversationStatus(id, status) {
+    if (!listEl || id === null || id === undefined) return;
+    var item = listEl.querySelector('.conversation-item[data-id="' + id + '"]');
+    if (!item) return;
+    var meta = item.querySelector(".conversation-meta");
+    if (!meta) return;
+    var badge = meta.querySelector(".conversation-status");
+    if (status) {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "conversation-status";
+        badge.setAttribute("aria-label", "Generating response");
+        meta.appendChild(badge);
+      }
+      badge.textContent = "\u2026";
+    } else if (badge && badge.parentNode) {
+      badge.parentNode.removeChild(badge);
+    }
+  }
+
   function isNearBottom() {
     if (!messagesEl) return true;
     return (
@@ -303,6 +345,7 @@
     setActiveItem(id);
     messagesEl.innerHTML = "";
     actionsEl.hidden = false;
+    loadShareLinks(id);
     return api("/chat/conversations/" + id)
       .then(function (data) {
         data.messages.forEach(function (message) {
@@ -316,6 +359,7 @@
             '<div class="chat-placeholder"><p>Ask the AI assistant for help with your code.</p></div>';
         }
         applySettingsToPanel(data);
+        syncWorkspaceSelect(data.workspace_id);
         clearComposerError();
         autoGrowComposer();
         inputEl.focus();
@@ -323,6 +367,27 @@
       .catch(function (error) {
         flashError(error.message);
       });
+  }
+
+  function loadShareLinks(id) {
+    var container = document.getElementById("share-links-list");
+    if (!container) return;
+    container.innerHTML = "";
+    api("/chat/conversations/" + id + "/share-links").then(function (links) {
+      links.forEach(function (link) {
+        var row = document.createElement("p");
+        var expiry = document.createElement("span");
+        expiry.textContent = "Read-only link expires " + new Date(link.expires_at).toLocaleString() + " ";
+        var revoke = document.createElement("button");
+        revoke.type = "button";
+        revoke.className = "btn btn-ghost btn-sm";
+        revoke.textContent = "Revoke";
+        revoke.dataset.revokeShareLinkId = link.id;
+        row.appendChild(expiry);
+        row.appendChild(revoke);
+        container.appendChild(row);
+      });
+    }).catch(function (error) { flashError(error.message); });
   }
 
   function newConversation() {
@@ -378,6 +443,17 @@
     }
   }
 
+  // Disable composer controls while a reply is being generated so a second
+  // submission cannot start a duplicate stream.
+  function setControlsDisabled(disabled) {
+    if (inputEl) inputEl.disabled = disabled;
+    if (attachBtn) attachBtn.disabled = disabled;
+    if (providerEl) providerEl.disabled = disabled;
+    if (modelEl) modelEl.disabled = disabled;
+    if (tempEl) tempEl.disabled = disabled;
+    if (systemEl) systemEl.disabled = disabled;
+  }
+
   function stopStream() {
     if (!streaming || !currentController) return;
     // Stay in-flight until the abort resolves so a fast double-click cannot
@@ -389,10 +465,14 @@
 
   async function ensureConversation() {
     if (currentId !== null) return currentId;
+    var payload = collectSettings();
+    // File the new conversation under the workspace currently selected in the
+    // sidebar. "all" means no workspace, which the server stores as NULL.
+    payload.workspace_id = selectedWorkspaceId();
     var created = await api("/chat/conversations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(collectSettings()),
+      body: JSON.stringify(payload),
     });
     addListItem(created);
     currentId = created.id;
@@ -489,6 +569,8 @@
     cancelRequested = false;
     currentController = new AbortController();
     setComposerState("streaming");
+    setControlsDisabled(true);
+    setConversationStatus(currentId, true);
     addMessage("user", content || "(image attached)", attachments);
 
     var typing = addTypingIndicator();
@@ -529,6 +611,7 @@
       streamBody.className = "message-body";
       typing.appendChild(streamBody);
       streamBody.textContent = "";
+      var streamingCursor = addStreamingCursor(streamBody);
 
       var reader = response.body.getReader();
       var decoder = new TextDecoder();
@@ -553,6 +636,7 @@
           if (payload.type === "token") {
             fullText += payload.content;
             streamBody.innerHTML = renderMarkdown(fullText);
+            addStreamingCursor(streamBody);
             maybeScrollToBottom();
           } else if (payload.type === "error") {
             flashError(payload.error);
@@ -590,8 +674,10 @@
         flashInfo(cancelRequested ? "Generation stopped." : "Stream aborted.");
       } else {
         flashError(error.message);
+        showStreamRetry(error);
       }
     } finally {
+      removeStreamingCursor(typing);
       typing.classList.remove("typing", "streaming");
       var finalBody = typing.querySelector(".message-body");
       if (finalBody && finalBody.textContent) {
@@ -605,9 +691,91 @@
       cancelRequested = false;
       streaming = false;
       setComposerState("idle");
+      setControlsDisabled(false);
+      setConversationStatus(currentId, false);
       sendBtn.disabled = !!(onboardingEl && !onboardingEl.hidden);
       inputEl.focus();
     }
+  }
+
+  // Visible retry affordance when the SSE stream drops, so the user is not
+  // left with a silently truncated reply.
+  function showStreamRetry(error) {
+    var el = document.createElement("div");
+    el.className = "flash flash-error stream-retry";
+    el.appendChild(
+      document.createTextNode(
+        (error && error.message) || "The response stream was interrupted."
+      )
+    );
+    el.appendChild(document.createTextNode(" "));
+    var retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn btn-ghost btn-sm";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", function () {
+      if (el.parentNode) el.parentNode.removeChild(el);
+      startStream();
+    });
+    el.appendChild(retry);
+    messagesEl.prepend(el);
+  }
+
+  // "all" is the sentinel meaning "no workspace"; it is also what the server
+  // expects for an unscoped request.
+  function selectedWorkspaceId() {
+    return workspaceSelectEl && workspaceSelectEl.value ? workspaceSelectEl.value : "all";
+  }
+
+  // Point the selector at the workspace an opened conversation is filed under.
+  // An unknown id (a shared-in conversation belonging to somebody else's
+  // workspace) leaves the current selection untouched rather than blanking it.
+  function syncWorkspaceSelect(workspaceId) {
+    if (!workspaceSelectEl) return;
+    if (workspaceId === null || workspaceId === undefined) {
+      workspaceSelectEl.value = "all";
+      return;
+    }
+    var match = Array.prototype.some.call(workspaceSelectEl.options, function (option) {
+      return option.value === String(workspaceId);
+    });
+    if (match) workspaceSelectEl.value = String(workspaceId);
+  }
+
+  function appendWorkspaceOption(workspace) {
+    if (!workspaceSelectEl) return;
+    var option = document.createElement("option");
+    option.value = String(workspace.id);
+    option.textContent = workspace.name;
+    workspaceSelectEl.appendChild(option);
+  }
+
+  // Create a workspace inline and scope the sidebar to it. The name is trimmed
+  // and the server enforces the 200-character column limit, so a blank or
+  // oversized name is rejected before anything is stored.
+  async function createWorkspace() {
+    var name = window.prompt("Workspace name");
+    if (name === null) return;
+    name = name.trim();
+    if (!name) {
+      flashError("A workspace name is required.");
+      return;
+    }
+    var created;
+    try {
+      created = await api("/workspaces/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name }),
+      });
+    } catch (error) {
+      flashError(error.message);
+      return;
+    }
+    appendWorkspaceOption(created);
+    if (workspaceSelectEl) workspaceSelectEl.value = String(created.id);
+    newConversation();
+    refreshList();
   }
 
   function addListItem(conversation) {
@@ -629,9 +797,62 @@
     updateTimestamps(li);
   }
 
+  function addHighlightedSnippet(parent, match) {
+    var snippet = match.snippet || {};
+    var item = document.createElement("div");
+    item.className = "conversation-search-match";
+    item.dataset.messageId = match.message_id;
+
+    var role = document.createElement("span");
+    role.className = "conversation-search-role";
+    role.textContent = match.role === "assistant" ? "Assistant" : "You";
+    item.appendChild(role);
+
+    item.appendChild(document.createTextNode(snippet.before || ""));
+    var highlighted = document.createElement("mark");
+    highlighted.textContent = snippet.match || "";
+    item.appendChild(highlighted);
+    item.appendChild(document.createTextNode(snippet.after || ""));
+    parent.appendChild(item);
+  }
+
+  function addSearchResult(result) {
+    var li = document.createElement("li");
+    li.className = "conversation-item conversation-search-result";
+    li.dataset.id = result.conversation_id;
+    li.dataset.title = result.title || "Untitled conversation";
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.setAttribute("aria-label", "Open conversation: " + li.dataset.title);
+
+    var title = document.createElement("span");
+    title.className = "conversation-title";
+    title.textContent = li.dataset.title;
+    li.appendChild(title);
+
+    var matches = document.createElement("div");
+    matches.className = "conversation-search-matches";
+    (result.matches || []).forEach(function (match) {
+      addHighlightedSnippet(matches, match);
+    });
+    if (!result.matches || result.matches.length === 0) {
+      var titleMatch = document.createElement("span");
+      titleMatch.className = "conversation-search-title-match";
+      titleMatch.textContent = "Title match";
+      matches.appendChild(titleMatch);
+    }
+    li.appendChild(matches);
+    listEl.appendChild(li);
+  }
+
   function refreshList() {
     var query = searchEl ? searchEl.value.trim() : "";
-    api("/chat/conversations" + (query ? "?q=" + encodeURIComponent(query) : ""))
+    var params = new URLSearchParams();
+    if (query) params.set("q", query);
+    // Scope the sidebar to the selected workspace. "all" is the default and is
+    // sent explicitly so the server treats it as "no filter" too.
+    params.set("workspace_id", selectedWorkspaceId());
+    api("/chat/conversations?" + params.toString())
       .then(function (items) {
         listEl.innerHTML = "";
         items.forEach(addListItem);
@@ -901,6 +1122,17 @@
 
     document.getElementById("new-conversation").addEventListener("click", newConversation);
 
+    if (workspaceSelectEl) {
+      // Changing the workspace re-scopes the sidebar to that project folder.
+      workspaceSelectEl.addEventListener("change", function () {
+        newConversation();
+        refreshList();
+      });
+    }
+    if (newWorkspaceBtn) {
+      newWorkspaceBtn.addEventListener("click", createWorkspace);
+    }
+
     if (providerEl) {
       providerEl.addEventListener("change", function () {
         renderModelSelect("");
@@ -940,6 +1172,29 @@
       var id = currentId;
       var button = event.target.closest("button");
       if (!button || id === null) return;
+      if (button.dataset.revokeShareLinkId) {
+        api("/chat/conversations/" + id + "/share-links/" + button.dataset.revokeShareLinkId, {
+          method: "DELETE",
+        }).then(function () { loadShareLinks(id); }).catch(function (error) { flashError(error.message); });
+        return;
+      }
+      if (button.id === "create-share-link") {
+        api("/chat/conversations/" + id + "/share-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }).then(function (share) {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(share.url).catch(function () {
+              window.prompt("Copy this read-only link:", share.url);
+            });
+          } else {
+            window.prompt("Copy this read-only link:", share.url);
+          }
+          loadShareLinks(id);
+        }).catch(function (error) { flashError(error.message); });
+        return;
+      }
       if (button.id === "rename-conversation") {
         var title = prompt("Rename conversation:", "");
         if (title === null) return;
@@ -991,4 +1246,15 @@
       }
     });
   });
+
+  // Test seam: expose the pure client helpers so the frontend unit tests can
+  // exercise them under jsdom without a browser. This is deliberately small and
+  // additive - it does not change any runtime behaviour.
+  window.AICA = {
+    escapeHtml: escapeHtml,
+    formatRelativeTime: formatRelativeTime,
+    renderMarkdown: renderMarkdown,
+    isNearBottom: isNearBottom,
+    getCsrf: getCsrf,
+  };
 })();

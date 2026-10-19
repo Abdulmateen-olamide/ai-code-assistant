@@ -28,13 +28,17 @@ store a plugin came from.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import metadata
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
+
+from app.services.plugin_versions import InvalidPluginVersionError, parse_version
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,10 @@ class PluginDependencyUnparsableError(PluginDependencyError):
     """Raised when a declared dependency is not a valid PEP 508 requirement."""
 
 
+class PluginDependencyConflictError(PluginDependencyError):
+    """Raised when no single version can satisfy the resolved graph's ranges."""
+
+
 @dataclass(frozen=True)
 class PluginRef:
     """Normalized plugin record consumed by the resolver.
@@ -93,6 +101,56 @@ PluginProvider = Callable[[str], PluginRef | None]
 PackageVersion = Callable[[str], str]
 
 
+def _candidate_versions(specifier_sets) -> set[Version]:
+    """Return boundary versions worth probing for a satisfiable intersection.
+
+    PEP 440 does not expose set intersection directly, so conflicts are detected
+    by probing the versions named in the constraints (plus the versions either
+    side of every boundary). For ordinary ranges this is exact: if none of the
+    probes satisfies every specifier, no version can.
+    """
+    candidates = {Version("0"), Version("1")}
+    for specifier_set in specifier_sets:
+        for specifier in specifier_set:
+            raw = specifier.version
+            base = raw[:-2] if raw.endswith(".*") else raw
+            try:
+                version = Version(base)
+            except InvalidVersion:
+                continue
+            candidates.add(version)
+            for suffix in (".post0.dev0", ".post0", ".post1", ".dev0"):
+                with contextlib.suppress(InvalidVersion):
+                    candidates.add(Version(f"{base}{suffix}"))
+            release = version.release
+            for index in range(len(release)):
+                higher = (
+                    *release[:index],
+                    release[index] + 1,
+                    *(0 for _ in release[index + 1 :]),
+                )
+                candidates.add(Version(".".join(str(part) for part in higher)))
+                if release[index] > 0:
+                    lower = (
+                        *release[:index],
+                        release[index] - 1,
+                        *(0 for _ in release[index + 1 :]),
+                    )
+                    candidates.add(Version(".".join(str(part) for part in lower)))
+    return candidates
+
+
+def _specifiers_conflict(specifier_sets) -> bool:
+    """Return ``True`` when the specifier sets share no satisfying version."""
+    constrained = [specifier_set for specifier_set in specifier_sets if specifier_set]
+    if len(constrained) < 2:
+        return False
+    return not any(
+        all(specifier_set.contains(candidate, prereleases=True) for specifier_set in constrained)
+        for candidate in _candidate_versions(constrained)
+    )
+
+
 class DependencyResolver:
     """Resolve and validate a plugin's declared dependencies.
 
@@ -115,19 +173,70 @@ class DependencyResolver:
         """Verify ``plugin`` and all of its transitive dependencies.
 
         Raises a :class:`PluginDependencyError` subclass when any required
-        dependency is missing, disabled, version-incompatible, or cyclic. The
-        plugin's state is never modified here; callers decide how to react.
+        dependency is missing, disabled, version-incompatible, or cyclic. When
+        two paths in the graph constrain the same dependency to disjoint
+        ranges, :class:`PluginDependencyConflictError` names both paths so the
+        install can be refused before anything changes. The plugin's state is
+        never modified here; callers decide how to react.
         """
-        self._check_plugin(plugin, ())
+        constraints: dict[str, list[tuple[Requirement, tuple[str, ...]]]] = {}
+        failures: list[tuple[str, Requirement, str]] = []
+        self._check_plugin(plugin, (), constraints, failures)
+        if failures:
+            root_id, requirement, installed = failures[0]
+            raise PluginDependencyVersionError(
+                root_id,
+                f"dependency '{requirement}' is not satisfied by "
+                f"installed version {installed}.",
+            )
         logger.debug("Plugin dependencies resolved for %s", plugin.id)
 
     # ---------------- internals ----------------
 
-    def _check_plugin(self, plugin: PluginRef, visiting: tuple[str, ...]) -> None:
+    def _register_constraint(
+        self,
+        constraints: dict[str, list[tuple[Requirement, tuple[str, ...]]]],
+        requirement: Requirement,
+        path: tuple[str, ...],
+    ) -> None:
+        """Record a version constraint and reject a disjoint intersection.
+
+        ``path`` is the chain of plugin ids from the requested root to the
+        plugin that declared this requirement, so a conflict can report exactly
+        which paths disagree.
+        """
+        if not requirement.specifier:
+            return
+        key = canonicalize_name(requirement.name)
+        entries = constraints.setdefault(key, [])
+        entries.append((requirement, path))
+        if len(entries) < 2:
+            return
+        if not _specifiers_conflict([entry[0].specifier for entry in entries]):
+            return
+        details = "; ".join(
+            f"{entry_path[-1]} requires '{entry_requirement}' " f"(path: {' -> '.join(entry_path)})"
+            for entry_requirement, entry_path in entries
+        )
+        raise PluginDependencyConflictError(
+            path[0],
+            f"version conflict for '{requirement.name}': {details}",
+        )
+
+    def _check_plugin(
+        self,
+        plugin: PluginRef,
+        visiting: tuple[str, ...],
+        constraints: dict[str, list[tuple[Requirement, tuple[str, ...]]]],
+        failures: list[tuple[str, Requirement, str]],
+    ) -> None:
         """Recursively validate ``plugin``'s dependencies.
 
         ``visiting`` holds the plugin ids on the current path from the root
         (used for cycle detection); a tuple keeps it immutable and cheap.
+        Version mismatches are collected and reported after the whole graph has
+        been walked, so a conflict between two branches is reported as a
+        conflict rather than as whichever branch happened to fail first.
         """
         if plugin.id in visiting:
             cycle = (*visiting, plugin.id)
@@ -136,7 +245,7 @@ class DependencyResolver:
                 "dependency cycle detected: " + " -> ".join(cycle),
             )
 
-        visiting = (*visiting, plugin.id)
+        path = (*visiting, plugin.id)
         for raw in plugin.dependencies:
             try:
                 requirement = Requirement(raw.strip())
@@ -149,11 +258,14 @@ class DependencyResolver:
                 # Environment markers (e.g. ``sys_platform == "win32"``) that do
                 # not apply to this environment are ignored.
                 continue
+            self._register_constraint(constraints, requirement, path)
             dependency = self._plugin_provider(requirement.name)
             if dependency is not None:
-                self._check_plugin_dependency(plugin.id, requirement, dependency, visiting)
+                self._check_plugin_dependency(
+                    path[0], requirement, dependency, path, constraints, failures
+                )
             else:
-                self._check_package_dependency(plugin.id, requirement)
+                self._check_package_dependency(path[0], requirement, failures)
 
     def _check_plugin_dependency(
         self,
@@ -161,6 +273,8 @@ class DependencyResolver:
         requirement: Requirement,
         dependency: PluginRef,
         visiting: tuple[str, ...],
+        constraints: dict[str, list[tuple[Requirement, tuple[str, ...]]]],
+        failures: list[tuple[str, Requirement, str]],
     ) -> None:
         """Validate a dependency that refers to a registered plugin."""
         if dependency.id in visiting:
@@ -181,17 +295,16 @@ class DependencyResolver:
         if requirement.specifier and not requirement.specifier.contains(
             dependency.version, prereleases=True
         ):
-            raise PluginDependencyVersionError(
-                root_id,
-                f"dependency '{requirement}' is not satisfied by "
-                f"installed version {dependency.version}.",
-            )
-        self._check_plugin(dependency, visiting)
+            failures.append((root_id, requirement, dependency.version))
+        # Keep walking even on a version mismatch so constraints declared below
+        # this dependency can still participate in conflict detection.
+        self._check_plugin(dependency, visiting, constraints, failures)
 
     def _check_package_dependency(
         self,
         root_id: str,
         requirement: Requirement,
+        failures: list[tuple[str, Requirement, str]],
     ) -> None:
         """Validate a dependency that refers to an installed Python package."""
         try:
@@ -203,8 +316,8 @@ class DependencyResolver:
             ) from None
 
         try:
-            version = Version(installed)
-        except InvalidVersion:
+            version = parse_version(installed)
+        except InvalidPluginVersionError:
             raise PluginDependencyVersionError(
                 root_id,
                 f"dependency '{requirement}' cannot be checked against "
@@ -213,8 +326,4 @@ class DependencyResolver:
 
         specifier = requirement.specifier
         if specifier and not specifier.contains(version, prereleases=True):
-            raise PluginDependencyVersionError(
-                root_id,
-                f"dependency '{requirement}' is not satisfied by "
-                f"installed version {installed}.",
-            )
+            failures.append((root_id, requirement, installed))

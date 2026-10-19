@@ -2,7 +2,7 @@
 
 Provider responses carry real prompt/completion token counts when the vendor
 reports them; when they do not — the offline mock provider, or a streamed reply
-— a small, dependency-free estimate is used so every message still records a
+ — a small, dependency-free estimate is used so every message still records a
 usage figure.
 """
 
@@ -13,7 +13,7 @@ CHARS_PER_TOKEN = 4
 
 
 def estimate_tokens(text) -> int:
-    """Estimate the token count of ``text`` (>= 1 for non-empty input)."""
+    """Estimate the token count of `text` (>= 1 for non-empty input)."""
     if text is None:
         return 0
     value = str(text)
@@ -67,7 +67,7 @@ def usage_from_text(prompt_text, completion_text) -> dict:
 
 
 def sum_usage(messages) -> dict:
-    """Cumulative usage across ``messages`` (missing counts ignored)."""
+    """Cumulative usage across `messages` (missing counts ignored)."""
     prompt = completion = total = 0
     for message in messages or []:
         if getattr(message, "total_tokens", None) is None:
@@ -76,3 +76,45 @@ def sum_usage(messages) -> dict:
         completion += message.completion_tokens or 0
         total += message.total_tokens or 0
     return _totals(prompt, completion)
+
+
+class BudgetAlertDeduplicator:
+    """Per-period deduplication of budge threshold alerts.
+
+    A given threshold alert fires at most once per budget per period. The
+    deduplicator records the period in which each threshold was alerted and
+    suppresses repeated crossings within that period. Starting a new period
+    resets the recorded alerts so the threshold can fire again.
+    """
+
+    def __init__(self):
+        self._period = None
+        self._alerted = set()
+
+    def _ensure_period(self, period) -> None:
+        if period != self._period:
+            self._period = period
+            self._alerted = set()
+
+    def should_alert(self, period, threshold) -> bool:
+        """Return True if the alert has not yet fired for this period/threshold."""
+        self._ensure_period(period)
+        return threshold not in self._alerted
+
+    def mark_alerted(self, period, threshold) -> None:
+        """Record that the alert fired for this period/threshold."""
+        self._ensure_period(period)
+        self._alerted.add(threshold)
+
+    def check_and_mark(self, period, threshold) -> bool:
+        """Atomically check and record the alert; True if it should fire."""
+        self._ensure_period(period)
+        if threshold in self._alerted:
+            return False
+        self._alerted.add(threshold)
+        return True
+
+    def reset(self, period=None) -> None:
+        """Clear recorded alerts, optionally switching to a new period."""
+        self._period = period
+        self._alerted = set()

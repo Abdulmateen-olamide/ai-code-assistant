@@ -10,6 +10,7 @@ instructions found inside imported files.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 
@@ -21,8 +22,10 @@ from app.models.workspace_member import (
     ROLE_VIEWER,
     STATUS_ACTIVE,
 )
+from app.services import token_usage
+from app.services.currency import format_cost, get_currency_config
 from app.services.llm import LLMProviderError, get_provider
-from app.services.llm_cache import cached_complete
+from app.services.llm_cache import cached_chat
 from app.services.permissions import assert_content_access
 from app.services.stellar_detection import (
     SOROBAN_CRATES,
@@ -243,14 +246,70 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + "\n…[context truncated]"
 
 
+#: Last completion performed by ``_run`` in this request/context. It lets
+#: ``analyze_project`` attach real provider-reported counts (or the estimates
+#: filled in by ``token_usage``) to the result without changing every analysis
+#: helper's return type.
+_LAST_COMPLETION: contextvars.ContextVar = contextvars.ContextVar(
+    "project_analysis_last_completion", default=None
+)
+
+
+def _provider_completion(messages: list[dict], *, user=None, no_cache: bool = False):
+    """Call the configured provider and return ``(response, provider)``."""
+    provider = get_provider(user=user)
+    if user is not None:
+        response = cached_chat(user, messages, provider=provider, no_cache=no_cache)
+    else:
+        response = provider.chat(messages)
+    return response, provider
+
+
+def _usage_from_response(response, provider, messages) -> dict:
+    """Return ledger-ready token usage plus provider/model metadata."""
+    usage = token_usage.usage_from_response(response, messages)
+    name = getattr(provider, "name", None)
+    models = getattr(provider, "models", ()) or ()
+    model = getattr(response, "model", None) or getattr(provider, "model", None)
+    if not model and models:
+        model = models[0]
+    # The offline provider derives counts from text and never reports vendor
+    # usage; treat it as estimated. Real providers may report only one side.
+    estimated = (
+        name == "mock"
+        or getattr(response, "prompt_tokens", None) is None
+        or getattr(response, "completion_tokens", None) is None
+    )
+    return {
+        **usage,
+        "provider": name,
+        "model": model,
+        "tokens_estimated": bool(estimated),
+    }
+
+
+def _with_usage(result: dict) -> dict:
+    """Attach usage metadata captured by the most recent ``_run`` call."""
+    completion = _LAST_COMPLETION.get()
+    if completion is not None:
+        response, provider, messages = completion
+        result["usage"] = _usage_from_response(response, provider, messages)
+    return result
+
+
 def _run(prompt: str, *, system: str = _PROJECT_SYSTEM) -> str:
     """Run a single completion with the configured provider."""
-    return _complete(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ]
-    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        response, provider = _provider_completion(messages)
+    except LLMProviderError as exc:
+        _LAST_COMPLETION.set(None)
+        return f"[analysis unavailable: {exc}]"
+    _LAST_COMPLETION.set((response, provider, messages))
+    return response.content
 
 
 def _complete(messages: list[dict], *, user=None, no_cache: bool = False) -> str:
@@ -261,10 +320,8 @@ def _complete(messages: list[dict], *, user=None, no_cache: bool = False) -> str
     directly.
     """
     try:
-        if user is not None:
-            return cached_complete(user, messages, no_cache=no_cache)
-        provider = get_provider()
-        return provider.complete(messages)
+        response, _ = _provider_completion(messages, user=user, no_cache=no_cache)
+        return response.content
     except LLMProviderError as exc:
         return f"[analysis unavailable: {exc}]"
 
@@ -707,9 +764,19 @@ def chat_with_project(
     pinned = _pinned_paths(project, attachments, history)
     context = build_context(project, question, attachments=pinned)
     messages = build_messages(project, question, history, attachments=pinned)
+    try:
+        response, provider = _provider_completion(messages, user=user, no_cache=no_cache)
+    except LLMProviderError as exc:
+        analysis = f"[analysis unavailable: {exc}]"
+        usage = token_usage.usage_from_text(token_usage.messages_text(messages), analysis)
+        usage.update({"provider": None, "model": None, "tokens_estimated": True})
+    else:
+        analysis = response.content
+        usage = _usage_from_response(response, provider, messages)
     return {
         "context_paths": context["paths"],
-        "analysis": _complete(messages, user=user, no_cache=no_cache),
+        "analysis": analysis,
+        "usage": usage,
     }
 
 
@@ -730,11 +797,28 @@ def estimate_tokens(text: str | None) -> int:
 
 
 def _estimate_cost(tokens: int) -> float:
-    """Estimated USD cost for ``tokens`` using the configured per-1k rate."""
+    """Estimated cost for ``tokens`` using the configured per-1k rate."""
     from flask import current_app
 
     rate = float(current_app.config.get("LLM_ESTIMATE_USD_PER_1K_TOKENS", 0.0) or 0.0)
     return round(tokens / 1000 * rate, 6)
+
+
+def _cost_payload(tokens: int) -> dict:
+    """Return the estimated cost in both raw and consistently formatted form.
+
+    The configured currency is included in the payload so clients never have to
+    guess which currency a figure is in (issue #441).
+    """
+    amount = _estimate_cost(tokens)
+    currency = get_currency_config()
+    return {
+        "estimated_cost_usd": amount,
+        "estimated_cost": amount,
+        "currency": currency,
+        "estimated_cost_display": format_cost(amount, currency),
+        "cost_is_estimate": True,
+    }
 
 
 def estimate_chat(
@@ -755,7 +839,7 @@ def estimate_chat(
     return {
         "mode": "chat",
         "prompt_tokens": tokens,
-        "estimated_cost_usd": _estimate_cost(tokens),
+        **_cost_payload(tokens),
     }
 
 
@@ -806,7 +890,7 @@ def estimate_analysis(project, kind: str) -> dict:
         "mode": "analysis",
         "kind": kind,
         "prompt_tokens": tokens,
-        "estimated_cost_usd": _estimate_cost(tokens),
+        **_cost_payload(tokens),
     }
 
 
@@ -816,6 +900,7 @@ def analyze_project(project, kind: str) -> dict:
     kind = (kind or "").strip().lower()
     if kind not in ANALYSIS_KINDS:
         kind = "architecture"
+    _LAST_COMPLETION.set(None)
 
     structure = project_structure(project)
     budget = _budget()
@@ -899,17 +984,17 @@ instructions, usage examples, and a short API/CLI reference where applicable.
 Base everything on the files shown and mark [CONFIRMED] vs [SUGGESTION].
 """
     elif kind == "quality":
-        return analyze_code_quality(project)
+        return _with_usage(analyze_code_quality(project))
     elif kind == "security":
-        return analyze_security(project)
+        return _with_usage(analyze_security(project))
     elif kind == "code_review":
-        return analyze_code_review(project)
+        return _with_usage(analyze_code_review(project))
     elif kind == "stellar":
-        return analyze_stellar_project(project)
+        return _with_usage(analyze_stellar_project(project))
     elif kind == "stellar_security":
-        return analyze_stellar_security(project)
+        return _with_usage(analyze_stellar_security(project))
     elif kind == "stellar_config":
-        return analyze_stellar_config(project)
+        return _with_usage(analyze_stellar_config(project))
     else:  # dependencies
         inventory = dependency_inventory(project)
         if inventory:
@@ -940,7 +1025,7 @@ be directly supported by the inventory.
         if signals.is_stellar:
             prompt += _soroban_dependency_context(inventory)
 
-    return {"kind": kind, "analysis": _run(prompt)}
+    return _with_usage({"kind": kind, "analysis": _run(prompt)})
 
 
 def analyze_code_quality(project) -> dict:

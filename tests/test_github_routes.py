@@ -25,12 +25,27 @@ class FakeResponse:
         return self._data
 
 
-def _make_fake_session(script):
+class FakeHTMLResponse(FakeResponse):
+    """A response whose body is not JSON, mirroring a GitHub 5xx HTML page."""
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+def _make_fake_session(script, sessions=None):
+    """Build a fake ``requests.Session`` that serves ``script``.
+
+    ``script`` entries are ``(method, path_fragment, status, data)``. When
+    ``sessions`` is a list, every constructed session is appended to it so a
+    test can assert on the auth headers the client used.
+    """
     ordered = sorted(script, key=lambda entry: len(entry[1]), reverse=True)
 
     class FakeSession:
         def __init__(self):
             self.headers = {"Authorization": "", "X-GitHub-Api-Version": "2022-11-28"}
+            if sessions is not None:
+                sessions.append(self)
 
         def request(self, method, url, params=None, timeout=None, **kwargs):
             url_path = url.split("api.github.com", 1)[-1].split("?", 1)[0]
@@ -68,6 +83,46 @@ def _create_account(app):
     db.session.add(account)
     db.session.commit()
     return account
+
+
+def _flashes(client):
+    """Return the pending flash messages as a list of strings."""
+    with client.session_transaction() as sess:
+        return [message for _, message in sess.get("_flashes", [])]
+
+
+def _forbid_token_exchange(calls):
+    """Return a ``requests.post`` stand-in that records no successful exchange.
+
+    Any call appends to ``calls`` and still answers, so a test that expects the
+    exchange to be skipped can assert on an empty ``calls`` list instead of
+    relying on an exception to fail the assertion.
+    """
+
+    def _post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse(200, {"access_token": "should-not-be-used"})
+
+    return _post
+
+
+def _token_exchange(calls, response):
+    """Return a ``requests.post`` stand-in that records the request and replays ``response``."""
+
+    def _post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return response
+
+    return _post
+
+
+def _assert_no_error_leakage(body, secrets):
+    """Assert that no sensitive or internal value reached the rendered page."""
+    text = body if isinstance(body, str) else body.decode()
+    for secret in secrets:
+        assert secret not in text, f"error detail leaked into the page: {secret!r}"
+    for marker in ("Traceback (most recent call last)", "GitHubError", "RequestException"):
+        assert marker not in text, f"internal failure detail leaked into the page: {marker!r}"
 
 
 class TestOAuthFlow:
@@ -332,6 +387,62 @@ class TestOAuthFlow:
         data = client.get("/github/api/status").get_json()
         assert data["connected"] is False
         assert "rate_limit" not in data
+
+
+class TestGrantedScopes:
+    """Issue #57: report the granted scopes and warn when ``repo`` is missing."""
+
+    def _connect_with_user_scopes(self, client, app, monkeypatch, user_headers, exchange_scope):
+        app.config["GITHUB_CLIENT_ID"] = "client-id"
+        app.config["GITHUB_CLIENT_SECRET"] = "client-secret"
+        _logged_in_client(client)
+        client.get("/github/connect")
+        state = _last_session_state(client)
+        monkeypatch.setattr(
+            "app.github.routes.requests.post",
+            lambda *a, **k: FakeResponse(
+                200, {"access_token": "gho_token", "scope": exchange_scope}
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [("GET", "/user", 200, {"id": 42, "login": "ghuser"}, user_headers)]
+            ),
+        )
+        client.get(f"/github/callback?code=abc&state={state}")
+        return GithubAccount.query.first()
+
+    def test_callback_prefers_granted_scopes_from_user_header(self, client, app, monkeypatch):
+        account = self._connect_with_user_scopes(
+            client, app, monkeypatch, {"X-OAuth-Scopes": "repo, read:user"}, "read:user"
+        )
+        assert account.granted_scopes == ["repo", "read:user"]
+
+    def test_callback_falls_back_to_exchange_scope(self, client, app, monkeypatch):
+        account = self._connect_with_user_scopes(client, app, monkeypatch, None, "read:user repo")
+        assert account.granted_scopes == ["read:user", "repo"]
+
+    def _status_with_scopes(self, client, app, monkeypatch, scopes):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = scopes
+        db.session.commit()
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([("GET", "/rate_limit", 200, {"resources": {}})]),
+        )
+        return client.get("/github/api/status").get_json()
+
+    def test_status_reports_missing_repo_scope(self, client, app, monkeypatch):
+        data = self._status_with_scopes(client, app, monkeypatch, "read:user")
+        assert data["scopes"] == ["read:user"]
+        assert data["missing_repo_scope"] is True
+
+    def test_status_reports_repo_scope_present(self, client, app, monkeypatch):
+        data = self._status_with_scopes(client, app, monkeypatch, "repo,read:user")
+        assert data["scopes"] == ["repo", "read:user"]
+        assert data["missing_repo_scope"] is False
 
 
 class TestRepositoryApi:
@@ -782,3 +893,153 @@ class TestSecurity:
 def _last_session_state(client):
     with client.session_transaction() as sess:
         return sess.get("github_oauth_state")
+
+
+class TestDashboardGrantedScopes:
+    """The dashboard shows the granted scopes and warns when repo is missing (#57)."""
+
+    def test_shows_granted_scopes_without_warning_when_repo_present(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/user",
+                        200,
+                        {"id": 42, "login": "ghuser"},
+                        {"X-OAuth-Scopes": "read:user, repo"},
+                    )
+                ]
+            ),
+        )
+        body = client.get("/github/").get_data(as_text=True)
+        assert "granted scopes" in body
+        assert "read:user" in body
+        assert "repo" in body
+        assert "Missing the" not in body
+
+    def test_warns_when_repo_scope_missing(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/user",
+                        200,
+                        {"id": 42, "login": "ghuser"},
+                        {"X-OAuth-Scopes": "read:user, gist"},
+                    )
+                ]
+            ),
+        )
+        body = client.get("/github/").get_data(as_text=True)
+        assert "Missing the" in body
+
+    def test_falls_back_to_stored_scopes_when_header_unavailable(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = "read:user, repo"
+        db.session.commit()
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([("GET", "/user", 200, {"id": 42, "login": "ghuser"})]),
+        )
+        body = client.get("/github/").get_data(as_text=True)
+        assert "read:user, repo" in body
+
+
+class TestStatusScopes:
+    """The status API reports whether the repo scope is missing (issue #57)."""
+
+    _RATE_LIMIT = (
+        "GET",
+        "/rate_limit",
+        200,
+        {"resources": {"core": {"limit": 5000, "remaining": 4999, "reset": 1700000000, "used": 1}}},
+    )
+
+    def _patch(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([self._RATE_LIMIT]),
+        )
+
+    def test_status_flags_missing_repo_scope(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = "read:user"
+        db.session.commit()
+        self._patch(monkeypatch)
+        data = client.get("/github/api/status").get_json()
+        assert data["repo_scope_missing"] is True
+
+    def test_status_repo_scope_present(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = "read:user,repo"
+        db.session.commit()
+        self._patch(monkeypatch)
+        data = client.get("/github/api/status").get_json()
+        assert data["repo_scope_missing"] is False
+
+
+class TestCompareRoute:
+    def test_compare_requires_login(self, client):
+        response = client.get("/github/api/compare/ow/repo/main...feature")
+        assert response.status_code == 302
+
+    def test_compare_returns_file_diff(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        compare_payload = {
+            "status": "ahead",
+            "ahead_by": 2,
+            "behind_by": 0,
+            "total_commits": 2,
+            "commits": [
+                {"sha": "abc123", "commit": {"message": "Add feature"}},
+                {"sha": "def456", "commit": {"message": "Fix bug"}},
+            ],
+            "files": [
+                {
+                    "filename": "app/py.py",
+                    "status": "modified",
+                    "additions": 10,
+                    "deletions": 2,
+                    "changes": 12,
+                    "patch": "@@ -1,+1 @@\n+old\n-new",
+                },
+                {
+                    "filename": "README.md",
+                    "status": "added",
+                    "additions": 5,
+                    "deletions": 0,
+                    "changes": 5,
+                    "patch": "@@ -0,0 +1,5 @@\n+hello",
+                },
+            ],
+        }
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    ("GET", "/repos/ow/repo/compare/main...feature", 200, compare_payload),
+                ]
+            ),
+        )
+        response = client.get("/github/api/compare/ow/repo/main...feature")
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["status"] == "ahead"
+        assert data["ahead_by"] == 2
+        assert len(data["files"]) == 2
+        filenames = {f["filename"] for f in data["files"]}
+        assert filenames == {"app/py.py", "README.md"}
+        assert data["additions"] == 15
+        assert data["deletions"] == 2

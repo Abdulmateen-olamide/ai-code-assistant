@@ -24,11 +24,41 @@ from app.services.capabilities import Capability, CapabilityStore
 from app.services.events import emit_event
 from app.services.permissions import require_workspace_capability, resolve_workspace, role_for
 from app.services.plugin_audit import record_plugin_audit
-from app.services.plugin_compat import compatibility_status
+from app.services.plugin_catalog import (
+    CatalogEntryNotFoundError,
+    CatalogError,
+    CatalogUnavailableError,
+    load_plugin_catalog,
+)
+from app.services.plugin_compat import (
+    IncompatibleCompatibilityError,
+    InvalidCompatibilityError,
+    compatibility_status,
+    enforce_compatible,
+)
 from app.services.plugin_config import validate_plugin_config
 from app.services.plugin_errors import list_workspace_error_reports
-from app.services.plugin_ops import discover_plugins
+from app.services.plugin_ops import (
+    PluginEntryPointMismatchError,
+    PluginNotFoundError,
+    PluginUpdateError,
+    discover_plugins,
+    update_plugin,
+)
+from app.services.plugin_signatures import (
+    VERIFY_IF_PRESENT,
+    PublisherSignatureError,
+    enforce_publisher_trust,
+)
+from app.services.plugin_trust import (
+    PluginTrustConfigError,
+    trusted_publisher_ids,
+)
 from app.services.plugins import ManifestValidationError, PluginError, PluginManifest
+
+
+class PluginAlreadyInstalledError(ValueError):
+    """Raised when a plugin is already installed in the workspace."""
 
 
 def _accessible_workspaces(user):
@@ -90,6 +120,78 @@ def _capability_name(value: str) -> str | None:
         if value in (cap.name, cap.value):
             return cap.name
     return None
+
+
+def _upsert_plugin(manifest: PluginManifest) -> Plugin:
+    """Create or reuse the global ``Plugin`` row for a validated manifest.
+
+    The manifest id is the identity, and an existing plugin keeps its entry
+    point: a conflicting entry point raises
+    :class:`PluginEntryPointMismatchError` so an install/update can never
+    retarget registered code.
+    """
+    plugin = Plugin.query.filter_by(id=manifest.id).first()
+    if plugin is None:
+        plugin = Plugin(
+            id=manifest.id,
+            name=manifest.name,
+            version=manifest.version,
+            description=manifest.description,
+            author=manifest.author,
+            entry_point=manifest.entry_point,
+            capabilities=manifest.capabilities,
+            permissions=manifest.permissions or [],
+            dependencies=manifest.dependencies or [],
+            compatibility=manifest.compatibility,
+            configuration=manifest.configuration or {},
+            trust_state=manifest.trust_state,
+            trust_publisher=manifest.trust_publisher,
+        )
+        db.session.add(plugin)
+        return plugin
+
+    if plugin.entry_point != manifest.entry_point:
+        raise PluginEntryPointMismatchError(
+            "Manifest entry_point does not match the registered plugin."
+        )
+
+    # Trust metadata is derived from the verified signature, so refresh it even
+    # when the global row already exists (for example after a key rotation).
+    plugin.trust_state = manifest.trust_state
+    plugin.trust_publisher = manifest.trust_publisher
+    return plugin
+
+
+def _install_in_workspace(manifest: PluginManifest, workspace_id: int) -> Plugin:
+    """Register ``manifest`` and install it in ``workspace_id``.
+
+    Shared by the local-manifest and catalog install routes so both paths keep
+    the same identity binding and duplicate-install handling. Neither path
+    creates capability grants. Returns the persisted plugin.
+
+    Raises:
+        PluginAlreadyInstalledError: If the plugin is already installed in the
+            workspace (or a concurrent request won the unique constraint).
+    """
+    plugin = _upsert_plugin(manifest)
+    if _installation(manifest.id, workspace_id) is not None:
+        db.session.rollback()
+        raise PluginAlreadyInstalledError
+
+    installation = PluginInstallation(
+        plugin_id=manifest.id,
+        workspace_id=workspace_id,
+        enabled=True,
+        config=manifest.configuration or {},
+        installed_by_id=current_user.id,
+    )
+    db.session.add(installation)
+    try:
+        db.session.commit()
+    except Exception:  # uniqueness races map to a duplicate install
+        db.session.rollback()
+        raise PluginAlreadyInstalledError from None
+    return plugin
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +256,33 @@ def api_inspect_plugin(workspace_id: int, plugin_id: str):
 
 
 # --------------------------------------------------------------------------
+# API: trusted publisher key management (read-only, #386)
+# --------------------------------------------------------------------------
+
+
+@bp.route("/api/trusted-publishers", methods=["GET"])
+@login_required
+def api_list_trusted_publishers():
+    """List the configured trusted publisher ids (never key material).
+
+    The configured keys live in ``PLUGIN_TRUSTED_KEYS`` (an operator secret
+    setting). This read-only surface lets an operator confirm *which* publisher
+    ids are trusted and under which policy, without exposing any key bytes or
+    fingerprints. Invalid key material is rejected when the application loads
+    (``app.services.plugin_trust.validate_trust_config``).
+    """
+    publishers = trusted_publisher_ids(current_app.config.get("PLUGIN_TRUSTED_KEYS") or {})
+    policy = current_app.config.get("PLUGIN_TRUST_POLICY", VERIFY_IF_PRESENT)
+    return jsonify(
+        {
+            "publishers": publishers,
+            "count": len(publishers),
+            "policy": policy,
+        }
+    )
+
+
+# --------------------------------------------------------------------------
 # API: plugin discovery (read-only, local-directory based)
 # --------------------------------------------------------------------------
 
@@ -204,62 +333,190 @@ def api_install_plugin(workspace_id: int):
 
     # Reject a plugin whose explicit PEP 440 compatibility range does not
     # include the running application version (an absent field is unrestricted).
-    if manifest.compatibility is not None:
-        status = compatibility_status(manifest.compatibility)
-        if not status["compatible"]:
-            return (
-                jsonify(
-                    {
-                        "error": (
-                            f"Plugin {manifest.id} requires application "
-                            f"{manifest.compatibility}, but this app is "
-                            f"{status['app_version']}."
-                        )
-                    }
-                ),
-                400,
-            )
-
-    plugin = Plugin.query.filter_by(id=manifest.id).first()
-    if plugin is None:
-        plugin = Plugin(
-            id=manifest.id,
-            name=manifest.name,
-            version=manifest.version,
-            description=manifest.description,
-            author=manifest.author,
-            entry_point=manifest.entry_point,
-            capabilities=manifest.capabilities,
-            permissions=manifest.permissions or [],
-            dependencies=manifest.dependencies or [],
-            compatibility=manifest.compatibility,
-            configuration=manifest.configuration or {},
-            trust_state=manifest.trust_state,
-            trust_publisher=manifest.trust_publisher,
-        )
-        db.session.add(plugin)
-    elif plugin.entry_point != manifest.entry_point:
-        return jsonify({"error": "Manifest entry_point does not match the registered plugin."}), 409
-
-    if _installation(manifest.id, workspace_id) is not None:
-        db.session.rollback()
-        return jsonify({"error": "Plugin is already installed in this workspace."}), 409
-
-    installation = PluginInstallation(
-        plugin_id=manifest.id,
-        workspace_id=workspace_id,
-        enabled=True,
-        config=manifest.configuration or {},
-        installed_by_id=current_user.id,
-    )
-    db.session.add(installation)
     try:
-        db.session.commit()
-    except Exception:  # uniqueness races map to a duplicate install
+        enforce_compatible(manifest.compatibility, subject=f"Plugin {manifest.id}")
+    except (IncompatibleCompatibilityError, InvalidCompatibilityError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        plugin = _install_in_workspace(manifest, workspace_id)
+    except PluginEntryPointMismatchError:
         db.session.rollback()
+        return jsonify({"error": "Manifest entry_point does not match the registered plugin."}), 409
+    except PluginAlreadyInstalledError:
         return jsonify({"error": "Plugin is already installed in this workspace."}), 409
 
     return jsonify(_serialize(plugin, workspace_id)), 201
+
+
+@bp.route(
+    "/api/workspaces/<int:workspace_id>/plugins/install-from-catalog",
+    methods=["POST"],
+)
+@login_required
+@require_workspace_capability("manage_plugins")
+def api_install_plugin_from_catalog(workspace_id: int):
+    """Install a plugin pinned by the operator-controlled catalog (#389).
+
+    Owner-only. The request names a catalog entry (``plugin_id`` plus an
+    optional ``version``); a client cannot supply a manifest, an artifact URL,
+    or a publisher key. The entry is validated against the catalog, the
+    manifest is re-validated against the manifest schema, and the active
+    ``PLUGIN_TRUST_POLICY`` is enforced *before* anything is written:
+
+    - unsigned entries are refused when the policy is ``required``;
+    - a forged, malformed, or untrusted signature is always refused;
+    - the artifact sha256 from the catalog is recorded in the response.
+
+    Success registers metadata only: no artifact is downloaded, no plugin code
+    is executed, and **no capability grant is created**. Grants remain explicit
+    per workspace.
+    """
+    data = request.get_json(silent=True) or {}
+    plugin_id = data.get("plugin_id")
+    version = data.get("version")
+
+    if not isinstance(plugin_id, str) or not plugin_id.strip():
+        return jsonify({"error": "plugin_id is required."}), 400
+    if version is not None and (not isinstance(version, str) or not version.strip()):
+        return jsonify({"error": "version must be a non-empty string when provided."}), 400
+
+    try:
+        catalog = load_plugin_catalog(current_app.config)
+    except CatalogUnavailableError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except CatalogError as exc:
+        return jsonify({"error": f"Invalid plugin catalog: {exc}"}), 400
+
+    try:
+        entry = catalog.get(
+            plugin_id.strip(),
+            version.strip() if version is not None else None,
+        )
+    except CatalogEntryNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except CatalogError as exc:
+        return jsonify({"error": f"Invalid plugin version: {exc}"}), 400
+
+    trusted_publishers = current_app.config.get("PLUGIN_TRUSTED_KEYS") or {}
+    try:
+        # Schema validation is trust-policy agnostic here: the detached (or
+        # embedded) signature is enforced separately below so a catalog entry
+        # signed out-of-band is not rejected as "unsigned".
+        manifest = PluginManifest.from_dict(
+            entry.manifest,
+            trusted_publishers=trusted_publishers,
+            trust_policy=VERIFY_IF_PRESENT,
+        )
+    except ManifestValidationError as exc:
+        return jsonify({"error": f"Invalid plugin manifest: {exc}"}), 400
+    except PluginError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    policy = current_app.config.get("PLUGIN_TRUST_POLICY", VERIFY_IF_PRESENT)
+    # A catalog entry may carry the publisher signature detached (catalog
+    # field) or embedded in the manifest; both sign the same canonical body, so
+    # the effective signature is whichever was supplied.
+    signature = entry.signature if entry.signature is not None else entry.manifest.get("signature")
+    try:
+        trust = enforce_publisher_trust(
+            entry.manifest,
+            signature,
+            trusted_publishers=trusted_publishers,
+            policy=policy,
+        )
+    except PluginTrustConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except PublisherSignatureError as exc:
+        # Refusals are auditable but never store artifact bytes or key material.
+        record_plugin_audit(
+            workspace_id,
+            "denied",
+            actor=current_user,
+            plugin_id=entry.plugin_id,
+            outcome="denied",
+            reason="publisher signature refused",
+        )
+        db.session.commit()
+        return jsonify({"error": str(exc)}), 403
+
+    try:
+        enforce_compatible(manifest.compatibility, subject=f"Plugin {manifest.id}")
+    except (IncompatibleCompatibilityError, InvalidCompatibilityError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    # The verified trust fact is what gets persisted, not whatever the catalog
+    # (or manifest) claimed.
+    manifest.trust_state = trust.state
+    manifest.trust_publisher = trust.publisher
+
+    try:
+        plugin = _install_in_workspace(manifest, workspace_id)
+    except PluginEntryPointMismatchError:
+        db.session.rollback()
+        return jsonify({"error": "Manifest entry_point does not match the registered plugin."}), 409
+    except PluginAlreadyInstalledError:
+        return jsonify({"error": "Plugin is already installed in this workspace."}), 409
+
+    payload = _serialize(plugin, workspace_id)
+    payload["source"] = entry.source
+    payload["integrity"] = entry.integrity
+    return jsonify(payload), 201
+
+
+@bp.route("/api/workspaces/<int:workspace_id>/plugins/<plugin_id>/update", methods=["POST"])
+@login_required
+@require_workspace_capability("manage_plugins")
+def api_update_plugin(workspace_id: int, plugin_id: str):
+    """Update a registered plugin from a validated manifest (owner only).
+
+    The manifest is fully validated and identity-bound: its ``id`` must match
+    the plugin being updated and its ``entry_point`` must not change, so an
+    update can never point an installed plugin at different code. The declared
+    PEP 440 ``compatibility`` range is enforced before anything is written; an
+    update that excludes the running application version is refused with
+    ``400`` and a message naming both the range and the current version. The
+    registered plugin (and every workspace installation) is left untouched.
+
+    Capabilities and per-workspace configuration are not modified by an update;
+    grants stay explicit and workspace-scoped.
+    """
+    installation = _installation(plugin_id, workspace_id)
+    if installation is None:
+        return jsonify({"error": "Plugin is not installed in this workspace."}), 404
+
+    data = request.get_json(silent=True) or {}
+    manifest_data = data.get("manifest")
+    if not isinstance(manifest_data, dict):
+        return jsonify({"error": "A manifest object is required."}), 400
+
+    try:
+        manifest = PluginManifest.from_dict(
+            manifest_data,
+            trusted_publishers=current_app.config["PLUGIN_TRUSTED_KEYS"],
+            trust_policy=current_app.config["PLUGIN_TRUST_POLICY"],
+        )
+    except ManifestValidationError as exc:
+        return jsonify({"error": f"Invalid plugin manifest: {exc}"}), 400
+    except PluginError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        plugin = update_plugin(plugin_id, manifest)
+    except (IncompatibleCompatibilityError, InvalidCompatibilityError) as exc:
+        db.session.rollback()
+        return jsonify({"error": str(exc)}), 400
+    except PluginEntryPointMismatchError as exc:
+        db.session.rollback()
+        return jsonify({"error": str(exc)}), 409
+    except PluginUpdateError as exc:
+        db.session.rollback()
+        return jsonify({"error": str(exc)}), 400
+    except PluginNotFoundError:
+        db.session.rollback()
+        return jsonify({"error": "Plugin not found."}), 404
+
+    return jsonify(_serialize(plugin, workspace_id))
 
 
 @bp.route("/api/workspaces/<int:workspace_id>/plugins/<plugin_id>/enable", methods=["POST"])

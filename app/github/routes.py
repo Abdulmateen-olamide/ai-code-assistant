@@ -12,6 +12,7 @@ Pages (HTML)
     /github/repos/<owner>/<repo>/issues/<n> issue detail
     /github/repos/<owner>/<repo>/pulls      pull request list
     /github/repos/<owner>/<repo>/pulls/<n>  pull request detail
+    /github/repos/lookup                    repository lookup form
 
 API (JSON)
     /github/api/status                      connection status
@@ -23,9 +24,13 @@ API (JSON)
     /github/api/repos/.../issues/<n>        single issue + AI analysis
     /github/api/repos/.../pulls             pull request list
     /github/api/repos/.../pulls/<n>         single PR + AI analysis
+    /github/api/repos/.../compare/<a>...<b> diff between two refs
     /github/api/repos/.../analyze-file      AI analysis of one file
+    /github/api/repos/lookup                resolve owner/name to a repository
 """
 
+import logging
+import re
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
@@ -55,10 +60,15 @@ from app.services.github import (
     validate_path,
 )
 
+#: Shape of a valid ``owner/name`` repository identifier.
+_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
 #: Cap on the number of files whose last commit is resolved for the browser.
 #: The lookups are batched into one GraphQL request, but keeping the count
 #: bounded avoids pathological query sizes on very large repositories.
 MAX_TREE_LAST_COMMITS = 100
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
@@ -69,9 +79,39 @@ MAX_TREE_LAST_COMMITS = 100
 @bp.route("/")
 @login_required
 def index():
-    """Dashboard showing the user's GitHub connection status."""
+    """Dashboard showing the user's GitHub connection status.
+
+    Displays the scopes GitHub actually *granted* (issue #57), falling back to
+    the scopes captured at connect time, and warns when the ``repo`` scope is
+    missing (private repositories will not load).
+    """
     account = GithubAccount.query.filter_by(user_id=current_user.id).first()
-    return render_template("github/index.html", account=account)
+    granted_scopes = _granted_scopes(account)
+    repo_scope_missing = bool(granted_scopes) and "repo" not in granted_scopes
+    return render_template(
+        "github/index.html",
+        account=account,
+        granted_scopes=granted_scopes,
+        repo_scope_missing=repo_scope_missing,
+    )
+
+
+def _granted_scopes(account: GithubAccount | None) -> list[str]:
+    """Return the scopes to display for the dashboard.
+
+    Prefers a live ``GET /user`` read (the token's current grants) and falls
+    back to the scopes stored at connect time. Best-effort: a failed read never
+    breaks the dashboard, and the value is used for display only — never for an
+    authorization decision (issue #57).
+    """
+    if account is None:
+        return []
+    stored = [scope.strip() for scope in (account.scopes or "").split(",") if scope.strip()]
+    try:
+        live = _client().get_granted_scopes()
+    except GitHubError:
+        live = []
+    return live or stored
 
 
 @bp.route("/connect")
@@ -102,7 +142,11 @@ def callback():
     error = request.args.get("error")
     if error:
         ratelimit.record(key)
-        flash(f"GitHub authorization failed: {error}", "error")
+        if error == "access_denied":
+            # The user cancelled GitHub's consent screen: show the dedicated
+            # denial page instead of a red "authorization failed" banner.
+            return render_template("github/index.html", account=None, denied=True)
+        flash("GitHub authorization failed. Please try again.", "error")
         return redirect(url_for("github.index"))
 
     state = request.args.get("state")
@@ -132,10 +176,26 @@ def callback():
     try:
         token_data = response.json()
     except ValueError:
+        token_data = None
+    # GitHub answers a failed exchange with a JSON object, but a proxy or
+    # gateway in front of it can return anything (``null``, a list, HTML).
+    # Normalize to a dict so a malformed body degrades to the friendly
+    # failure path instead of raising.
+    if not isinstance(token_data, dict):
         token_data = {}
     if response.status_code >= 400 or "access_token" not in token_data:
         ratelimit.record(key)
-        message = token_data.get("error_description") or token_data.get("error") or response.text
+        # Only GitHub's own structured error fields are surfaced to the user.
+        # The raw response body may be a gateway HTML page carrying internal
+        # detail, so it is logged rather than flashed (issue #82).
+        message = token_data.get("error_description") or token_data.get("error")
+        if not message:
+            logger.warning(
+                "GitHub token exchange failed (HTTP %s): %s",
+                response.status_code,
+                response.text[:200],
+            )
+            message = "GitHub did not return a token. Please try again."
         flash(f"GitHub authorization failed: {message}", "error")
         return redirect(url_for("github.index"))
 
@@ -145,7 +205,8 @@ def callback():
         user = client.get_user()
     except GitHubError as exc:
         ratelimit.record(key)
-        flash(f"Could not verify your GitHub account: {exc}", "error")
+        current_app.logger.warning("GitHub user verification failed: %s", exc)
+        flash("Could not verify your GitHub account. Please try again.", "error")
         return redirect(url_for("github.index"))
 
     account = GithubAccount.query.filter_by(user_id=current_user.id).first()
@@ -154,7 +215,12 @@ def callback():
         db.session.add(account)
     account.github_user_id = user["id"]
     account.github_username = user.get("login", "")
-    account.scopes = token_data.get("scope", "")
+    # Prefer the scopes GitHub reports as actually granted (captured from the
+    # ``X-OAuth-Scopes`` header on ``GET /user``), falling back to the
+    # token-exchange response. This value is shown to the user only;
+    # authorization always defers to GitHub's own responses (issue #57).
+    granted = client.granted_scopes
+    account.scopes = ",".join(granted) or (token_data.get("scope") or "")
     account.token_type = token_data.get("token_type", "bearer")
     account.set_access_token(token)
     account.set_refresh_token(token_data.get("refresh_token"))
@@ -215,7 +281,15 @@ def status():
         "account": account.to_dict() if account else None,
     }
     if account is not None:
+        granted = account.granted_scopes
+        payload["scopes"] = granted
+        # A missing ``repo`` scope means private repositories will not load.
+        # This drives a warning banner only; it is never used to gate access
+        # (issue #57).
+        payload["missing_repo_scope"] = "repo" not in granted
         payload["rate_limit"] = _rate_limit_summary()
+        scopes = [scope.strip() for scope in (account.scopes or "").split(",") if scope.strip()]
+        payload["repo_scope_missing"] = bool(scopes) and "repo" not in scopes
     return jsonify(payload)
 
 
@@ -309,6 +383,13 @@ def _throttled_response(retry_after: int):
 def repos():
     """Repository browser page."""
     return render_template("github/repos.html")
+
+
+@bp.route("/repos/lookup")
+@login_required
+def repo_lookup():
+    """Repository lookup form: browse an arbitrary public repository by owner/name."""
+    return render_template("github/repo_lookup.html")
 
 
 @bp.route("/repos/<owner>/<repo>")
@@ -417,6 +498,82 @@ def _repo_matches_query(repo: dict, query: str) -> bool:
     return False
 
 
+def _normalize_full_name(raw: str) -> str | None:
+    """Normalize a user-supplied ``owner/name`` string.
+
+    Accepts an optional ``https://github.com/`` prefix and trailing ``.git``,
+    returning the canonical ``owner/name`` or ``None`` when the input does not
+    look like a repository identifier. The result is still validated by
+    :func:`validate_full_name` before any GitHub call is made.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None
+    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix) :]
+            break
+    value = value.strip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    if not _FULL_NAME_RE.match(value):
+        return None
+    return value
+
+
+@bp.route("/api/repos/lookup")
+@login_required
+def api_repo_lookup():
+    """Resolve an arbitrary ``owner/name`` to a repository the user can access.
+
+    The lookup is performed with the user's own token, so GitHub's access model
+    is authoritative: private repositories the user cannot see return a clear
+    permission error and no metadata is leaked. Public repositories are always
+    resolvable, matching GitHub's own visibility rules.
+    """
+    raw = request.args.get("full_name") or request.args.get("q") or ""
+    full_name = _normalize_full_name(raw)
+    if not full_name:
+        return (
+            jsonify(
+                {
+                    "error": "Enter a repository as owner/name (for example, octocat/Hello-World).",
+                    "code": "invalid_full_name",
+                }
+            ),
+            400,
+        )
+
+    try:
+        client = _client()
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 403
+
+    try:
+        data = client.get_repository(validate_full_name(full_name))
+    except GitHubError as exc:
+        status = getattr(exc, "status_code", None)
+        if status in (403, 404):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Repository '{full_name}' was not found or you do not have "
+                            "permission to view it."
+                        ),
+                        "code": "not_found_or_forbidden",
+                        "full_name": full_name,
+                    }
+                ),
+                404,
+            )
+        return jsonify(github_error_payload(exc)), 502
+
+    payload = repo_payload(data)
+    payload["readme"] = client.get_readme(data.get("full_name", full_name))
+    return jsonify(payload)
+
+
 @bp.route("/api/repos")
 @login_required
 def api_repos():
@@ -476,6 +633,36 @@ def api_branches(owner: str, repo: str):
             }
             for branch in data
         ]
+    )
+
+
+@bp.route("/api/compare/<owner>/<repo>/<base>...<head>")
+@bp.route("/api/repos/<owner>/<repo>/compare/<base>...<head>")
+@login_required
+def api_compare(owner: str, repo: str, base: str, head: str):
+    """Return GitHub's diff between two refs (``base...head``).
+
+    Exposed at ``/github/api/compare/...`` and, for the repository browser, at
+    ``/github/api/repos/<owner>/<repo>/compare/...``.
+    """
+    full_name = validate_full_name(f"{owner}/{repo}")
+    try:
+        client = _client()
+        data = client.compare_refs(full_name, base, head)
+    except GitHubError as exc:
+        return jsonify(github_error_payload(exc)), 502
+    files = data.get("files") or []
+    return jsonify(
+        {
+            "status": data.get("status"),
+            "ahead_by": data.get("ahead_by"),
+            "behind_by": data.get("behind_by"),
+            "total_commits": data.get("total_commits"),
+            "commits": data.get("commits") or [],
+            "files": files,
+            "additions": sum(file.get("additions") or 0 for file in files),
+            "deletions": sum(file.get("deletions") or 0 for file in files),
+        }
     )
 
 
@@ -665,10 +852,28 @@ def api_issues(owner: str, repo: str):
     state = request.args.get("state", "open")
     if state not in ("open", "closed", "all"):
         state = "open"
+    labels = request.args.get("labels", "").strip() or None
+    assignee = request.args.get("assignee", "").strip() or None
+    search = request.args.get("q", "").strip() or None
     page, per_page = _page_params()
+    # Only forward the optional filters when they are actually supplied so the
+    # call stays compatible with clients/tests that do not know about them.
+    filters = {}
+    if labels:
+        filters["labels"] = labels
+    if assignee:
+        filters["assignee"] = assignee
+    if search:
+        filters["search"] = search
     try:
         client = _client()
-        result = client.list_issues_page(full_name, state=state, page=page, per_page=per_page)
+        result = client.list_issues_page(
+            full_name,
+            state=state,
+            page=page,
+            per_page=per_page,
+            **filters,
+        )
     except GitHubError as exc:
         return jsonify(github_error_payload(exc)), 502
     return jsonify(_paginated_payload(result, issue_payload))

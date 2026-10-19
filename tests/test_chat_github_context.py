@@ -57,7 +57,7 @@ class RoutedSession:
         self.calls = []
         self.headers = {}
 
-    def request(self, method, url, params=None, timeout=None):
+    def request(self, method, url, params=None, timeout=None, headers=None):
         self.calls.append((method, url, params))
         return self._route(url)
 
