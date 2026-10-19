@@ -60,6 +60,17 @@
     }).join("");
   }
 
+  function pluginBadges(plugin) {
+    if (
+      typeof window !== "undefined" &&
+      window.AICAPluginBadges &&
+      typeof window.AICAPluginBadges.render === "function"
+    ) {
+      return " " + window.AICAPluginBadges.render(plugin);
+    }
+    return "";
+  }
+
   function pluginRow(plugin) {
     var stateBadge;
     if (!plugin.installed) {
@@ -93,7 +104,8 @@
       '<div class="project-row plugin-row" data-id="' + escapeHtml(plugin.id) + '">' +
       "<div>" +
       '<div class="project-name">' + escapeHtml(plugin.name) +
-      ' <span class="activity-meta">v' + escapeHtml(plugin.version) + "</span> " + stateBadge + "</div>" +
+      ' <span class="activity-meta">v' + escapeHtml(plugin.version) + "</span> " + stateBadge +
+      pluginBadges(plugin) + "</div>" +
       "<p class=\"project-meta\">" + escapeHtml(plugin.description || "No description.") + "</p>" +
       "<p class=\"project-meta\">author: " + escapeHtml(plugin.author || "unknown") +
       " &middot; id: " + escapeHtml(plugin.id) + "</p>" +

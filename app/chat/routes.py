@@ -1,15 +1,147 @@
-"""Chat routes: UI page, conversation CRUD, and SSE streaming."""
+"""Chat routes: UI page, conversation CRUD, sharing, and SSE streaming."""
 
+import base64
+import errno
+import hashlib
 import json
+import secrets
+from datetime import UTC, datetime, timedelta
 
-from flask import Response, jsonify, render_template, request
+from flask import (
+    Response,
+    abort,
+    current_app,
+    jsonify,
+    render_template,
+    request,
+    stream_with_context,
+    url_for,
+)
 from flask_login import current_user, login_required
 from sqlalchemy import func
 
 from app.chat import bp
 from app.extensions import db
-from app.models import Conversation, Message
-from app.services.llm import LLMProviderError, get_provider
+from app.models import (
+    Conversation,
+    ConversationShare,
+    Message,
+    MessageAttachment,
+    ProjectFile,
+    User,
+    Workspace,
+)
+from app.models.message_attachment import ALLOWED_IMAGE_TYPES
+from app.models.project import STATUS_READY
+from app.services import audit, chat_export, token_usage
+from app.services.conversation_search import search_conversations
+from app.services.github import (
+    GitHubError,
+    GitHubNotConnectedError,
+    build_github_context,
+    github_error_message,
+)
+from app.services.llm import LLMProviderError, provider_status
+from app.services.llm_cache import cached_chat
+from app.services.notifications import notify
+from app.services.provider_config import (
+    DEFAULT_TEMPERATURE,
+    ProviderSettingsError,
+    apply_settings,
+    build_provider,
+    provider_options,
+)
+from app.services.providers.registry import resolve_provider_name
+from app.services.providers.retry import RetryingProvider, is_transient_error
+
+#: Machine-readable code returned when the configured provider has no key.
+PROVIDER_NOT_CONFIGURED_CODE = "provider_not_configured"
+
+
+def _provider_not_configured_payload(status: dict) -> dict:
+    """Build the distinct payload for a provider that has no usable key.
+
+    The client keys off ``code`` to render the onboarding panel instead of a
+    generic error, and uses ``provider`` to link to the right API-key entry.
+    """
+    provider = status.get("provider") or "the configured provider"
+    return {
+        "error": (
+            f"No API key is configured for '{provider}'. Add one under API keys to start chatting."
+        ),
+        "code": PROVIDER_NOT_CONFIGURED_CODE,
+        "provider": status.get("provider"),
+        "reason": status.get("reason"),
+    }
+
+
+#: Machine-readable code returned when a stream drops and the client should
+#: offer a retry (issue: streaming indicator and typing feedback).
+STREAM_INTERRUPTED_CODE = "stream_interrupted"
+
+
+def _stream_interrupted_payload(reply: str, reason: str | None = None) -> dict:
+    """Build the payload sent when an SSE stream drops mid-generation.
+
+    The partial reply is included so the client can keep what was generated
+    and offer a visible retry affordance instead of silently losing output.
+    """
+    return {
+        "type": "error",
+        "code": STREAM_INTERRUPTED_CODE,
+        "error": reason or "The response stream was interrupted. Retry to continue.",
+        "partial": reply,
+        "retryable": True,
+    }
+
+
+#: Machine-readable code returned when a message references GitHub context but
+#: the user has not connected a GitHub account (issue #74).
+GITHUB_NOT_CONNECTED_CODE = "github_not_connected"
+
+
+def _github_not_connected_payload() -> dict:
+    """Build the connection prompt for GitHub context without a linked account.
+
+    Mirrors the provider onboarding payload so the client can render a
+    "Connect GitHub" call to action instead of a generic error (issue #74).
+    """
+    return {
+        "error": (
+            "Connect your GitHub account to reference repositories, issues or pull "
+            "requests in chat."
+        ),
+        "code": GITHUB_NOT_CONNECTED_CODE,
+        "connect_url": url_for("github.connect"),
+    }
+
+
+def _github_context_messages(user, content: str) -> tuple[list[dict], dict | None, int]:
+    """Resolve the GitHub references in a message for a user (issue #74).
+
+    Returns ``(messages, error, status)``: the extra system messages carrying the
+    fetched context, or an error payload and the status to return it with. An
+    empty message list with no error means the message referenced nothing, so
+    chat keeps working for users who never connected GitHub.
+    """
+    try:
+        result = build_github_context(user, content)
+    except GitHubNotConnectedError:
+        return [], _github_not_connected_payload(), 409
+    except GitHubError as exc:
+        return [], {"error": github_error_message(exc), "code": "github_error"}, 502
+
+    messages: list[dict] = []
+    if result["context"]:
+        messages.append({"role": "system", "content": result["context"]})
+    if result["notices"]:
+        messages.append(
+            {
+                "role": "system",
+                "content": "GitHub context notes:\n- " + "\n- ".join(result["notices"]),
+            }
+        )
+    return messages, None, 200
 
 
 def _get_conversation(conversation_id: int) -> Conversation:
@@ -20,37 +152,273 @@ def _get_conversation(conversation_id: int) -> Conversation:
     return conversation
 
 
+def _get_visible_conversation(conversation_id: int) -> Conversation:
+    """Return a conversation readable by the current user (owner or shared)."""
+    conversation = Conversation.query.filter_by(id=conversation_id).first_or_404()
+    if conversation.user_id == current_user.id or conversation.is_shared_with(current_user.id):
+        return conversation
+    abort(404)
+
+
+def _shared_conversation_ids() -> list[int]:
+    """Conversation ids the current user can read because they were shared in."""
+    rows = (
+        ConversationShare.query.filter_by(user_id=current_user.id)
+        .with_entities(ConversationShare.conversation_id)
+        .all()
+    )
+    return [row[0] for row in rows]
+
+
+# --------------------------------------------------------------------------
+# Workspace scoping
+#
+# A conversation may optionally be filed under one of the caller's own
+# workspaces. Everything here is owner-scoped: a workspace id that belongs to
+# somebody else is treated exactly like one that does not exist, so these routes
+# are never an existence oracle.
+# --------------------------------------------------------------------------
+
+#: Sentinel distinguishing "no workspace selected" (show every conversation)
+#: from a concrete workspace id, since ``0`` is not a valid primary key.
+ALL_WORKSPACES = "all"
+
+
+def _owned_workspaces() -> list[Workspace]:
+    """Return the current user's workspaces, pinned first then most recent."""
+    return (
+        Workspace.query.filter_by(user_id=current_user.id)
+        .order_by(Workspace.is_pinned.desc(), Workspace.updated_at.desc())
+        .all()
+    )
+
+
+def _requested_workspace_id(raw) -> int | str | None:
+    """Normalize a ``workspace_id`` argument to an owned id, ``"all"``, or ``None``.
+
+    Returns ``None`` when the argument is absent/blank (no filtering) and
+    :data:`ALL_WORKSPACES` for the explicit "every workspace" selection. Raises
+    ``(error, 404)`` for a malformed value or a workspace the caller does not
+    own, so an unowned id is indistinguishable from a nonexistent one.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        if raw == ALL_WORKSPACES:
+            return ALL_WORKSPACES
+    try:
+        workspace_id = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("A valid workspace_id is required.") from None
+    if Workspace.query.filter_by(id=workspace_id, user_id=current_user.id).first() is None:
+        raise LookupError("Workspace not found.")
+    return workspace_id
+
+
+def _apply_workspace_filter(query, raw):
+    """Scope a conversation query to the requested workspace.
+
+    Shared-in conversations always carry the *owner's* workspace, so they are
+    only visible in the "all workspaces" view - filing them into the reader's
+    workspace list would leak the organizer's project structure.
+    """
+    try:
+        workspace_id = _requested_workspace_id(raw)
+    except ValueError as exc:
+        return query, (jsonify({"error": str(exc)}), 400)
+    except LookupError as exc:
+        return query, (jsonify({"error": str(exc)}), 404)
+    if workspace_id is None or workspace_id == ALL_WORKSPACES:
+        return query, None
+    return (
+        query.filter(
+            db.and_(
+                Conversation.user_id == current_user.id,
+                Conversation.workspace_id == workspace_id,
+            )
+        ),
+        None,
+    )
+
+
+def _assign_workspace(conversation: Conversation, data: dict):
+    """Apply ``workspace_id`` from a create/update payload to ``conversation``.
+
+    Returns ``None`` on success or a ``(payload, status)`` error tuple. A
+    workspace the caller does not own is rejected with 404 (no existence
+    oracle), matching the read paths.
+    """
+    if "workspace_id" not in data:
+        return None
+    raw = data.get("workspace_id")
+    if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == ALL_WORKSPACES:
+        conversation.workspace_id = None
+        return None
+    try:
+        workspace_id = _requested_workspace_id(raw)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    conversation.workspace_id = workspace_id
+    return None
+
+
+def _message_images(message) -> list[dict]:
+    """Return base64 image payloads for a message's attachments (issue #49)."""
+    return [
+        {
+            "content_type": attachment.content_type,
+            "data": base64.b64encode(attachment.data).decode("ascii"),
+        }
+        for attachment in message.attachments
+    ]
+
+
+def _conversation_messages(conversation, context_messages=None) -> list[dict]:
+    """Build the outgoing message list, honoring system prompt, GitHub context and images."""
+    messages: list[dict] = []
+    if conversation.system_prompt:
+        messages.append({"role": "system", "content": conversation.system_prompt})
+    messages.extend(context_messages or [])
+    for message in conversation.messages:
+        item: dict = {"role": message.role, "content": message.content}
+        images = _message_images(message)
+        if images:
+            item["images"] = images
+        messages.append(item)
+    return messages
+
+
+def _link_attachments(conversation, message, attachment_ids) -> str | None:
+    """Attach uploaded images to ``message``, returning an error string or None.
+
+    Only images uploaded against this conversation and not yet linked to a
+    message may be attached, so another user's (or conversation's) upload can
+    never be pulled in.
+    """
+    if not attachment_ids:
+        return None
+    if not isinstance(attachment_ids, list):
+        return "Attachment ids must be a list."
+    limit = int(current_app.config.get("CHAT_IMAGE_MAX_PER_MESSAGE", 4))
+    if len(attachment_ids) > limit:
+        return f"At most {limit} images can be attached to one message."
+    for raw_id in attachment_ids:
+        try:
+            attachment_id = int(raw_id)
+        except (TypeError, ValueError):
+            return "Invalid attachment id."
+        attachment = MessageAttachment.query.filter_by(
+            id=attachment_id, conversation_id=conversation.id, message_id=None
+        ).first()
+        if attachment is None:
+            return "Attachment not found."
+        message.attachments.append(attachment)
+    return None
+
+
+def _generation_kwargs(conversation) -> dict:
+    """Return the ``model``/``params`` passed to the provider for a conversation."""
+    params = {}
+    if conversation.temperature is not None:
+        params["temperature"] = conversation.temperature
+    return {"model": conversation.model, "params": params or None}
+
+
+#: Cap on files returned per project in the chat file tree (keeps the payload
+#: bounded for large imports); ``truncated`` signals the client when it applies.
+MAX_TREE_FILES = 500
+
+
 @bp.route("/")
 @login_required
 def index():
-    """Render the chat interface with the user's conversations."""
-    conversations = (
-        Conversation.query.filter_by(user_id=current_user.id)
-        .order_by(Conversation.is_pinned.desc(), Conversation.updated_at.desc())
-        .all()
+    """Render the chat interface with the user's conversations.
+
+    ``?workspace_id=<id>`` scopes the sidebar to a single workspace and
+    ``?workspace_id=all`` (the default) shows every conversation. The workspace
+    list backs the sidebar selector so the user can file or create a workspace
+    without leaving the page.
+    """
+    shared_ids = _shared_conversation_ids()
+    base = Conversation.query.filter(
+        db.or_(Conversation.user_id == current_user.id, Conversation.id.in_(shared_ids))
     )
-    return render_template("chat/index.html", conversations=conversations)
+    base, error = _apply_workspace_filter(base, request.args.get("workspace_id"))
+    if error is not None:
+        abort(404)
+    conversations = base.order_by(
+        Conversation.is_pinned.desc(), Conversation.updated_at.desc()
+    ).all()
+    selected = request.args.get("workspace_id") or ALL_WORKSPACES
+    return render_template(
+        "chat/index.html",
+        conversations=conversations,
+        workspaces=_owned_workspaces(),
+        selected_workspace=selected,
+        provider_status=provider_status(current_user),
+    )
+
+
+@bp.route("/api/provider-status")
+@login_required
+def api_provider_status():
+    """Report whether the LLM provider is ready to serve requests.
+
+    The chat UI calls this after the user visits the API-key page so the
+    composer unlocks without a full page reload (issue #25).
+    """
+    return jsonify(provider_status(current_user))
 
 
 @bp.route("/conversations", methods=["GET"])
 @login_required
 def list_conversations():
-    """Return the current user's conversations as JSON (for search/refresh)."""
+    """Return the current user's conversations as JSON (for search/refresh).
+
+    ``workspace_id`` scopes the list to one workspace; omit it (or pass ``all``)
+    to return everything the caller can see.
+    """
     query = request.args.get("q", "").strip().lower()
-    base = Conversation.query.filter_by(user_id=current_user.id)
+    shared_ids = _shared_conversation_ids()
+    base = Conversation.query.filter(
+        db.or_(Conversation.user_id == current_user.id, Conversation.id.in_(shared_ids))
+    )
+    base, error = _apply_workspace_filter(base, request.args.get("workspace_id"))
+    if error is not None:
+        return error
     if query:
         base = base.filter(func.lower(Conversation.title).contains(query))
     conversations = base.order_by(Conversation.updated_at.desc()).all()
     return jsonify([c.to_dict() for c in conversations])
 
 
+@bp.route("/search", methods=["GET"])
+@login_required
+def search():
+    """Search the current user's conversation titles and message content."""
+    query = request.args.get("q", "")
+    return jsonify(search_conversations(current_user.id, query))
+
+
 @bp.route("/conversations", methods=["POST"])
 @login_required
 def create_conversation():
-    """Create a new empty conversation."""
+    """Create a new empty conversation, optionally filed under a workspace."""
     data = request.get_json(silent=True) or {}
     title = (data.get("title") or "New conversation").strip()[:200]
     conversation = Conversation(user_id=current_user.id, title=title or "New conversation")
+    error = _assign_workspace(conversation, data)
+    if error is not None:
+        return error
+    try:
+        apply_settings(conversation, data, current_user)
+    except ProviderSettingsError as exc:
+        return jsonify({"error": str(exc)}), 400
     db.session.add(conversation)
     db.session.commit()
     return jsonify(conversation.to_dict()), 201
@@ -59,25 +427,105 @@ def create_conversation():
 @bp.route("/conversations/<int:conversation_id>", methods=["GET"])
 @login_required
 def get_conversation(conversation_id: int):
-    """Return a conversation with its full message history."""
-    conversation = _get_conversation(conversation_id)
+    """Return a conversation with its full message history.
+
+    Readable by the owner and by any user the conversation was shared with.
+    """
+    conversation = _get_visible_conversation(conversation_id)
     payload = conversation.to_dict()
     payload["messages"] = [m.to_dict() for m in conversation.messages]
+    payload["shared_user_ids"] = [s.user_id for s in conversation.shares]
+    # Cumulative token usage across the conversation (issue #13).
+    payload["usage"] = token_usage.sum_usage(conversation.messages)
     return jsonify(payload)
+
+
+@bp.route("/api/usage/daily")
+@login_required
+def api_usage_daily():
+    """Return the current user's daily token totals (issue #13).
+
+    Query param ``days`` (default 30, max 365) bounds the window. Days with no
+    usage are omitted. This backs the "daily per-user totals are queryable"
+    acceptance criterion and future quota/billing work.
+    """
+    days = request.args.get("days", 30, type=int) or 30
+    days = min(max(days, 1), 365)
+    since = datetime.now(UTC) - timedelta(days=days)
+
+    day = func.date(Message.created_at).label("day")
+    rows = (
+        db.session.query(
+            day,
+            func.coalesce(func.sum(Message.prompt_tokens), 0),
+            func.coalesce(func.sum(Message.completion_tokens), 0),
+            func.coalesce(func.sum(Message.total_tokens), 0),
+        )
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .filter(Conversation.user_id == current_user.id, Message.created_at >= since)
+        .group_by(day)
+        .order_by(day)
+        .all()
+    )
+    return jsonify(
+        [
+            {
+                "date": str(row[0]),
+                "prompt_tokens": int(row[1] or 0),
+                "completion_tokens": int(row[2] or 0),
+                "total_tokens": int(row[3] or 0),
+            }
+            for row in rows
+        ]
+    )
 
 
 @bp.route("/conversations/<int:conversation_id>", methods=["PATCH"])
 @login_required
 def update_conversation(conversation_id: int):
-    """Rename or pin/unpin a conversation."""
+    """Rename, pin/unpin, or move a conversation to another workspace."""
     conversation = _get_conversation(conversation_id)
     data = request.get_json(silent=True) or {}
     if "title" in data:
         conversation.title = (data.get("title") or "Untitled").strip()[:200]
     if "is_pinned" in data:
         conversation.is_pinned = bool(data["is_pinned"])
+    error = _assign_workspace(conversation, data)
+    if error is not None:
+        return error
     db.session.commit()
     return jsonify(conversation.to_dict())
+
+
+@bp.route("/conversations/<int:conversation_id>/settings", methods=["PATCH"])
+@login_required
+def update_conversation_settings(conversation_id: int):
+    """Persist the conversation's provider/model/temperature/system prompt.
+
+    Settings apply to subsequent messages, so a new conversation is not needed
+    to change them.
+    """
+    conversation = _get_conversation(conversation_id)
+    data = request.get_json(silent=True) or {}
+    try:
+        apply_settings(conversation, data, current_user)
+    except ProviderSettingsError as exc:
+        return jsonify({"error": str(exc)}), 400
+    db.session.commit()
+    return jsonify(conversation.to_dict())
+
+
+@bp.route("/api/options")
+@login_required
+def api_options():
+    """Return the providers/models the current user can select (issue #12)."""
+    return jsonify(
+        {
+            "providers": provider_options(current_user),
+            "default_provider": resolve_provider_name(),
+            "default_temperature": DEFAULT_TEMPERATURE,
+        }
+    )
 
 
 @bp.route("/conversations/<int:conversation_id>", methods=["DELETE"])
@@ -85,7 +533,16 @@ def update_conversation(conversation_id: int):
 def delete_conversation(conversation_id: int):
     """Delete a conversation and all of its messages."""
     conversation = _get_conversation(conversation_id)
+    conversation_id_value = conversation.id
+    title = conversation.title
     db.session.delete(conversation)
+    audit.record(
+        audit.CONVERSATION_DELETED,
+        user=current_user,
+        target_type="conversation",
+        target_id=conversation_id_value,
+        metadata={"title": title},
+    )
     db.session.commit()
     return jsonify({"ok": True})
 
@@ -107,6 +564,244 @@ def export_conversation(conversation_id: int):
     )
 
 
+@bp.route("/conversations/<int:conversation_id>/export.md")
+@login_required
+def export_conversation_markdown(conversation_id: int):
+    """Export a conversation as a downloadable Markdown document (issue #46)."""
+    conversation = _get_conversation(conversation_id)
+    body = chat_export.render_conversation_markdown(conversation)
+    filename = f"conversation-{conversation.id}.md"
+    return Response(
+        body,
+        mimetype="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@bp.route("/conversations/<int:conversation_id>/shares", methods=["GET"])
+@login_required
+def list_shares(conversation_id: int):
+    """Return who a conversation was shared with (owner only)."""
+    conversation = _get_conversation(conversation_id)
+    return jsonify([s.to_dict() for s in conversation.shares])
+
+
+@bp.route("/conversations/<int:conversation_id>/shares", methods=["POST"])
+@login_required
+def share_conversation(conversation_id: int):
+    """Share a conversation with another registered user (owner only).
+
+    Creates a persistent ``ConversationShare`` row and a ``share``
+    notification for the recipient so the share is discoverable in the app.
+    """
+    conversation = _get_conversation(conversation_id)
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    if not username:
+        return jsonify({"error": "A recipient username is required."}), 400
+
+    recipient = User.query.filter_by(username=username).first()
+    if recipient is None:
+        return jsonify({"error": "No user with that username exists."}), 404
+    if recipient.id == current_user.id:
+        return jsonify({"error": "You cannot share a conversation with yourself."}), 400
+    existing = ConversationShare.query.filter_by(
+        conversation_id=conversation.id, user_id=recipient.id
+    ).first()
+    if existing is not None:
+        return jsonify({"error": "This conversation is already shared with that user."}), 409
+
+    share = ConversationShare(
+        conversation_id=conversation.id,
+        user_id=recipient.id,
+        shared_by_id=current_user.id,
+    )
+    db.session.add(share)
+    notify(
+        recipient,
+        "share",
+        actor=current_user,
+        payload={
+            "title": conversation.title,
+            "conversation_id": conversation.id,
+        },
+        link=url_for("chat.index", conversation=conversation.id),
+    )
+    db.session.commit()
+    return jsonify(share.to_dict()), 201
+
+
+@bp.route("/conversations/<int:conversation_id>/shares/<int:user_id>", methods=["DELETE"])
+@login_required
+def unshare_conversation(conversation_id: int, user_id: int):
+    """Remove a previously created share (owner only)."""
+    conversation = _get_conversation(conversation_id)
+    share = ConversationShare.query.filter_by(
+        conversation_id=conversation.id, user_id=user_id
+    ).first_or_404()
+    db.session.delete(share)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@bp.route("/conversations/<int:conversation_id>/share-links", methods=["GET", "POST"])
+@login_required
+def create_share_link(conversation_id: int):
+    """Create an expiring, read-only URL for a conversation owned by caller."""
+    if request.method == "GET":
+        conversation = _get_visible_conversation(conversation_id)
+        if conversation.user_id != current_user.id:
+            return jsonify([])
+        links = (
+            ConversationShare.query.filter_by(conversation_id=conversation.id)
+            .filter(ConversationShare.token_hash.isnot(None))
+            .order_by(ConversationShare.created_at.desc())
+            .all()
+        )
+        return jsonify(
+            [
+                {
+                    "id": link.id,
+                    "expires_at": link.expires_at.isoformat(),
+                    "permission": link.permission,
+                }
+                for link in links
+            ]
+        )
+    conversation = _get_conversation(conversation_id)
+    data = request.get_json(silent=True) or {}
+    try:
+        hours = int(data.get("expires_in_hours", 168))
+    except (TypeError, ValueError):
+        return jsonify({"error": "expires_in_hours must be an integer."}), 400
+    if hours < 1 or hours > 24 * 365:
+        return jsonify({"error": "Expiry must be between 1 hour and 365 days."}), 400
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(hours=hours)
+    share = ConversationShare(
+        conversation_id=conversation.id,
+        user_id=None,
+        shared_by_id=current_user.id,
+        token_hash=hashlib.sha256(token.encode()).hexdigest(),
+        expires_at=expires_at,
+        permission="read_only",
+    )
+    db.session.add(share)
+    db.session.commit()
+    return (
+        jsonify(
+            {
+                "id": share.id,
+                "url": url_for("chat.view_shared_conversation", token=token, _external=True),
+                "created_by": current_user.id,
+                "expires_at": expires_at.isoformat(),
+                "permission": "read_only",
+            }
+        ),
+        201,
+    )
+
+
+@bp.route("/conversations/<int:conversation_id>/share-links/<int:share_id>", methods=["DELETE"])
+@login_required
+def revoke_share_link(conversation_id: int, share_id: int):
+    """Revoke one of the current owner's public links."""
+    conversation = _get_conversation(conversation_id)
+    share = (
+        ConversationShare.query.filter_by(id=share_id, conversation_id=conversation.id)
+        .filter(ConversationShare.token_hash.isnot(None))
+        .first_or_404()
+    )
+    db.session.delete(share)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@bp.route("/shared/<token>")
+def view_shared_conversation(token: str):
+    """Render only the message history authorized by a valid share token."""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    share = ConversationShare.query.filter_by(token_hash=token_hash).first()
+    now = datetime.now(UTC)
+    if share is None or share.expires_at is None:
+        abort(404)
+    expiry = (
+        share.expires_at.replace(tzinfo=UTC)
+        if share.expires_at.tzinfo is None
+        else share.expires_at
+    )
+    if expiry <= now or share.permission != "read_only":
+        abort(404)
+    conversation = Conversation.query.filter_by(id=share.conversation_id).first()
+    if conversation is None:
+        abort(404)
+    messages = [
+        {"role": message.role, "content": message.content, "created_at": message.created_at}
+        for message in conversation.messages
+        if message.role in {"user", "assistant"}
+    ]
+    return render_template(
+        "chat/shared_conversation.html", title=conversation.title, messages=messages
+    )
+
+
+@bp.route("/conversations/<int:conversation_id>/attachments", methods=["POST"])
+@login_required
+def upload_attachment(conversation_id: int):
+    """Upload an image to attach to a later message (issue #49).
+
+    The image is validated (png/jpeg/webp, within the size cap) and stored
+    against the conversation; the returned id is passed as ``attachment_ids``
+    when sending the message.
+    """
+    conversation = _get_conversation(conversation_id)
+    upload = request.files.get("image")
+    if upload is None or not (upload.filename or "").strip():
+        return jsonify({"error": "An image file is required."}), 400
+    content_type = (upload.mimetype or "").lower()
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        return jsonify({"error": "Only PNG, JPEG, or WebP images are supported."}), 400
+    max_bytes = int(current_app.config.get("CHAT_IMAGE_MAX_BYTES", 5 * 1024 * 1024))
+    data = upload.read(max_bytes + 1)
+    if not data:
+        return jsonify({"error": "The uploaded image was empty."}), 400
+    if len(data) > max_bytes:
+        return jsonify({"error": "This image is too large."}), 400
+
+    attachment = MessageAttachment(
+        conversation_id=conversation.id,
+        filename=(upload.filename or "image")[:255],
+        content_type=content_type,
+        size=len(data),
+        data=data,
+    )
+    db.session.add(attachment)
+    db.session.commit()
+    return jsonify(attachment.to_dict()), 201
+
+
+@bp.route("/attachments/<int:attachment_id>")
+@login_required
+def get_attachment(attachment_id: int):
+    """Serve an attachment's bytes inline to its owner."""
+    attachment = (
+        MessageAttachment.query.join(
+            Conversation, MessageAttachment.conversation_id == Conversation.id
+        )
+        .filter(MessageAttachment.id == attachment_id, Conversation.user_id == current_user.id)
+        .first_or_404()
+    )
+    filename = (attachment.filename or "image").replace('"', "")
+    return Response(
+        attachment.data,
+        mimetype=attachment.content_type,
+        headers={
+            "Cache-Control": "private, max-age=0, no-store",
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
+
+
 @bp.route("/conversations/<int:conversation_id>/messages", methods=["POST"])
 @login_required
 def send_message(conversation_id: int):
@@ -118,20 +813,50 @@ def send_message(conversation_id: int):
     conversation = _get_conversation(conversation_id)
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
+    attachment_ids = data.get("attachment_ids") or []
+    if not content and not attachment_ids:
+        return jsonify({"error": "Message content or an image is required."}), 400
     if not content:
-        return jsonify({"error": "Message content is required."}), 400
+        content = "(image attached)"
 
-    history = [{"role": m.role, "content": m.content} for m in conversation.messages]
-    conversation.messages.append(Message(role="user", content=content))
+    status = provider_status(current_user)
+    if not status["configured"]:
+        return jsonify(_provider_not_configured_payload(status)), 503
+
+    context_messages, context_error, context_status = _github_context_messages(
+        current_user, content
+    )
+    if context_error is not None:
+        return jsonify(context_error), context_status
+
+    # ``no_cache`` lets a client force a fresh provider call (issue #18).
+    no_cache = bool(data.get("no_cache"))
+    user_message = Message(role="user", content=content)
+    conversation.messages.append(user_message)
+    error = _link_attachments(conversation, user_message, attachment_ids)
+    if error:
+        db.session.rollback()
+        return jsonify({"error": error}), 400
+
+    messages = _conversation_messages(conversation, context_messages)
 
     try:
-        provider = get_provider()
-        reply = provider.complete([*history, {"role": "user", "content": content}])
+        provider = RetryingProvider(build_provider(current_user, conversation.provider))
+        generation = _generation_kwargs(conversation)
+        response = cached_chat(
+            current_user,
+            messages,
+            provider=provider,
+            model=generation.get("model"),
+            params=generation.get("params"),
+            no_cache=no_cache,
+        )
     except LLMProviderError as exc:
         db.session.rollback()
         return jsonify({"error": str(exc)}), 502
 
-    conversation.messages.append(Message(role="assistant", content=reply))
+    usage = token_usage.usage_from_response(response, messages)
+    conversation.messages.append(Message(role="assistant", content=response.content, **usage))
     if conversation.title == "New conversation":
         conversation.title = content.strip()[:60] or "New conversation"
     db.session.commit()
@@ -150,35 +875,165 @@ def stream_message(conversation_id: int):
     conversation = _get_conversation(conversation_id)
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
+    attachment_ids = data.get("attachment_ids") or []
+    if not content and not attachment_ids:
+        return jsonify({"error": "Message content or an image is required."}), 400
     if not content:
-        return jsonify({"error": "Message content is required."}), 400
+        content = "(image attached)"
 
-    history = [{"role": m.role, "content": m.content} for m in conversation.messages]
-    conversation.messages.append(Message(role="user", content=content))
+    status = provider_status(current_user)
+    if not status["configured"]:
+        return jsonify(_provider_not_configured_payload(status)), 503
+
+    context_messages, context_error, context_status = _github_context_messages(
+        current_user, content
+    )
+    if context_error is not None:
+        return jsonify(context_error), context_status
+
+    user_message = Message(role="user", content=content)
+    conversation.messages.append(user_message)
+    error = _link_attachments(conversation, user_message, attachment_ids)
+    if error:
+        db.session.rollback()
+        return jsonify({"error": error}), 400
     db.session.commit()
+    messages = _conversation_messages(conversation, context_messages)
+    generation = _generation_kwargs(conversation)
 
-    def generate():
-        try:
-            provider = get_provider()
-            for chunk in provider.stream([*history, {"role": "user", "content": content}]):
-                yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-        except LLMProviderError as exc:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
-            return
+    def persist_assistant(reply: str, usage: dict | None = None):
+        """Persist an assistant message, or return ``None`` when empty.
 
-        # Persist the complete reply built from the streamed chunks is not
-        # possible inside the generator without buffering; instead the mock
-        # provider's complete() is used for a canonical response.
-        try:
-            provider = get_provider()
-            reply = provider.complete([*history, {"role": "user", "content": content}])
-        except LLMProviderError as exc:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
-            return
-
-        message = Message(role="assistant", content=reply)
+        Used both for the completed reply and for the partial text kept when
+        the client cancels mid-stream (issue #11). ``usage`` records the token
+        counts for the message (issue #13).
+        """
+        reply = reply or ""
+        if not reply.strip():
+            return None
+        message = Message(role="assistant", content=reply, **(usage or {}))
         conversation.messages.append(message)
         db.session.commit()
-        yield f"data: {json.dumps({'type': 'done', 'message': message.to_dict()})}\n\n"
+        return message
 
-    return Response(generate(), mimetype="text/event-stream")
+    def stream_usage(reply: str) -> dict:
+        """Estimated usage for a streamed reply (streams report no token counts)."""
+        return token_usage.usage_from_text(token_usage.messages_text(messages), reply)
+
+    def generate():
+        # Accumulate chunks so a cancelled stream can still keep what it got.
+        chunks: list[str] = []
+        try:
+            provider = RetryingProvider(build_provider(current_user, conversation.provider))
+            for chunk in provider.stream(messages, **generation):
+                chunks.append(chunk)
+                yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+        except GeneratorExit:
+            # The client disconnected (Stop button or closed tab). Persist the
+            # partial reply so the user keeps what was generated, then stop.
+            partial = "".join(chunks)
+            persist_assistant(partial, stream_usage(partial))
+            raise
+        except OSError as exc:
+            # The transport dropped (connection reset, broken pipe, timeout).
+            # Keep the partial reply and surface a retryable error event so the
+            # client can show a retry affordance instead of losing output.
+            partial = "".join(chunks)
+            persist_assistant(partial, stream_usage(partial))
+            reason = None
+            if getattr(exc, "errno", None) in (errno.ECONNRESET, errno.EPIPE):
+                reason = "The connection was interrupted. Retry to continue."
+            yield f"data: {json.dumps(_stream_interrupted_payload(partial, reason))}\n\n"
+            return
+        except LLMProviderError as exc:
+            # A provider failure mid-stream: keep the partial text too.
+            partial = "".join(chunks)
+            persist_assistant(partial, stream_usage(partial))
+            payload = _stream_interrupted_payload(partial, str(exc))
+            payload["retryable"] = is_transient_error(exc)
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
+
+        reply = "".join(chunks)
+        message = persist_assistant(reply, stream_usage(reply))
+        if message is None:
+            # The provider streamed no text; fall back to a single completion.
+            try:
+                provider = RetryingProvider(build_provider(current_user, conversation.provider))
+                response = provider.chat(messages, **generation)
+                message = persist_assistant(
+                    response.content, token_usage.usage_from_response(response, messages)
+                )
+            except LLMProviderError as exc:
+                payload = _stream_interrupted_payload("", str(exc))
+                payload["retryable"] = is_transient_error(exc)
+                yield f"data: {json.dumps(payload)}\n\n"
+                return
+
+        payload = {"type": "done", "message": message.to_dict() if message else None}
+        yield f"data: {json.dumps(payload)}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+# --------------------------------------------------------------------------
+# API: project file tree (for the chat sidebar)
+# --------------------------------------------------------------------------
+
+
+@bp.route("/api/project-files")
+@login_required
+def api_project_files():
+    """Return the current user's workspaces/projects/files for the chat tree.
+
+    Grouped by workspace, then project, so the chat sidebar can render a
+    collapsible tree. File content is fetched separately (owner-scoped) via the
+    workspace file endpoint when a file is opened.
+    """
+    workspaces = (
+        Workspace.query.filter_by(user_id=current_user.id).order_by(Workspace.name.asc()).all()
+    )
+
+    result = []
+    for workspace in workspaces:
+        projects = []
+        for project in workspace.projects:
+            if project.status != STATUS_READY:
+                projects.append(
+                    {
+                        "id": project.id,
+                        "name": project.name,
+                        "status": project.status,
+                        "truncated": False,
+                        "files": [],
+                    }
+                )
+                continue
+
+            rows = (
+                ProjectFile.query.filter_by(project_id=project.id)
+                .order_by(ProjectFile.path.asc())
+                .limit(MAX_TREE_FILES + 1)
+                .all()
+            )
+            truncated = len(rows) > MAX_TREE_FILES
+            files = []
+            for file in rows[:MAX_TREE_FILES]:
+                payload = file.to_dict()
+                payload["project_id"] = project.id
+                payload["created_at"] = file.created_at.isoformat() if file.created_at else None
+                files.append(payload)
+
+            projects.append(
+                {
+                    "id": project.id,
+                    "name": project.name,
+                    "status": project.status,
+                    "truncated": truncated,
+                    "files": files,
+                }
+            )
+
+        result.append({"id": workspace.id, "name": workspace.name, "projects": projects})
+
+    return jsonify(result)

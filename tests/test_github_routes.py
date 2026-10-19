@@ -5,6 +5,7 @@ network. The OAuth token-exchange POST is mocked the same way.
 """
 
 import json
+from datetime import UTC, datetime, timedelta
 
 from app.extensions import db
 from app.models import GithubAccount, User
@@ -24,19 +25,35 @@ class FakeResponse:
         return self._data
 
 
-def _make_fake_session(script):
+class FakeHTMLResponse(FakeResponse):
+    """A response whose body is not JSON, mirroring a GitHub 5xx HTML page."""
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+def _make_fake_session(script, sessions=None):
+    """Build a fake ``requests.Session`` that serves ``script``.
+
+    ``script`` entries are ``(method, path_fragment, status, data)``. When
+    ``sessions`` is a list, every constructed session is appended to it so a
+    test can assert on the auth headers the client used.
+    """
     ordered = sorted(script, key=lambda entry: len(entry[1]), reverse=True)
 
     class FakeSession:
         def __init__(self):
             self.headers = {"Authorization": "", "X-GitHub-Api-Version": "2022-11-28"}
+            if sessions is not None:
+                sessions.append(self)
 
         def request(self, method, url, params=None, timeout=None, **kwargs):
             url_path = url.split("api.github.com", 1)[-1].split("?", 1)[0]
             for entry in ordered:
                 if entry[0] in (method, "*") and (entry[1] == "*" or entry[1] in url_path):
                     status, data = entry[2], entry[3]
-                    return FakeResponse(status, data)
+                    headers = entry[4] if len(entry) > 4 else None
+                    return FakeResponse(status, data, headers=headers)
             raise AssertionError(f"Unhandled request: {method} {url_path}")
 
         def get(self, url, params=None, timeout=None, **kwargs):
@@ -66,6 +83,46 @@ def _create_account(app):
     db.session.add(account)
     db.session.commit()
     return account
+
+
+def _flashes(client):
+    """Return the pending flash messages as a list of strings."""
+    with client.session_transaction() as sess:
+        return [message for _, message in sess.get("_flashes", [])]
+
+
+def _forbid_token_exchange(calls):
+    """Return a ``requests.post`` stand-in that records no successful exchange.
+
+    Any call appends to ``calls`` and still answers, so a test that expects the
+    exchange to be skipped can assert on an empty ``calls`` list instead of
+    relying on an exception to fail the assertion.
+    """
+
+    def _post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse(200, {"access_token": "should-not-be-used"})
+
+    return _post
+
+
+def _token_exchange(calls, response):
+    """Return a ``requests.post`` stand-in that records the request and replays ``response``."""
+
+    def _post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return response
+
+    return _post
+
+
+def _assert_no_error_leakage(body, secrets):
+    """Assert that no sensitive or internal value reached the rendered page."""
+    text = body if isinstance(body, str) else body.decode()
+    for secret in secrets:
+        assert secret not in text, f"error detail leaked into the page: {secret!r}"
+    for marker in ("Traceback (most recent call last)", "GitHubError", "RequestException"):
+        assert marker not in text, f"internal failure detail leaked into the page: {marker!r}"
 
 
 class TestOAuthFlow:
@@ -129,6 +186,88 @@ class TestOAuthFlow:
         assert "gho_real_token" not in account.access_token_encrypted
         assert decrypt_secret(account.access_token_encrypted) == "gho_real_token"
 
+    def test_callback_stores_refresh_token_and_expiry(self, client, app, monkeypatch):
+        app.config["GITHUB_CLIENT_ID"] = "client-id"
+        app.config["GITHUB_CLIENT_SECRET"] = "client-secret"
+        _logged_in_client(client)
+        client.get("/github/connect")
+        session_state = _last_session_state(client)
+        monkeypatch.setattr(
+            "app.github.routes.requests.post",
+            lambda *a, **k: FakeResponse(
+                200,
+                {
+                    "access_token": "gho_expiring",
+                    "refresh_token": "ghr_refresh",
+                    "expires_in": 1800,
+                    "token_type": "bearer",
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([("GET", "/user", 200, {"id": 42, "login": "ghuser"})]),
+        )
+
+        response = client.get(f"/github/callback?code=abc&state={session_state}")
+        assert response.status_code == 302
+        account = GithubAccount.query.first()
+        assert decrypt_secret(account.refresh_token_encrypted) == "ghr_refresh"
+        assert account.token_expires_at.replace(tzinfo=UTC) > datetime.now(UTC)
+
+    def test_expired_token_refreshes_and_persists_rotation(self, client, app, monkeypatch):
+        app.config["GITHUB_CLIENT_ID"] = "client-id"
+        app.config["GITHUB_CLIENT_SECRET"] = "client-secret"
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.set_refresh_token("ghr_old")
+        account.token_expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        db.session.commit()
+
+        calls = []
+
+        def refresh(*args, **kwargs):
+            calls.append(kwargs["data"])
+            return FakeResponse(
+                200,
+                {"access_token": "gho_new", "refresh_token": "ghr_new", "expires_in": 3600},
+            )
+
+        monkeypatch.setattr("app.services.github.requests.post", refresh)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    ("GET", "/user/repos", 200, []),
+                    ("GET", "/user", 200, {"id": 42, "login": "ghuser"}),
+                ]
+            ),
+        )
+
+        response = client.get("/github/api/repos")
+        assert response.status_code == 200
+        assert calls[0]["grant_type"] == "refresh_token"
+        db.session.refresh(account)
+        assert decrypt_secret(account.access_token_encrypted) == "gho_new"
+        assert decrypt_secret(account.refresh_token_encrypted) == "ghr_new"
+
+    def test_disconnect_attempts_revocation(self, client, app, monkeypatch):
+        app.config["GITHUB_CLIENT_ID"] = "client-id"
+        app.config["GITHUB_CLIENT_SECRET"] = "client-secret"
+        _logged_in_client(client)
+        _create_account(app)
+        calls = []
+        monkeypatch.setattr(
+            "app.services.github.requests.delete",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or FakeResponse(204),
+        )
+
+        response = client.post("/github/disconnect", follow_redirects=True)
+        assert response.status_code == 200
+        assert calls[0][0][0].endswith("/applications/client-id/token")
+        assert calls[0][1]["json"] == {"access_token": "gho_test_token"}
+        assert GithubAccount.query.count() == 0
+
     def test_disconnect_removes_account(self, client, app):
         _logged_in_client(client)
         _create_account(app)
@@ -137,19 +276,173 @@ class TestOAuthFlow:
         assert b"Disconnected your GitHub account" in response.data
         assert GithubAccount.query.count() == 0
 
-    def test_status_returns_connection(self, client, app):
+    def test_status_returns_connection(self, client, app, monkeypatch):
         _logged_in_client(client)
         _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/rate_limit",
+                        200,
+                        {
+                            "resources": {
+                                "core": {
+                                    "limit": 5000,
+                                    "remaining": 4999,
+                                    "reset": 1_700_000_000,
+                                    "used": 1,
+                                }
+                            }
+                        },
+                    )
+                ]
+            ),
+        )
         response = client.get("/github/api/status")
         data = response.get_json()
         assert data["connected"] is True
         assert data["account"]["github_username"] == "ghuser"
         assert "access_token" not in json.dumps(data)
 
+    def test_status_includes_rate_limit_when_available(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/rate_limit",
+                        200,
+                        {
+                            "resources": {
+                                "core": {
+                                    "limit": 5000,
+                                    "remaining": 4999,
+                                    "reset": 1_700_000_000,
+                                    "used": 1,
+                                }
+                            }
+                        },
+                    )
+                ]
+            ),
+        )
+        data = client.get("/github/api/status").get_json()
+        rate_limit = data["rate_limit"]
+        assert rate_limit["available"] is True
+        assert rate_limit["remaining"] == 4999
+        assert rate_limit["reset"] == 1_700_000_000
+        assert rate_limit["low"] is False
+        serialized = json.dumps(data)
+        assert "gho_test_token" not in serialized
+        assert "access_token" not in serialized
+
+    def test_status_flags_low_quota(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/rate_limit",
+                        200,
+                        {
+                            "resources": {
+                                "core": {
+                                    "limit": 5000,
+                                    "remaining": 5,
+                                    "reset": 1_700_000_000,
+                                    "used": 4995,
+                                }
+                            }
+                        },
+                    )
+                ]
+            ),
+        )
+        rate_limit = client.get("/github/api/status").get_json()["rate_limit"]
+        assert rate_limit["available"] is True
+        assert rate_limit["remaining"] == 5
+        assert rate_limit["low"] is True
+
+    def test_status_reports_unavailable_quota(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([("GET", "/rate_limit", 200, {"resources": {}})]),
+        )
+        rate_limit = client.get("/github/api/status").get_json()["rate_limit"]
+        assert rate_limit == {"available": False}
+
     def test_status_when_disconnected(self, client):
         _logged_in_client(client)
         data = client.get("/github/api/status").get_json()
         assert data["connected"] is False
+        assert "rate_limit" not in data
+
+
+class TestGrantedScopes:
+    """Issue #57: report the granted scopes and warn when ``repo`` is missing."""
+
+    def _connect_with_user_scopes(self, client, app, monkeypatch, user_headers, exchange_scope):
+        app.config["GITHUB_CLIENT_ID"] = "client-id"
+        app.config["GITHUB_CLIENT_SECRET"] = "client-secret"
+        _logged_in_client(client)
+        client.get("/github/connect")
+        state = _last_session_state(client)
+        monkeypatch.setattr(
+            "app.github.routes.requests.post",
+            lambda *a, **k: FakeResponse(
+                200, {"access_token": "gho_token", "scope": exchange_scope}
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [("GET", "/user", 200, {"id": 42, "login": "ghuser"}, user_headers)]
+            ),
+        )
+        client.get(f"/github/callback?code=abc&state={state}")
+        return GithubAccount.query.first()
+
+    def test_callback_prefers_granted_scopes_from_user_header(self, client, app, monkeypatch):
+        account = self._connect_with_user_scopes(
+            client, app, monkeypatch, {"X-OAuth-Scopes": "repo, read:user"}, "read:user"
+        )
+        assert account.granted_scopes == ["repo", "read:user"]
+
+    def test_callback_falls_back_to_exchange_scope(self, client, app, monkeypatch):
+        account = self._connect_with_user_scopes(client, app, monkeypatch, None, "read:user repo")
+        assert account.granted_scopes == ["read:user", "repo"]
+
+    def _status_with_scopes(self, client, app, monkeypatch, scopes):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = scopes
+        db.session.commit()
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([("GET", "/rate_limit", 200, {"resources": {}})]),
+        )
+        return client.get("/github/api/status").get_json()
+
+    def test_status_reports_missing_repo_scope(self, client, app, monkeypatch):
+        data = self._status_with_scopes(client, app, monkeypatch, "read:user")
+        assert data["scopes"] == ["read:user"]
+        assert data["missing_repo_scope"] is True
+
+    def test_status_reports_repo_scope_present(self, client, app, monkeypatch):
+        data = self._status_with_scopes(client, app, monkeypatch, "repo,read:user")
+        assert data["scopes"] == ["repo", "read:user"]
+        assert data["missing_repo_scope"] is False
 
 
 class TestRepositoryApi:
@@ -230,6 +523,54 @@ class TestRepositoryApi:
         assert response.status_code == 404
         assert response.get_json()["kind"] == "not_found"
 
+    def test_repo_detail_includes_extended_metadata(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+
+        def fake_repo(self_, full_name):
+            return {
+                "full_name": full_name,
+                "name": "repo",
+                "description": "A demo repository",
+                "owner": {"login": "owner"},
+                "private": False,
+                "language": "Python",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "stargazers_count": 42,
+                "forks_count": 7,
+                "open_issues_count": 3,
+                "license": {"spdx_id": "MIT", "name": "MIT License"},
+                "topics": ["stellar", "flask"],
+                "homepage": "https://example.com",
+            }
+
+        monkeypatch.setattr(GitHubClient, "get_repository", fake_repo)
+        monkeypatch.setattr(GitHubClient, "get_readme", lambda self_, full_name: None)
+
+        data = client.get("/github/api/repos/owner/repo").get_json()
+        assert data["stars"] == 42
+        assert data["forks"] == 7
+        assert data["open_issues_count"] == 3
+        assert data["license"] == "MIT"
+        assert data["topics"] == ["stellar", "flask"]
+        assert data["homepage"] == "https://example.com"
+
+    def test_repo_payload_defaults_for_missing_fields(self):
+        from app.services.github import repo_payload
+
+        payload = repo_payload(
+            {
+                "full_name": "owner/repo",
+                "license": {"spdx_id": "NOASSERTION", "name": "Other"},
+            }
+        )
+        assert payload["stars"] == 0
+        assert payload["forks"] == 0
+        assert payload["open_issues_count"] == 0
+        assert payload["license"] == "Other"
+        assert payload["topics"] == []
+        assert payload["homepage"] == ""
+
 
 class TestApiEndpoints:
     def _script_client(self, client, app, script, monkeypatch):
@@ -247,12 +588,66 @@ class TestApiEndpoints:
                 "GET",
                 "/git/trees/",
                 200,
-                {"tree": [{"path": "app/__init__.py", "type": "blob"}], "truncated": False},
-            )
+                {
+                    "tree": [
+                        {"path": "app/__init__.py", "type": "blob", "size": 2048},
+                        {"path": "app", "type": "tree"},
+                    ],
+                    "truncated": False,
+                },
+            ),
+            (
+                "POST",
+                "/graphql",
+                200,
+                {
+                    "data": {
+                        "repository": {
+                            "f0": {
+                                "history": {
+                                    "nodes": [
+                                        {
+                                            "oid": "abc1234567890",
+                                            "messageHeadline": "Fix the bug",
+                                            "committedDate": "2026-01-01T00:00:00Z",
+                                            "author": {"name": "Alice"},
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                },
+            ),
+        ]
+        self._script_client(client, app, script, monkeypatch)
+        data = client.get("/github/api/repos/owner/repo/tree?ref=main").get_json()
+        blob = data["entries"][0]
+        assert blob["path"] == "app/__init__.py"
+        assert blob["size"] == 2048
+        assert blob["last_commit"]["sha"] == "abc1234567890"
+        assert blob["last_commit"]["message"] == "Fix the bug"
+        assert blob["last_commit"]["author"] == "Alice"
+        # Directories carry no last-commit metadata.
+        assert data["entries"][1]["last_commit"] is None
+
+    def test_tree_survives_commit_lookup_failure(self, client, app, monkeypatch):
+        script = [
+            (
+                "GET",
+                "/git/trees/",
+                200,
+                {
+                    "tree": [{"path": "app/__init__.py", "type": "blob", "size": 10}],
+                    "truncated": False,
+                },
+            ),
+            ("POST", "/graphql", 500, {"message": "boom"}),
         ]
         self._script_client(client, app, script, monkeypatch)
         data = client.get("/github/api/repos/owner/repo/tree?ref=main").get_json()
         assert data["entries"][0]["path"] == "app/__init__.py"
+        assert data["entries"][0]["last_commit"] is None
 
     def test_commits_returns_summary(self, client, app, monkeypatch):
         script = [
@@ -273,8 +668,36 @@ class TestApiEndpoints:
         ]
         self._script_client(client, app, script, monkeypatch)
         data = client.get("/github/api/repos/owner/repo/commits").get_json()
-        assert data[0]["short_sha"] == "abc123"
-        assert data[0]["message"] == "Fix the bug"
+        assert data["items"][0]["short_sha"] == "abc123"
+        assert data["items"][0]["message"] == "Fix the bug"
+        assert data["page"] == 1
+        assert data["has_next"] is False
+
+    def test_commits_pagination_envelope_from_link_header(self, client, app, monkeypatch):
+        script = [
+            (
+                "GET",
+                "/commits",
+                200,
+                [
+                    {
+                        "sha": "abc1234567890",
+                        "commit": {
+                            "message": "Fix the bug\n",
+                            "author": {"name": "Alice", "date": "2026-01-01T00:00:00Z"},
+                        },
+                    }
+                ],
+                {"Link": '<https://api.github.com/repos/owner/repo/commits?page=2>; rel="next"'},
+            )
+        ]
+        self._script_client(client, app, script, monkeypatch)
+        data = client.get(
+            "/github/api/repos/owner/repo/commits?ref=main&path=app/x.py&page=1"
+        ).get_json()
+        assert data["has_next"] is True
+        assert data["page"] == 1
+        assert data["items"][0]["short_sha"] == "abc1234"
 
     def test_issues_excludes_pulls(self, client, app, monkeypatch):
         script = [
@@ -295,8 +718,10 @@ class TestApiEndpoints:
         ]
         self._script_client(client, app, script, monkeypatch)
         data = client.get("/github/api/repos/owner/repo/issues").get_json()
-        assert [i["number"] for i in data] == [2]
-        assert data[0]["labels"] == ["enhancement"]
+        assert [i["number"] for i in data["items"]] == [2]
+        assert data["items"][0]["labels"] == ["enhancement"]
+        assert data["page"] == 1
+        assert data["has_prev"] is False
 
     def test_pull_detail_returns_files(self, client, app, monkeypatch):
         script = [
@@ -312,6 +737,9 @@ class TestApiEndpoints:
                     "additions": 10,
                     "deletions": 2,
                     "changed_files": 1,
+                    "mergeable": True,
+                    "mergeable_state": "clean",
+                    "head": {"ref": "feature", "sha": "abc123"},
                 },
             ),
             (
@@ -320,11 +748,104 @@ class TestApiEndpoints:
                 200,
                 [{"filename": "app/x.py", "status": "modified", "patch": "diff"}],
             ),
+            (
+                "GET",
+                "/commits/abc123/check-runs",
+                200,
+                {
+                    "check_runs": [
+                        {
+                            "name": "pytest",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "details_url": "https://example.test/check",
+                        }
+                    ]
+                },
+            ),
+            (
+                "GET",
+                "/commits/abc123/status",
+                200,
+                {"state": "success", "statuses": [{"context": "ci/build", "state": "success"}]},
+            ),
         ]
         self._script_client(client, app, script, monkeypatch)
         data = client.get("/github/api/repos/owner/repo/pulls/5").get_json()
         assert data["number"] == 5
         assert data["files"][0]["filename"] == "app/x.py"
+        assert data["mergeable_state"] == "clean"
+        assert data["checks"]["available"] is True
+        assert data["checks"]["runs"][0]["name"] == "pytest"
+        assert data["checks"]["status"]["state"] == "success"
+
+    def test_issues_page_envelope_exposes_navigation(self, client, app, monkeypatch):
+        from app.services.github import GitHubPage
+
+        _logged_in_client(client)
+        _create_account(app)
+        captured = {}
+
+        def fake_page(self_, full_name, *, state="open", page=1, per_page=50):
+            captured.update(state=state, page=page, per_page=per_page)
+            return GitHubPage(
+                items=[{"number": 2, "title": "feature"}],
+                page=page,
+                per_page=per_page,
+                has_next=True,
+                has_prev=False,
+                total_pages=4,
+            )
+
+        monkeypatch.setattr(GitHubClient, "list_issues_page", fake_page)
+        data = client.get("/github/api/repos/owner/repo/issues?state=closed&page=2").get_json()
+        assert [i["number"] for i in data["items"]] == [2]
+        assert data["page"] == 2
+        assert data["has_next"] is True
+        assert data["has_prev"] is False
+        assert data["total_pages"] == 4
+        assert captured["state"] == "closed"
+        assert captured["page"] == 2
+
+    def test_issues_per_page_is_capped(self, client, app, monkeypatch):
+        from app.services.github import GitHubPage
+
+        _logged_in_client(client)
+        _create_account(app)
+        captured = {}
+
+        def fake_page(self_, full_name, *, state="open", page=1, per_page=50):
+            captured["per_page"] = per_page
+            return GitHubPage(items=[], page=page, per_page=per_page)
+
+        monkeypatch.setattr(GitHubClient, "list_issues_page", fake_page)
+        client.get("/github/api/repos/owner/repo/issues?per_page=500")
+        assert captured["per_page"] == 100
+
+    def test_pulls_page_envelope(self, client, app, monkeypatch):
+        from app.services.github import GitHubPage
+
+        _logged_in_client(client)
+        _create_account(app)
+        captured = {}
+
+        def fake_page(self_, full_name, *, state="open", page=1, per_page=50):
+            captured["state"] = state
+            return GitHubPage(
+                items=[{"number": 5, "title": "Add feature"}],
+                page=page,
+                per_page=per_page,
+                has_next=False,
+                has_prev=True,
+                total_pages=2,
+            )
+
+        monkeypatch.setattr(GitHubClient, "list_pull_requests_page", fake_page)
+        data = client.get("/github/api/repos/owner/repo/pulls?state=all&page=2").get_json()
+        assert data["items"][0]["number"] == 5
+        assert data["has_prev"] is True
+        assert data["total_pages"] == 2
+        assert captured["state"] == "all"
 
     def test_analyze_file_requires_path(self, client, app, monkeypatch):
         self._script_client(client, app, [], monkeypatch)
@@ -341,6 +862,17 @@ class TestApiEndpoints:
         assert client.get("/github/repos/owner/repo/issues/1").status_code == 200
         assert client.get("/github/repos/owner/repo/pulls").status_code == 200
         assert client.get("/github/repos/owner/repo/pulls/1").status_code == 200
+        assert client.get("/github/repos/owner/repo/commits/abc1234").status_code == 200
+
+    def test_commit_detail_renders_with_back_link(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        response = client.get("/github/repos/owner/repo/commits/abc1234")
+        assert response.status_code == 200
+        body = response.get_data(as_text=True)
+        assert 'data-sha="abc1234"' in body
+        assert "Back to commit list" in body
+        assert "github_commit.js" in body
 
 
 class TestSecurity:
@@ -361,3 +893,153 @@ class TestSecurity:
 def _last_session_state(client):
     with client.session_transaction() as sess:
         return sess.get("github_oauth_state")
+
+
+class TestDashboardGrantedScopes:
+    """The dashboard shows the granted scopes and warns when repo is missing (#57)."""
+
+    def test_shows_granted_scopes_without_warning_when_repo_present(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/user",
+                        200,
+                        {"id": 42, "login": "ghuser"},
+                        {"X-OAuth-Scopes": "read:user, repo"},
+                    )
+                ]
+            ),
+        )
+        body = client.get("/github/").get_data(as_text=True)
+        assert "granted scopes" in body
+        assert "read:user" in body
+        assert "repo" in body
+        assert "Missing the" not in body
+
+    def test_warns_when_repo_scope_missing(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    (
+                        "GET",
+                        "/user",
+                        200,
+                        {"id": 42, "login": "ghuser"},
+                        {"X-OAuth-Scopes": "read:user, gist"},
+                    )
+                ]
+            ),
+        )
+        body = client.get("/github/").get_data(as_text=True)
+        assert "Missing the" in body
+
+    def test_falls_back_to_stored_scopes_when_header_unavailable(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = "read:user, repo"
+        db.session.commit()
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([("GET", "/user", 200, {"id": 42, "login": "ghuser"})]),
+        )
+        body = client.get("/github/").get_data(as_text=True)
+        assert "read:user, repo" in body
+
+
+class TestStatusScopes:
+    """The status API reports whether the repo scope is missing (issue #57)."""
+
+    _RATE_LIMIT = (
+        "GET",
+        "/rate_limit",
+        200,
+        {"resources": {"core": {"limit": 5000, "remaining": 4999, "reset": 1700000000, "used": 1}}},
+    )
+
+    def _patch(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session([self._RATE_LIMIT]),
+        )
+
+    def test_status_flags_missing_repo_scope(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = "read:user"
+        db.session.commit()
+        self._patch(monkeypatch)
+        data = client.get("/github/api/status").get_json()
+        assert data["repo_scope_missing"] is True
+
+    def test_status_repo_scope_present(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        account = _create_account(app)
+        account.scopes = "read:user,repo"
+        db.session.commit()
+        self._patch(monkeypatch)
+        data = client.get("/github/api/status").get_json()
+        assert data["repo_scope_missing"] is False
+
+
+class TestCompareRoute:
+    def test_compare_requires_login(self, client):
+        response = client.get("/github/api/compare/ow/repo/main...feature")
+        assert response.status_code == 302
+
+    def test_compare_returns_file_diff(self, client, app, monkeypatch):
+        _logged_in_client(client)
+        _create_account(app)
+        compare_payload = {
+            "status": "ahead",
+            "ahead_by": 2,
+            "behind_by": 0,
+            "total_commits": 2,
+            "commits": [
+                {"sha": "abc123", "commit": {"message": "Add feature"}},
+                {"sha": "def456", "commit": {"message": "Fix bug"}},
+            ],
+            "files": [
+                {
+                    "filename": "app/py.py",
+                    "status": "modified",
+                    "additions": 10,
+                    "deletions": 2,
+                    "changes": 12,
+                    "patch": "@@ -1,+1 @@\n+old\n-new",
+                },
+                {
+                    "filename": "README.md",
+                    "status": "added",
+                    "additions": 5,
+                    "deletions": 0,
+                    "changes": 5,
+                    "patch": "@@ -0,0 +1,5 @@\n+hello",
+                },
+            ],
+        }
+        monkeypatch.setattr(
+            "app.services.github.requests.Session",
+            lambda: _make_fake_session(
+                [
+                    ("GET", "/repos/ow/repo/compare/main...feature", 200, compare_payload),
+                ]
+            ),
+        )
+        response = client.get("/github/api/compare/ow/repo/main...feature")
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["status"] == "ahead"
+        assert data["ahead_by"] == 2
+        assert len(data["files"]) == 2
+        filenames = {f["filename"] for f in data["files"]}
+        assert filenames == {"app/py.py", "README.md"}
+        assert data["additions"] == 15
+        assert data["deletions"] == 2

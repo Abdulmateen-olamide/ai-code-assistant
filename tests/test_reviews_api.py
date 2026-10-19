@@ -21,7 +21,7 @@ JSON_REPLY = json.dumps(
                 "file": "app/main.py",
                 "line": 2,
                 "severity": "high",
-                "category": "bug",
+                "category": "complexity",
                 "explanation": "Unchecked input.",
                 "recommendation": "Validate it.",
                 "confidence": "confirmed",
@@ -94,7 +94,7 @@ def _pr_dict():
 def _pr_files():
     return [
         {
-            "filename": "app.py",
+            "filename": "app/main.py",
             "patch": "@@\n+def f()",
             "status": "modified",
             "additions": 2,
@@ -135,6 +135,69 @@ class TestProjectReviews:
         review = db.session.get(Review, payload["id"])
         assert review.summary_dict["overall_assessment"] == "Looks fine."
         assert ReviewFinding.query.filter_by(review_id=review.id).count() == 1
+
+    def test_invented_files_and_coverage_are_rejected_not_persisted(
+        self, client, make_user, login, monkeypatch
+    ):
+        user = make_user()
+        login()
+        project = _make_project(user)
+        invented = json.dumps(
+            {
+                "summary": {
+                    "overall_assessment": "Coverage is 99%.",
+                    "files_affected": ["app/main.py", "not/real.py"],
+                    "testing_recommendations": ["Raise coverage to 90 percent."],
+                },
+                "findings": [
+                    {
+                        "file": "not/real.py",
+                        "line": 1,
+                        "severity": "high",
+                        "category": "complexity",
+                        "explanation": "Invented file.",
+                        "confidence": "confirmed",
+                    },
+                    {
+                        "file": "app/main.py",
+                        "line": 2,
+                        "severity": "high",
+                        "category": "complexity",
+                        "explanation": "Coverage dropped to 12%.",
+                        "confidence": "confirmed",
+                    },
+                    {
+                        "file": "app/main.py",
+                        "line": 3,
+                        "severity": "medium",
+                        "category": "complexity",
+                        "explanation": "Nested conditionals.",
+                        "confidence": "confirmed",
+                    },
+                ],
+            }
+        )
+        monkeypatch.setattr("app.services.reviews.get_provider", lambda: FakeProvider(invented))
+        response = client.post(
+            "/reviews/api/reviews",
+            json={"source": "project", "project_id": project.id, "kind": "quality"},
+        )
+        assert response.status_code == 201
+        payload = response.get_json()
+        assert payload["findings_count"] == 1
+        review = db.session.get(Review, payload["id"])
+        assert review.summary_dict["overall_assessment"] == ""
+        assert review.summary_dict["files_affected"] == ["app/main.py"]
+        assert review.summary_dict["testing_recommendations"] == []
+        rows = ReviewFinding.query.filter_by(review_id=review.id).all()
+        assert len(rows) == 1
+        assert rows[0].file == "app/main.py"
+        assert rows[0].line == 3
+        assert "12%" not in (rows[0].explanation or "")
+
+        metrics = client.get("/reviews/api/metrics").get_json()
+        assert metrics["findings"]["total"] == 1
+        assert "not/real.py" not in metrics["findings"]["by_file"]
 
     def test_run_project_review_not_ready(self, client, make_user, login):
         user = make_user()
@@ -275,13 +338,13 @@ class TestListDetailDelete:
         db.session.commit()
         response = client.get("/reviews/api/reviews")
         assert response.status_code == 200
-        assert len(response.get_json()) == 2
+        assert len(response.get_json()["items"]) == 2
 
         response = client.get("/reviews/api/reviews?kind=pr")
-        assert len(response.get_json()) == 1
+        assert len(response.get_json()["items"]) == 1
 
         response = client.get(f"/reviews/api/reviews?project_id={project.id}")
-        assert len(response.get_json()) == 1
+        assert len(response.get_json()["items"]) == 1
 
     def test_list_scoped_to_owner(self, client, make_user, login):
         other = make_user(username="other", email="other@example.com")
@@ -290,7 +353,7 @@ class TestListDetailDelete:
         db.session.add(Review(user_id=other.id, source="project", kind="security"))
         db.session.commit()
         response = client.get("/reviews/api/reviews")
-        assert response.get_json() == []
+        assert response.get_json()["items"] == []
 
     def test_detail_and_findings(self, client, make_user, login):
         user = make_user()
@@ -337,7 +400,59 @@ class TestListDetailDelete:
 
         response = client.get(f"/reviews/api/reviews/{review.id}/findings?addressed=1")
         assert len(response.get_json()) == 1
+
+        # Findings carry a [CONFIRMED]/[SUGGESTION] label derived from confidence.
+        findings = client.get(f"/reviews/api/reviews/{review.id}/findings").get_json()
+        labels = {f["confidence"]: f["confidence_label"] for f in findings}
+        assert labels["confirmed"] == "[CONFIRMED]"
+        assert labels["suggestion"] == "[SUGGESTION]"
         assert response.get_json()[0]["file"] == "b.py"
+
+    def test_detail_exposes_categories_and_filters_by_category(self, client, make_user, login):
+        user = make_user()
+        login()
+        project = _make_project(user)
+        review = Review(
+            user_id=user.id,
+            project_id=project.id,
+            source="project",
+            kind="quality",
+            status="completed",
+        )
+        db.session.add(review)
+        db.session.commit()
+        db.session.add_all(
+            [
+                ReviewFinding(
+                    review_id=review.id,
+                    severity="medium",
+                    category="readability",
+                    explanation="e",
+                    confidence="suggestion",
+                ),
+                ReviewFinding(
+                    review_id=review.id,
+                    severity="medium",
+                    category="dead-code",
+                    explanation="e",
+                    confidence="confirmed",
+                ),
+            ]
+        )
+        db.session.commit()
+
+        detail = client.get(f"/reviews/api/reviews/{review.id}").get_json()
+        assert "readability" in detail["categories"]
+        assert "dead-code" in detail["categories"]
+
+        all_findings = client.get(f"/reviews/api/reviews/{review.id}/findings").get_json()
+        assert len(all_findings) == 2
+
+        filtered = client.get(
+            f"/reviews/api/reviews/{review.id}/findings?category=readability"
+        ).get_json()
+        assert len(filtered) == 1
+        assert filtered[0]["category"] == "readability"
 
     def test_detail_forbidden_for_other_user(self, client, make_user, login):
         other = make_user(username="other", email="other@example.com")
@@ -483,3 +598,323 @@ class TestMetrics:
         response = client.get(f"/reviews/api/metrics?project_id={project.id}")
         assert response.status_code == 200
         assert response.get_json()["total_reviews"] == 1
+
+    def test_workspace_metrics_aggregate(self, client, make_user, login):
+        user = make_user()
+        login()
+        project = _make_project(user)
+        review = Review(user_id=user.id, project_id=project.id, source="project", kind="quality")
+        db.session.add(review)
+        db.session.commit()
+        db.session.add(
+            ReviewFinding(
+                review_id=review.id,
+                severity="high",
+                category="duplication",
+                explanation="e",
+                confidence="confirmed",
+            )
+        )
+        db.session.commit()
+
+        response = client.get(f"/reviews/api/metrics?workspace_id={project.workspace_id}")
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["total_reviews"] == 1
+        assert payload["findings"]["total"] == 1
+        assert payload["findings"]["by_severity"]["high"] == 1
+        assert payload["findings"]["by_category"]["duplication"] == 1
+        assert "reviews_last_7_days" in payload
+
+    def test_workspace_metrics_owner_scoped(self, client, make_user, login):
+        other = make_user(username="other", email="other@example.com")
+        project = _make_project(other)
+        make_user()
+        login()
+        response = client.get(f"/reviews/api/metrics?workspace_id={project.workspace_id}")
+        assert response.status_code == 404
+
+    def test_findings_trend_tracks_open_and_addressed(self, client, make_user, login):
+        user = make_user()
+        login()
+        first = Review(user_id=user.id, source="project", kind="quality", status="completed")
+        db.session.add(first)
+        db.session.commit()
+        second = Review(user_id=user.id, source="project", kind="security", status="completed")
+        db.session.add(second)
+        db.session.commit()
+        db.session.add_all(
+            [
+                ReviewFinding(
+                    review_id=first.id,
+                    severity="high",
+                    category="duplication",
+                    explanation="e",
+                    confidence="confirmed",
+                    addressed=True,
+                ),
+                ReviewFinding(
+                    review_id=first.id,
+                    severity="medium",
+                    category="readability",
+                    explanation="e",
+                    confidence="potential",
+                    addressed=False,
+                ),
+                ReviewFinding(
+                    review_id=second.id,
+                    severity="critical",
+                    category="injection",
+                    explanation="e",
+                    confidence="confirmed",
+                    addressed=False,
+                ),
+            ]
+        )
+        db.session.commit()
+
+        trend = client.get("/reviews/api/metrics").get_json()["findings_trend"]
+        assert [point["review_id"] for point in trend] == [first.id, second.id]
+        assert trend[0]["kind"] == "quality"
+        assert trend[0]["open"] == 1
+        assert trend[0]["addressed"] == 1
+        assert trend[0]["total"] == 2
+        assert trend[1]["open"] == 1
+        assert trend[1]["addressed"] == 0
+        assert trend[1]["total"] == 1
+
+    def test_findings_trend_empty_without_reviews(self, client, make_user, login):
+        make_user()
+        login()
+        assert client.get("/reviews/api/metrics").get_json()["findings_trend"] == []
+
+
+class TestExportReview:
+    def _make_review(self, user, with_finding=True):
+        review = Review(
+            user_id=user.id,
+            source="project",
+            kind="quality",
+            status="completed",
+            findings_count=1 if with_finding else 0,
+        )
+        review.summary = json.dumps({"overall_assessment": "Looks fine."})
+        db.session.add(review)
+        db.session.commit()
+        if with_finding:
+            db.session.add(
+                ReviewFinding(
+                    review_id=review.id,
+                    file="app/main.py",
+                    line=2,
+                    severity="high",
+                    category="readability",
+                    explanation="Unchecked input.",
+                    recommendation="Validate it.",
+                    confidence="confirmed",
+                )
+            )
+            db.session.commit()
+        return review
+
+    def test_export_json(self, client, make_user, login):
+        user = make_user()
+        login()
+        review = self._make_review(user)
+
+        response = client.get(f"/reviews/api/reviews/{review.id}/export?format=json")
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        assert "attachment" in response.headers["Content-Disposition"]
+        assert f"review-{review.id}.json" in response.headers["Content-Disposition"]
+        payload = json.loads(response.get_data(as_text=True))
+        assert payload["review"]["id"] == review.id
+        assert payload["findings"][0]["severity"] == "high"
+        assert payload["findings"][0]["confidence_label"] == "[CONFIRMED]"
+
+    def test_export_defaults_to_json(self, client, make_user, login):
+        user = make_user()
+        login()
+        review = self._make_review(user)
+
+        response = client.get(f"/reviews/api/reviews/{review.id}/export")
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        assert f"review-{review.id}.json" in response.headers["Content-Disposition"]
+
+    def test_export_markdown(self, client, make_user, login):
+        user = make_user()
+        login()
+        review = self._make_review(user)
+
+        response = client.get(f"/reviews/api/reviews/{review.id}/export?format=markdown")
+
+        assert response.status_code == 200
+        assert response.mimetype == "text/markdown"
+        assert f"review-{review.id}.md" in response.headers["Content-Disposition"]
+        text = response.get_data(as_text=True)
+        assert f"# Review #{review.id}" in text
+        assert "## Summary" in text
+        assert "Looks fine." in text
+        assert "## Findings" in text
+        assert "[HIGH] readability - app/main.py:2" in text
+        assert "[CONFIRMED]" in text
+        assert "**Recommendation:** Validate it." in text
+
+    def test_export_markdown_without_findings(self, client, make_user, login):
+        user = make_user()
+        login()
+        review = self._make_review(user, with_finding=False)
+
+        response = client.get(f"/reviews/api/reviews/{review.id}/export?format=md")
+
+        assert response.status_code == 200
+        assert "_No findings were recorded for this review._" in response.get_data(as_text=True)
+
+    def test_export_rejects_unknown_format(self, client, make_user, login):
+        user = make_user()
+        login()
+        review = self._make_review(user)
+
+        response = client.get(f"/reviews/api/reviews/{review.id}/export?format=pdf")
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]
+
+    def test_export_is_owner_scoped(self, client, make_user, login):
+        owner = make_user()
+        review = self._make_review(owner)
+        make_user(username="intruder", email="intruder@example.com")
+        login(email="intruder@example.com")
+
+        assert client.get(f"/reviews/api/reviews/{review.id}/export").status_code == 404
+
+    def test_export_requires_login(self, client):
+        assert client.get("/reviews/api/reviews/1/export").status_code == 302
+
+
+class TestReviewRetry:
+    """Retrying a failed review run with its configuration snapshot (#133)."""
+
+    def test_retry_requires_login(self, client):
+        assert client.post("/reviews/api/reviews/1/retry").status_code == 302
+
+    def test_retry_failed_project_review_reuses_config_snapshot(
+        self, client, make_user, login, monkeypatch
+    ):
+        from app.services.llm import LLMProviderError
+
+        user = make_user()
+        login()
+        project = _make_project(user)
+
+        def boom(*args, **kwargs):
+            raise LLMProviderError("provider down")
+
+        monkeypatch.setattr("app.services.reviews.get_provider", boom)
+        failed = client.post(
+            "/reviews/api/reviews",
+            json={"source": "project", "project_id": project.id, "kind": "quality"},
+        ).get_json()
+        assert failed["status"] == "failed"
+        snapshot = json.loads(db.session.get(Review, failed["id"]).config)
+
+        captured = {}
+
+        def fake_review_project(proj, kind, config):
+            captured["config"] = config
+            return {
+                "summary": {"overall_assessment": "retried"},
+                "findings": [
+                    {
+                        "file": "app/main.py",
+                        "line": 1,
+                        "severity": "low",
+                        "category": "maintainability",
+                        "explanation": "Retry note.",
+                        "confidence": "suggestion",
+                    }
+                ],
+                "raw": "",
+            }
+
+        monkeypatch.setattr(
+            "app.reviews.routes.reviews_service.review_project", fake_review_project
+        )
+        # The project's current config differs from the failed run's snapshot;
+        # the retry must reproduce the snapshot, not the new config.
+        db.session.add(
+            ReviewConfig(user_id=user.id, project_id=project.id, severity_threshold="high")
+        )
+        db.session.commit()
+
+        response = client.post(f"/reviews/api/reviews/{failed['id']}/retry")
+
+        assert response.status_code == 201
+        payload = response.get_json()
+        assert payload["status"] == "completed"
+        assert payload["id"] != failed["id"]
+        assert captured["config"] == snapshot
+        assert json.loads(db.session.get(Review, payload["id"]).config) == snapshot
+
+    def test_retry_failed_pr_review_reuses_config_snapshot(
+        self, client, make_user, login, monkeypatch
+    ):
+        from app.services.llm import LLMProviderError
+
+        make_user()
+        login()
+        monkeypatch.setattr(
+            "app.reviews.routes.get_github_client",
+            lambda: FakeGithubClient(_pr_dict(), _pr_files()),
+        )
+
+        def boom(*args, **kwargs):
+            raise LLMProviderError("provider down")
+
+        monkeypatch.setattr("app.services.reviews.get_provider", boom)
+        failed = client.post(
+            "/reviews/api/reviews",
+            json={"source": "github_pr", "repo": "octocat/hello", "pr_number": 7},
+        ).get_json()
+        assert failed["status"] == "failed"
+        snapshot = json.loads(db.session.get(Review, failed["id"]).config)
+
+        captured = {}
+
+        def fake_review_pr(pr, files, config):
+            captured["config"] = config
+            return {"summary": {}, "findings": [], "raw": ""}
+
+        monkeypatch.setattr(
+            "app.reviews.routes.reviews_service.review_pull_request", fake_review_pr
+        )
+
+        response = client.post(f"/reviews/api/reviews/{failed['id']}/retry")
+
+        assert response.status_code == 201
+        assert response.get_json()["status"] == "completed"
+        assert captured["config"] == snapshot
+
+    def test_retry_completed_review_rejected(self, client, make_user, login):
+        user = make_user()
+        login()
+        review = Review(user_id=user.id, source="project", kind="quality", status="completed")
+        db.session.add(review)
+        db.session.commit()
+
+        response = client.post(f"/reviews/api/reviews/{review.id}/retry")
+
+        assert response.status_code == 409
+
+    def test_retry_other_users_review_forbidden(self, client, make_user, login):
+        other = make_user(username="other", email="other@example.com")
+        make_user()
+        login()
+        review = Review(user_id=other.id, source="project", kind="quality", status="failed")
+        db.session.add(review)
+        db.session.commit()
+
+        assert client.post(f"/reviews/api/reviews/{review.id}/retry").status_code == 404

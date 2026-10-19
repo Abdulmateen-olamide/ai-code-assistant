@@ -2,7 +2,7 @@
 analysis, stats, and ownership isolation."""
 
 from app.extensions import db
-from app.models import Project, ProjectFile, Workspace
+from app.models import Project, ProjectFile, ProjectMessage, Workspace
 from app.models.project import SOURCE_ARCHIVE, STATUS_INDEXING, STATUS_READY
 
 
@@ -129,6 +129,60 @@ class TestSearchRoute:
         response = client.get(f"/workspaces/api/projects/{project.id}/search")
         assert response.status_code == 400
 
+    def test_scope_path_and_content(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        path_only = client.get(f"/workspaces/api/projects/{project.id}/search?q=app&scope=path")
+        assert [r["path"] for r in path_only.get_json()["results"]] == ["app.py"]
+
+        content_only = client.get(
+            f"/workspaces/api/projects/{project.id}/search?q=app&scope=content"
+        )
+        assert content_only.get_json()["results"] == []
+
+    def test_language_filter(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        response = client.get(
+            f"/workspaces/api/projects/{project.id}/search?q=helper&language=python"
+        )
+        assert response.status_code == 200
+        assert [r["path"] for r in response.get_json()["results"]] == ["src/lib/helper.py"]
+
+        none = client.get(
+            f"/workspaces/api/projects/{project.id}/search?q=helper&language=markdown"
+        )
+        assert none.get_json()["results"] == []
+
+    def test_regex_mode_matches(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        response = client.get(
+            f"/workspaces/api/projects/{project.id}/search?q=^src/&regex=1&scope=path"
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["regex"] is True
+        assert [r["path"] for r in data["results"]] == ["src/lib/helper.py"]
+
+    def test_filters_compose(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        response = client.get(
+            f"/workspaces/api/projects/{project.id}/search?q=def&regex=1&scope=content&language=python"
+        )
+        data = response.get_json()
+        assert [r["path"] for r in data["results"]] == ["src/lib/helper.py"]
+        assert data["language"] == "python"
+        assert data["scope"] == "content"
+
+    def test_invalid_regex_is_400(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        response = client.get(f"/workspaces/api/projects/{project.id}/search?q=(unclosed&regex=1")
+        assert response.status_code == 400
+        assert "regular expression" in response.get_json()["error"].lower()
+
+    def test_invalid_scope_is_400(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        response = client.get(f"/workspaces/api/projects/{project.id}/search?q=x&scope=bogus")
+        assert response.status_code == 400
+
     def test_unindexed_project_conflict(self, client, app, make_user, login):
         user = make_user(username="idxuser", email="idxuser@example.com")
         login(email="idxuser@example.com")
@@ -148,6 +202,33 @@ class TestSearchRoute:
 
 
 class TestChatRoute:
+    def test_sessions_are_named_and_messages_are_scoped(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        created = client.post(
+            f"/workspaces/api/projects/{project.id}/sessions", json={"title": "Architecture"}
+        )
+        assert created.status_code == 201
+        session_id = created.get_json()["id"]
+
+        response = client.post(
+            f"/workspaces/api/projects/{project.id}/chat",
+            json={"content": "What does app.py do?", "session_id": session_id},
+        )
+        assert response.status_code == 201
+        sessions = client.get(f"/workspaces/api/projects/{project.id}/sessions").get_json()
+        assert sessions[0]["title"] == "Architecture"
+        messages = client.get(
+            f"/workspaces/api/projects/{project.id}/messages?session_id={session_id}"
+        ).get_json()
+        assert len(messages) == 2
+        assert ProjectMessage.query.filter_by(session_id=session_id).count() == 2
+
+    def test_sessions_create_default_for_existing_project(self, client, app, make_user, login):
+        _, project = _setup(app, make_user, login)
+        response = client.get(f"/workspaces/api/projects/{project.id}/sessions")
+        assert response.status_code == 200
+        assert response.get_json()[0]["title"] == "General"
+
     def test_chat_persists_messages(self, client, app, make_user, login):
         _, project = _setup(app, make_user, login)
         response = client.post(
@@ -261,3 +342,9 @@ class TestProjectIsolation:
         response = client.get(f"/workspaces/{workspace.id}/projects/{project.id}")
         assert response.status_code == 200
         assert b"AI Chat" in response.data
+
+    def test_project_explorer_renders_breadcrumb_container(self, client, app, make_user, login):
+        workspace, project = _setup(app, make_user, login)
+        response = client.get(f"/workspaces/{workspace.id}/projects/{project.id}")
+        assert response.status_code == 200
+        assert b'id="file-breadcrumbs"' in response.data
